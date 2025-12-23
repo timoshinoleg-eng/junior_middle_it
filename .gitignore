@@ -1,0 +1,5 @@
+﻿.env
+*.db
+jobs.db
+__pycache__/
+*.pyc
