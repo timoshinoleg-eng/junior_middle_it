@@ -1,5 +1,18 @@
-﻿.env
+﻿# Environment
+.env
+*.env.local
+
+# Database
 *.db
 jobs.db
+
+# Python
 __pycache__/
+*.py[cod]
 *.pyc
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
