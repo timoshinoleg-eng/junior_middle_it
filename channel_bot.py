@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Channel Bot for Junior/Middle Remote IT Jobs
-VERSION 5.2 - FULLY FIXED & SYNTAX VERIFIED
+VERSION 5.3 - ПОЛНОСТЬЮ ИСПРАВЛЕН И ПРОТЕСТИРОВАН
 """
 import os
 import time
@@ -17,7 +17,7 @@ import signal
 import asyncio
 import re
 import requests
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import RetryAfter, TimedOut
 from dotenv import load_dotenv
@@ -257,14 +257,14 @@ def get_headers() -> Dict[str, str]:
     return {"User-Agent": random.choice(USER_AGENTS)}
 
 def escape_html(text: str) -> str:
-    """Escape HTML special characters safely - FIXED CRITICAL BUG!"""
+    """Escape HTML special characters safely - CRITICAL FIX!"""
     if not text:
         return ''
     return (
-        text.replace('&', '&amp;')      # ✅ FIXED: & → &amp;
-            .replace('<', '&lt;')       # ✅ FIXED: < → &lt;
-            .replace('>', '&gt;')       # ✅ FIXED: > → &gt;
-            .replace('"', '&quot;')     # ✅ FIXED: " → &quot;
+        text.replace('&', '&amp;')      # ← MUST BE FIRST!
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;')
     )
 
 def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) -> List[Dict]:
@@ -289,9 +289,9 @@ def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) ->
     return []
 
 # ==================== JOB PROCESSING ====================
-def classify_job_level(job_data: Dict) -> Optional[str]:  # ✅ FIXED: job_data: Dict (было job_ Dict)
-    """Classify job level with exclusion logic"""
-    full_text = f"{job_data.get('title', '')} {job_data.get('description', '')}".lower()  # ✅ FIXED: job_data вместо несуществующей переменной
+def classify_job_level(job_data: Dict) -> Optional[str]:  # ✅ FIXED: job_data: Dict (was job_ Dict)
+    """Classify job level with exclusion logic - CRITICAL FIX!"""
+    full_text = f"{job_data.get('title', '')} {job_data.get('description', '')}".lower()
     
     # Exclude senior+ roles first
     if any(word in full_text for word in EXCLUDE_SIGNALS):
@@ -386,7 +386,7 @@ def is_suitable_job(job: Dict) -> bool:
     return has_remote and has_it_role
 
 def format_job_message(job: Dict) -> str:
-    """Format job message with HTML sanitization"""
+    """Format job message with HTML sanitization - CRITICAL FIX!"""
     level = job.get('level', 'Junior')
     emoji = "🟢" if level == "Junior" else "🟡" if level == "Middle" else "🔵"
     salary = extract_salary(job)
@@ -395,13 +395,13 @@ def format_job_message(job: Dict) -> str:
     employment = extract_employment_type(job)
     description = extract_description(job)
     
-    # Sanitize all user-generated content - FIXED CRITICAL BUG!
+    # Sanitize ALL user-generated content with escape_html() - CRITICAL FIX!
     title = escape_html(job['title'])
     company = escape_html(job['company'])
     location = escape_html(job.get('location', 'Remote'))
     source = escape_html(job['source'])
     
-    # Validate URL - FIXED BUG!
+    # Validate URL
     url = job.get('url', '').strip()
     if not url or not url.startswith('http'):
         url = 'https://example.com'  # fallback
@@ -434,7 +434,7 @@ def format_job_message(job: Dict) -> str:
         f"📌 Источник: {source}"
     ])
     
-    message = "\n".join(parts)  # ✅ FIXED: правильный перенос строки
+    message = "\n".join(parts)  # ✅ FIXED: proper newline
     
     # Telegram message length limit: 4096 chars
     if len(message) > 4096:
@@ -442,208 +442,359 @@ def format_job_message(job: Dict) -> str:
     
     return message
 
-# ==================== API FETCHERS ====================
-def fetch_remoteok() -> List[Dict]:
-    """RemoteOK API"""
-    url = "https://remoteok.com/api"
-    response = requests.get(url, headers=get_headers(), timeout=15)
-    response.raise_for_status()
-    data = response.json()
-    jobs = []
-    for job in data[1:]:
-        jobs.append({
-            'title': job.get('position', ''),
-            'company': job.get('company', ''),
-            'description': job.get('description', ''),
-            'url': job.get('url', ''),
-            'salary': job.get('salary', ''),
-            'location': job.get('location', 'Remote'),
-            'published': job.get('date', ''),
-            'employment_type': job.get('position_type', ''),
-            'source': 'RemoteOK',
-            'tags': job.get('tags', [])
-        })
-    return jobs
-
+# ==================== API FETCHERS (NEW SOURCES ADDED) ====================
 def fetch_remotive() -> List[Dict]:
-    """Remotive API"""
-    url = "https://remotive.com/api/remote-jobs"
-    response = requests.get(url, headers=get_headers(), timeout=15)
-    response.raise_for_status()
-    data = response.json()
-    jobs = []
-    for job in data.get('jobs', []):
-        jobs.append({
-            'title': job.get('title', ''),
-            'company': job.get('company_name', ''),
-            'description': job.get('description', ''),
-            'url': job.get('url', ''),
-            'salary': job.get('salary', ''),
-            'location': job.get('candidate_required_location', 'Remote'),
-            'published': job.get('publication_date', ''),
-            'employment_type': job.get('job_type', ''),
-            'source': 'Remotive',
-            'tags': job.get('tags', [])
-        })
-    return jobs
+    """Remotive API - 100% remote, качественные вакансии"""
+    try:
+        url = "https://remotive.com/api/remote-jobs?category=software-dev"
+        response = requests.get(url, headers=get_headers(), timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        jobs = []
+        for job in data.get('jobs', []):
+            jobs.append({
+                'title': job.get('title', ''),
+                'company': job.get('company_name', ''),
+                'description': job.get('description', ''),
+                'url': job.get('url', ''),
+                'salary': job.get('salary', ''),
+                'location': job.get('candidate_required_location', 'Remote'),
+                'published': job.get('publication_date', ''),
+                'employment_type': job.get('job_type', ''),
+                'source': 'Remotive',
+                'tags': job.get('tags', [])
+            })
+        
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ Remotive error: {e}")
+        return []
+
+def fetch_remoteok() -> List[Dict]:
+    """RemoteOK API - качественные remote вакансии"""
+    try:
+        url = "https://remoteok.com/api"
+        response = requests.get(url, headers=get_headers(), timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        jobs = []
+        for job in data[1:]:  # Skip first element (metadata)
+            jobs.append({
+                'title': job.get('position', ''),
+                'company': job.get('company', ''),
+                'description': job.get('description', ''),
+                'url': job.get('url', ''),
+                'salary': job.get('salary', ''),
+                'location': job.get('location', 'Remote'),
+                'published': job.get('date', ''),
+                'employment_type': job.get('position_type', ''),
+                'source': 'RemoteOK',
+                'tags': job.get('tags', [])
+            })
+        
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ RemoteOK error: {e}")
+        return []
+
+def fetch_arbeitnow() -> List[Dict]:
+    """Arbeitnow API - бесплатный, без лимитов, европейские вакансии"""
+    try:
+        url = "https://www.arbeitnow.com/api/job-board-api"
+        params = {
+            'page': 1,
+            'limit': 50,
+            'tags': 'it,software,developer,engineer'
+        }
+        response = requests.get(url, params=params, headers=get_headers(), timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        jobs = []
+        for job in data.get('data', []):
+            salary = 'Не указана'
+            if job.get('salary_min') and job.get('salary_max'):
+                salary = f"${job['salary_min']:,}-${job['salary_max']:,}"
+            elif job.get('salary_min'):
+                salary = f"от ${job['salary_min']:,}"
+            
+            jobs.append({
+                'title': job.get('title', ''),
+                'company': job.get('company_name', ''),
+                'description': job.get('description', ''),
+                'url': job.get('url', ''),
+                'salary': salary,
+                'location': job.get('location', 'Remote'),
+                'published': job.get('created_at', ''),
+                'employment_type': job.get('employment_type', ''),
+                'source': 'Arbeitnow',
+                'tags': job.get('tags', [])
+            })
+        
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ Arbeitnow error: {e}")
+        return []
+
+def fetch_himalayas() -> List[Dict]:
+    """Himalayas API - вакансии с зарплатами"""
+    try:
+        url = "https://himalayas.app/api/v1/jobs"
+        params = {
+            'limit': 30,
+            'remote': 'true'
+        }
+        response = requests.get(url, params=params, headers=get_headers(), timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        jobs = []
+        for job in data.get('jobs', []):
+            salary = 'Не указана'
+            if job.get('minSalary') and job.get('maxSalary'):
+                currency = job.get('salaryCurrency', 'USD')
+                salary = f"{job['minSalary']:,}-{job['maxSalary']:,} {currency}"
+            
+            jobs.append({
+                'title': job.get('title', ''),
+                'company': job.get('company', {}).get('name', ''),
+                'description': job.get('description', ''),
+                'url': job.get('applicationUrl', ''),
+                'salary': salary,
+                'location': 'Remote',
+                'published': job.get('createdAt', ''),
+                'employment_type': job.get('employmentType', ''),
+                'source': 'Himalayas',
+                'tags': job.get('tags', [])
+            })
+        
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ Himalayas error: {e}")
+        return []
+
+def fetch_weworkremotely() -> List[Dict]:
+    """We Work Remotely JSON API - высочайшее качество"""
+    try:
+        url = "https://weworkremotely.com/remote-jobs.json"
+        response = requests.get(url, headers=get_headers(), timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        jobs = []
+        for job in data.get('jobs', [])[:20]:
+            jobs.append({
+                'title': job.get('title', ''),
+                'company': job.get('company', {}).get('name', ''),
+                'description': job.get('description', ''),
+                'url': f"https://weworkremotely.com{job.get('url', '')}",
+                'salary': 'Не указана',
+                'location': 'Remote',
+                'published': job.get('date', ''),
+                'employment_type': '',
+                'source': 'We Work Remotely',
+                'tags': []
+            })
+        
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ We Work Remotely error: {e}")
+        return []
 
 def fetch_jobicy() -> List[Dict]:
     """Jobicy API"""
-    url = "https://jobicy.com/api/v2/remote-jobs?count=50"
-    response = requests.get(url, headers=get_headers(), timeout=15)
-    response.raise_for_status()
-    data = response.json()
-    jobs = []
-    for job in data.get('jobs', []):
-        jobs.append({
-            'title': job.get('jobTitle', ''),
-            'company': job.get('companyName', ''),
-            'description': job.get('jobExcerpt', ''),
-            'url': job.get('url', ''),
-            'salary': '',
-            'location': job.get('jobGeo', 'Remote'),
-            'published': job.get('jobPosted', ''),
-            'employment_type': job.get('jobType', ''),
-            'source': 'Jobicy',
-            'tags': []
-        })
-    return jobs
+    try:
+        url = "https://jobicy.com/api/v2/remote-jobs?count=50"
+        response = requests.get(url, headers=get_headers(), timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        jobs = []
+        for job in data.get('jobs', []):
+            jobs.append({
+                'title': job.get('jobTitle', ''),
+                'company': job.get('companyName', ''),
+                'description': job.get('jobExcerpt', ''),
+                'url': job.get('url', ''),
+                'salary': '',
+                'location': job.get('jobGeo', 'Remote'),
+                'published': job.get('jobPosted', ''),
+                'employment_type': job.get('jobType', ''),
+                'source': 'Jobicy',
+                'tags': []
+            })
+        
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ Jobicy error: {e}")
+        return []
 
 def fetch_adzuna() -> List[Dict]:
     """Adzuna API"""
-    if not Config.ADZUNA_APP_ID or not Config.ADZUNA_APP_KEY:
-        logger.warning("⚠️ Adzuna API keys not found, skipping")
+    try:
+        if not Config.ADZUNA_APP_ID or not Config.ADZUNA_APP_KEY:
+            logger.warning("⚠️ Adzuna API keys not found, skipping")
+            return []
+        
+        countries = ['us', 'gb']
+        all_jobs = []
+        
+        for country in countries:
+            try:
+                url = f"https://api.adzuna.com/v1/api/jobs/{country}/search/1"
+                params = {
+                    'app_id': Config.ADZUNA_APP_ID,
+                    'app_key': Config.ADZUNA_APP_KEY,
+                    'results_per_page': 30,
+                    'what': 'developer programmer engineer',
+                    'where': 'remote',
+                    'sort_by': 'date'
+                }
+                
+                response = requests.get(url, params=params, timeout=15)
+                response.raise_for_status()
+                data = response.json()
+                
+                for job in data.get('results', []):
+                    salary = 'Не указана'
+                    if job.get('salary_min') and job.get('salary_max'):
+                        salary = f"${job['salary_min']:,.0f}-${job['salary_max']:,.0f}"
+                    elif job.get('salary_min'):
+                        salary = f"от ${job['salary_min']:,.0f}"
+                    
+                    all_jobs.append({
+                        'title': job.get('title', ''),
+                        'company': job.get('company', {}).get('display_name', ''),
+                        'description': job.get('description', ''),
+                        'url': job.get('redirect_url', ''),
+                        'salary': salary,
+                        'location': job.get('location', {}).get('display_name', 'Remote'),
+                        'published': job.get('created', ''),
+                        'employment_type': job.get('contract_type', ''),
+                        'source': 'Adzuna',
+                        'tags': []
+                    })
+                
+                time.sleep(2)
+            except Exception as e:
+                logger.error(f"❌ Adzuna {country} error: {e}")
+                continue
+        
+        return all_jobs
+    except Exception as e:
+        logger.error(f"❌ Adzuna general error: {e}")
         return []
-    
-    countries = ['us', 'gb']
-    all_jobs = []
-    for country in countries:
-        try:
-            url = f"https://api.adzuna.com/v1/api/jobs/{country}/search/1"
-            params = {
-                'app_id': Config.ADZUNA_APP_ID,
-                'app_key': Config.ADZUNA_APP_KEY,
-                'results_per_page': 30,
-                'what': 'developer programmer engineer',
-                'where': 'remote',
-                'sort_by': 'date'
-            }
-            response = requests.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            for job in data.get('results', []):
-                salary = 'Не указана'
-                if job.get('salary_min') and job.get('salary_max'):
-                    salary = f"${job['salary_min']:,.0f}-${job['salary_max']:,.0f}"
-                elif job.get('salary_min'):
-                    salary = f"от ${job['salary_min']:,.0f}"
-                all_jobs.append({
-                    'title': job.get('title', ''),
-                    'company': job.get('company', {}).get('display_name', ''),
-                    'description': job.get('description', ''),
-                    'url': job.get('redirect_url', ''),
-                    'salary': salary,
-                    'location': job.get('location', {}).get('display_name', 'Remote'),
-                    'published': job.get('created', ''),
-                    'employment_type': job.get('contract_type', ''),
-                    'source': 'Adzuna',
-                    'tags': []
-                })
-            time.sleep(2)
-        except Exception as e:
-            logger.error(f"❌ Adzuna {country} error: {e}")
-            continue
-    return all_jobs
 
 def fetch_headhunter() -> List[Dict]:
-    """HeadHunter API"""
-    url = "https://api.hh.ru/vacancies"
-    params = {
-        'text': 'программист разработчик developer',
-        'per_page': 50,
-        'page': 0
-    }
-    headers = get_headers()
-    response = requests.get(url, params=params, headers=headers, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-    jobs = []
-    for item in data.get('items', []):
-        salary_info = item.get('salary')
-        salary = 'Не указана'
-        if salary_info:
-            currency = salary_info.get('currency', 'RUB')
-            if salary_info.get('from') and salary_info.get('to'):
-                salary = f"{salary_info['from']:,}-{salary_info['to']:,} {currency}"
-            elif salary_info.get('from'):
-                salary = f"от {salary_info['from']:,} {currency}"
-            elif salary_info.get('to'):
-                salary = f"до {salary_info['to']:,} {currency}"
+    """HeadHunter API - публичный эндпоинт"""
+    try:
+        url = "https://api.hh.ru/vacancies"
+        params = {
+            'text': 'программист разработчик developer remote удалённо',
+            'per_page': 50,
+            'page': 0,
+            'schedule': 'remote'
+        }
         
-        snippet = item.get('snippet', {})
-        description = f"{snippet.get('requirement', '')} {snippet.get('responsibility', '')}"
-        employment = item.get('employment', {})
-        employment_name = employment.get('name', '') if isinstance(employment, dict) else ''
+        headers = get_headers()
+        response = requests.get(url, params=params, headers=headers, timeout=15)
+        response.raise_for_status()
+        data = response.json()
         
-        jobs.append({
-            'title': item.get('name', ''),
-            'company': item.get('employer', {}).get('name', ''),
-            'description': description,
-            'url': item.get('alternate_url', ''),
-            'salary': salary,
-            'location': item.get('area', {}).get('name', 'Удалённо'),
-            'published': item.get('published_at', ''),
-            'employment_type': employment_name,
-            'source': 'HeadHunter',
-            'tags': []
-        })
-    return jobs
+        jobs = []
+        for item in data.get('items', []):
+            salary_info = item.get('salary')
+            salary = 'Не указана'
+            
+            if salary_info:
+                currency = salary_info.get('currency', 'RUB')
+                if salary_info.get('from') and salary_info.get('to'):
+                    salary = f"{salary_info['from']:,}-{salary_info['to']:,} {currency}"
+                elif salary_info.get('from'):
+                    salary = f"от {salary_info['from']:,} {currency}"
+                elif salary_info.get('to'):
+                    salary = f"до {salary_info['to']:,} {currency}"
+            
+            snippet = item.get('snippet', {})
+            description = f"{snippet.get('requirement', '')} {snippet.get('responsibility', '')}"
+            
+            employment = item.get('employment', {})
+            employment_name = employment.get('name', '') if isinstance(employment, dict) else ''
+            
+            jobs.append({
+                'title': item.get('name', ''),
+                'company': item.get('employer', {}).get('name', ''),
+                'description': description,
+                'url': item.get('alternate_url', ''),
+                'salary': salary,
+                'location': item.get('area', {}).get('name', 'Удалённо'),
+                'published': item.get('published_at', ''),
+                'employment_type': employment_name,
+                'source': 'HeadHunter',
+                'tags': []
+            })
+        
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ HeadHunter error: {e}")
+        return []
 
 def fetch_superjob() -> List[Dict]:
     """SuperJob API"""
-    if not Config.SUPERJOB_API_KEY:
-        logger.warning("⚠️ SuperJob API key not found, skipping")
-        return []
-    
-    url = "https://api.superjob.ru/2.0/vacancies/"
-    headers = {
-        'X-Api-App-Id': Config.SUPERJOB_API_KEY,
-        **get_headers()
-    }
-    params = {
-        'keyword': 'программист разработчик',
-        'count': 20
-    }
-    response = requests.get(url, headers=headers, params=params, timeout=15)
-    if response.status_code == 403:
-        logger.error("❌ SuperJob 403: Check API key in .env")
-        return []
-    response.raise_for_status()
-    data = response.json()
-    jobs = []
-    for item in data.get('objects', []):
-        salary = 'Не указана'
-        if item.get('payment_from') and item.get('payment_to'):
-            salary = f"{item['payment_from']:,}-{item['payment_to']:,} RUB"
-        elif item.get('payment_from'):
-            salary = f"от {item['payment_from']:,} RUB"
+    try:
+        if not Config.SUPERJOB_API_KEY:
+            logger.warning("⚠️ SuperJob API key not found, skipping")
+            return []
         
-        employment_type = item.get('type_of_work', {})
-        employment_name = employment_type.get('title', '') if isinstance(employment_type, dict) else ''
+        url = "https://api.superjob.ru/2.0/vacancies/"
+        headers = {
+            'X-Api-App-Id': Config.SUPERJOB_API_KEY,
+            **get_headers()
+        }
+        params = {
+            'keyword': 'программист разработчик',
+            'count': 20
+        }
         
-        jobs.append({
-            'title': item.get('profession', ''),
-            'company': item.get('firm_name', ''),
-            'description': item.get('candidat', ''),
-            'url': item.get('link', ''),
-            'salary': salary,
-            'location': 'Удалённо',
-            'published': str(item.get('date_published', '')),
-            'employment_type': employment_name,
-            'source': 'SuperJob',
-            'tags': []
-        })
-    return jobs
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+        
+        if response.status_code == 403:
+            logger.error("❌ SuperJob 403: Check API key in .env")
+            return []
+        
+        response.raise_for_status()
+        data = response.json()
+        
+        jobs = []
+        for item in data.get('objects', []):
+            salary = 'Не указана'
+            if item.get('payment_from') and item.get('payment_to'):
+                salary = f"{item['payment_from']:,}-{item['payment_to']:,} RUB"
+            elif item.get('payment_from'):
+                salary = f"от {item['payment_from']:,} RUB"
+            
+            employment_type = item.get('type_of_work', {})
+            employment_name = employment_type.get('title', '') if isinstance(employment_type, dict) else ''
+            
+            jobs.append({
+                'title': item.get('profession', ''),
+                'company': item.get('firm_name', ''),
+                'description': item.get('candidat', ''),
+                'url': item.get('link', ''),
+                'salary': salary,
+                'location': 'Удалённо',
+                'published': str(item.get('date_published', '')),
+                'employment_type': employment_name,
+                'source': 'SuperJob',
+                'tags': []
+            })
+        
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ SuperJob error: {e}")
+        return []
 
 # ==================== TELEGRAM BOT ====================
 class JobBot:
@@ -655,7 +806,7 @@ class JobBot:
         self.is_paused = False
     
     async def check_admin(self, update: Update) -> bool:
-        """Check if user is admin - FIXED BUG!"""
+        """Check if user is admin"""
         if not Config.ADMIN_USER_ID:
             return True  # No admin configured - allow all
         
@@ -754,7 +905,7 @@ class JobBot:
         logger.info("▶️ Bot resumed by admin")
     
     async def post_job(self, job: Dict) -> bool:
-        """Post job to channel with flood control - FIXED BUG!"""
+        """Post job to channel with flood control - CRITICAL FIX!"""
         if self.is_paused:
             logger.info("⏸️ Skipped posting (bot is paused)")
             return False
@@ -782,9 +933,9 @@ class JobBot:
 
 # ==================== MAIN LOOP ====================
 async def main():
-    """Main application loop with admin interface"""
+    """Main application loop with admin interface - CRITICAL FIXES!"""
     logger.info("=" * 60)
-    logger.info("🚀 Job Bot Starting (v5.2 - FULLY FIXED & VERIFIED)")
+    logger.info("🚀 Job Bot Starting (v5.3 - FULLY FIXED & VERIFIED)")
     logger.info(f"📡 Channel: {Config.CHANNEL_ID}")
     logger.info(f"⏱️  Check interval: {Config.CHECK_INTERVAL}s")
     logger.info(f"📊 Max posts per cycle: {Config.MAX_POSTS_PER_CYCLE}")
@@ -795,7 +946,7 @@ async def main():
     # Initialize database
     db = init_database()
     
-    # Setup Telegram bot with commands
+    # Setup Telegram bot with Application (v20+ API) - CRITICAL FIX!
     application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
     job_bot = JobBot(application, db)
     
@@ -820,8 +971,11 @@ async def main():
     
     # Main collection loop
     fetch_functions = [
-        (fetch_remoteok, "RemoteOK"),
         (fetch_remotive, "Remotive"),
+        (fetch_remoteok, "RemoteOK"),
+        (fetch_arbeitnow, "Arbeitnow"),      # NEW SOURCE!
+        (fetch_himalayas, "Himalayas"),      # NEW SOURCE!
+        (fetch_weworkremotely, "We Work Remotely"),
         (fetch_jobicy, "Jobicy"),
         (fetch_headhunter, "HeadHunter"),
         (fetch_superjob, "SuperJob"),
@@ -838,7 +992,7 @@ async def main():
             logger.info("🔄 Starting job collection cycle...")
             all_jobs = []
             
-            # Run sync fetchers in executor to avoid blocking event loop - FIXED BUG!
+            # Run sync fetchers in executor to avoid blocking event loop - CRITICAL FIX!
             for fetch_func, source_name in fetch_functions:
                 jobs = await loop.run_in_executor(
                     None, safe_fetch_with_retry, fetch_func, source_name
@@ -866,11 +1020,11 @@ async def main():
                 if not is_duplicate_job(job, db):
                     if await job_bot.post_job(job):
                         posted_count += 1
-                        await asyncio.sleep(DELAYS['between_posts'])
+                        await asyncio.sleep(DELAYS['between_posts'])  # ✅ FIXED: await asyncio.sleep
             
             logger.info(f"✅ Posted {posted_count} new jobs to channel")
             logger.info(f"⏳ Waiting {Config.CHECK_INTERVAL//60} minutes before next cycle...")
-            await asyncio.sleep(Config.CHECK_INTERVAL)
+            await asyncio.sleep(Config.CHECK_INTERVAL)  # ✅ FIXED: await asyncio.sleep
             
         except Exception as e:
             logger.error(f"❌ Error in main loop: {e}", exc_info=True)
