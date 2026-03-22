@@ -1,18 +1,65 @@
-﻿# Environment
-.env
-*.env.local
-
-# Database
-*.db
-jobs.db
-
 # Python
 __pycache__/
 *.py[cod]
-*.pyc
-venv/
-env/
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# IDE
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDEs
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Telegram session files (IMPORTANT!)
+*.session
+*.session-journal
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# Backup files
+*.bak
+*.backup

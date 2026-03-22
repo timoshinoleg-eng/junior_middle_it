@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
 Telegram Channel Bot for Junior/Middle Remote IT Jobs
-VERSION 5.3 - ПОЛНОСТЬЮ ИСПРАВЛЕН И ПРОТЕСТИРОВАН
+VERSION 6.0 - С улучшенными источниками, классификацией и форматированием
+
+Новые возможности:
+- 10 Telegram-каналов в качестве источников (Telethon)
+- Автоматическая классификация по 7+ категориям
+- MarkdownV2 форматирование с inline-кнопками
+- Избранное и настройки пользователей
 """
 import os
 import time
@@ -17,13 +23,39 @@ import signal
 import asyncio
 import re
 import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes, 
+    CallbackQueryHandler, filters
+)
 from telegram.error import RetryAfter, TimedOut
+from telegram.constants import ParseMode
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Импорт новых модулей (с fallback)
+try:
+    from job_classifier import JobClassifier, get_job_category_info
+    CLASSIFIER_AVAILABLE = True
+except ImportError:
+    CLASSIFIER_AVAILABLE = False
+    logging.warning("⚠️ job_classifier не найден, классификация отключена")
+
+try:
+    from telegram_job_parser import TelegramJobParser, fetch_telegram_jobs
+    TELEGRAM_PARSER_AVAILABLE = True
+except ImportError:
+    TELEGRAM_PARSER_AVAILABLE = False
+    logging.warning("⚠️ telegram_job_parser не найден, Telegram-каналы отключены")
+
+try:
+    from message_formatter import JobMessageFormatter, format_job_message
+    FORMATTER_AVAILABLE = True
+except ImportError:
+    FORMATTER_AVAILABLE = False
+    logging.warning("⚠️ message_formatter не найден, используется стандартное форматирование")
 
 # ==================== CONFIGURATION ====================
 class Config:
@@ -33,9 +65,13 @@ class Config:
     SUPERJOB_API_KEY = os.getenv('SUPERJOB_API_KEY')
     ADZUNA_APP_ID = os.getenv('ADZUNA_APP_ID')
     ADZUNA_APP_KEY = os.getenv('ADZUNA_APP_KEY')
+    TELEGRAM_API_ID = os.getenv('TELEGRAM_API_ID')
+    TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
     CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1800'))
     MAX_POSTS_PER_CYCLE = int(os.getenv('MAX_POSTS_PER_CYCLE', '15'))
     ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
+    ENABLE_TELEGRAM_CHANNELS = os.getenv('ENABLE_TELEGRAM_CHANNELS', 'true').lower() == 'true'
+    ENABLE_MARKDOWN_V2 = os.getenv('ENABLE_MARKDOWN_V2', 'true').lower() == 'true'
     
     @classmethod
     def validate(cls) -> bool:
@@ -144,7 +180,8 @@ IT_ROLES = [
     "mobile", "ios", "android", "react", "vue", "angular",
     "python", "javascript", "java", "php", "ruby", "go", "rust",
     "node", "web developer", "software", "support engineer",
-    "разработчик", "программист", "инженер", "тестировщик"
+    "разработчик", "программист", "инженер", "тестировщик",
+    "менеджер проекта", "product owner", "scrum master"
 ]
 
 REMOTE_KEYWORDS = ["remote", "удаленно", "удалённо", "work from home", "дистанционно", "wfh"]
@@ -160,17 +197,33 @@ TECH_STACK = [
     'Java', 'C#', 'Go', 'Rust', 'PHP', 'Ruby', 'Swift', 'Kotlin'
 ]
 
+CATEGORY_NAMES_RU = {
+    'development': 'Разработка',
+    'qa': 'QA',
+    'devops': 'DevOps',
+    'data': 'Данные',
+    'marketing': 'Маркетинг',
+    'sales': 'Продажи',
+    'pm': 'Менеджмент',
+    'design': 'Дизайн',
+    'support': 'Поддержка',
+    'security': 'Безопасность',
+    'other': 'Другое',
+}
+
 # ==================== DATABASE ====================
 class DatabaseConnection:
-    """Thread-safe SQLite database connection"""
+    """Thread-safe SQLite database connection with enhanced schema"""
     def __init__(self, db_path: str = 'jobs.db'):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self._initialize()
     
     def _initialize(self):
-        """Initialize database schema"""
+        """Initialize database schema with migrations"""
         c = self.conn.cursor()
+        
+        # Main jobs table
         c.execute("""
             CREATE TABLE IF NOT EXISTS posted_jobs (
                 hash TEXT PRIMARY KEY,
@@ -179,13 +232,58 @@ class DatabaseConnection:
                 level TEXT,
                 url TEXT,
                 source TEXT,
+                category TEXT DEFAULT 'other',
                 posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # User favorites
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS user_favorites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                job_hash TEXT NOT NULL,
+                saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, job_hash)
+            )
+        """)
+        
+        # User settings
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY,
+                enabled_categories TEXT DEFAULT 'development,qa,devops,data,marketing,sales,pm,design,other',
+                hide_senior BOOLEAN DEFAULT 1,
+                min_salary_filter INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Telegram content hashes for dedup
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_content_hashes (
+                hash TEXT PRIMARY KEY,
+                source TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Indexes
+        c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_category ON posted_jobs(category)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_posted_at ON posted_jobs(posted_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_favorites_user ON user_favorites(user_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tg_hashes_created ON telegram_content_hashes(created_at)")
+        
+        # Migration: add category if not exists
+        try:
+            c.execute("SELECT category FROM posted_jobs LIMIT 1")
+        except sqlite3.OperationalError:
+            c.execute("ALTER TABLE posted_jobs ADD COLUMN category TEXT DEFAULT 'other'")
+        
         self.conn.commit()
         logger.info("✅ Database initialized")
     
-    def execute(self, query: str, params: tuple = ()):
+    def execute(self, query: str, params: tuple = ())->"sqlite3.Cursor":
         """Execute query with commit"""
         cursor = self.conn.cursor()
         cursor.execute(query, params)
@@ -208,10 +306,99 @@ class DatabaseConnection:
         """Close database connection"""
         self.conn.close()
         logger.info("🔌 Database connection closed")
+    
+    # User favorites methods
+    def add_favorite(self, user_id: int, job_hash: str) -> bool:
+        """Add job to user favorites"""
+        try:
+            self.execute(
+                'INSERT OR IGNORE INTO user_favorites (user_id, job_hash) VALUES (?, ?)',
+                (user_id, job_hash)
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error adding favorite: {e}")
+            return False
+    
+    def remove_favorite(self, user_id: int, job_hash: str) -> bool:
+        """Remove job from user favorites"""
+        try:
+            self.execute(
+                'DELETE FROM user_favorites WHERE user_id = ? AND job_hash = ?',
+                (user_id, job_hash)
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error removing favorite: {e}")
+            return False
+    
+    def get_user_favorites(self, user_id: int) -> List[Dict]:
+        """Get user's favorite jobs"""
+        results = self.fetchall("""
+            SELECT j.hash, j.title, j.company, j.level, j.category, j.url
+            FROM user_favorites f
+            JOIN posted_jobs j ON f.job_hash = j.hash
+            WHERE f.user_id = ?
+            ORDER BY f.saved_at DESC
+        """, (user_id,))
+        
+        return [
+            {
+                'hash': row[0],
+                'title': row[1],
+                'company': row[2],
+                'level': row[3],
+                'category': row[4],
+                'url': row[5],
+            }
+            for row in results
+        ]
+    
+    # User settings methods
+    def get_user_settings(self, user_id: int) -> Dict:
+        """Get user settings"""
+        result = self.fetchone(
+            'SELECT enabled_categories, hide_senior, min_salary_filter FROM user_settings WHERE user_id = ?',
+            (user_id,)
+        )
+        
+        if result:
+            return {
+                'enabled_categories': result[0].split(','),
+                'hide_senior': bool(result[1]),
+                'min_salary_filter': result[2],
+            }
+        
+        # Default settings
+        return {
+            'enabled_categories': list(CATEGORY_NAMES_RU.keys()),
+            'hide_senior': True,
+            'min_salary_filter': 0,
+        }
+    
+    def update_user_categories(self, user_id: int, categories: List[str]) -> bool:
+        """Update user's enabled categories"""
+        try:
+            self.execute("""
+                INSERT OR REPLACE INTO user_settings (user_id, enabled_categories, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            """, (user_id, ','.join(categories)))
+            return True
+        except Exception as e:
+            logger.error(f"Error updating categories: {e}")
+            return False
+    
+    def hide_category_for_user(self, user_id: int, category: str) -> bool:
+        """Hide category for user"""
+        settings = self.get_user_settings(user_id)
+        enabled = [c for c in settings['enabled_categories'] if c != category]
+        return self.update_user_categories(user_id, enabled)
+
 
 def init_database() -> DatabaseConnection:
     """Initialize and return database connection"""
     return DatabaseConnection()
+
 
 def generate_job_hash(job: Dict) -> str:
     """Generate robust hash using URL (primary) or title+company (fallback)"""
@@ -223,6 +410,7 @@ def generate_job_hash(job: Dict) -> str:
     company = job.get('company', '').lower()
     return hashlib.md5(f"{title}_{company}".encode()).hexdigest()
 
+
 def is_duplicate_job(job: Dict, db: DatabaseConnection) -> bool:
     """Check and register job deduplication with cleanup"""
     # Cleanup old records (>7 days)
@@ -230,6 +418,7 @@ def is_duplicate_job(job: Dict, db: DatabaseConnection) -> bool:
     db.execute('DELETE FROM posted_jobs WHERE posted_at < ?', (cleanup_threshold,))
     
     job_hash = generate_job_hash(job)
+    job['hash'] = job_hash  # Сохраняем hash в job для дальнейшего использования
     
     # Check if exists
     result = db.fetchone('SELECT 1 FROM posted_jobs WHERE hash = ?', (job_hash,))
@@ -239,14 +428,15 @@ def is_duplicate_job(job: Dict, db: DatabaseConnection) -> bool:
     
     # Register new job
     db.execute(
-        'INSERT INTO posted_jobs (hash, title, company, level, url, source) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO posted_jobs (hash, title, company, level, url, source, category) VALUES (?, ?, ?, ?, ?, ?, ?)',
         (
             job_hash,
             job.get('title', ''),
             job.get('company', ''),
             job.get('level', 'Junior'),
             job.get('url', ''),
-            job.get('source', '')
+            job.get('source', ''),
+            job.get('category', 'other')
         )
     )
     logger.debug(f"💾 Saved new job: {job.get('title', 'N/A')}")
@@ -256,19 +446,21 @@ def is_duplicate_job(job: Dict, db: DatabaseConnection) -> bool:
 def get_headers() -> Dict[str, str]:
     return {"User-Agent": random.choice(USER_AGENTS)}
 
+
 def escape_html(text: str) -> str:
-    """Escape HTML special characters safely - CRITICAL FIX!"""
+    """Escape HTML special characters safely"""
     if not text:
         return ''
     return (
-        text.replace('&', '&amp;')      # ← MUST BE FIRST!
+        text.replace('&', '&amp;')
             .replace('<', '&lt;')
             .replace('>', '&gt;')
             .replace('"', '&quot;')
     )
 
+
 def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) -> List[Dict]:
-    """Retry wrapper with exponential backoff - SYNC version for executor"""
+    """Retry wrapper with exponential backoff"""
     for attempt in range(max_retries):
         try:
             result = fetch_func()
@@ -289,8 +481,8 @@ def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) ->
     return []
 
 # ==================== JOB PROCESSING ====================
-def classify_job_level(job_data: Dict) -> Optional[str]:  # ✅ FIXED: job_data: Dict (was job_ Dict)
-    """Classify job level with exclusion logic - CRITICAL FIX!"""
+def classify_job_level(job_data: Dict) -> Optional[str]:
+    """Classify job level with exclusion logic"""
     full_text = f"{job_data.get('title', '')} {job_data.get('description', '')}".lower()
     
     # Exclude senior+ roles first
@@ -304,6 +496,18 @@ def classify_job_level(job_data: Dict) -> Optional[str]:  # ✅ FIXED: job_data:
     if any(role in full_text for role in IT_ROLES):
         return "Junior"
     return None
+
+
+def auto_classify_category(job: Dict) -> str:
+    """Автоматическая классификация категории"""
+    if CLASSIFIER_AVAILABLE:
+        try:
+            classifier = JobClassifier()
+            return classifier.classify(job)
+        except Exception as e:
+            logger.error(f"Error classifying job: {e}")
+    return 'other'
+
 
 def extract_salary(job: Dict) -> str:
     """Extract and format salary"""
@@ -321,6 +525,7 @@ def extract_salary(job: Dict) -> str:
             return f"до ${max_sal:,} {currency}"
     return 'Не указана'
 
+
 def extract_skills(job: Dict) -> List[str]:
     """Extract skills from tags and description"""
     skills = set()
@@ -337,6 +542,7 @@ def extract_skills(job: Dict) -> List[str]:
     
     return sorted(list(skills))[:5]
 
+
 def extract_posted_date(job: Dict) -> str:
     """Extract and format publication date"""
     date_raw = job.get('published') or job.get('created') or job.get('publication_date') or job.get('date_published')
@@ -346,37 +552,40 @@ def extract_posted_date(job: Dict) -> str:
     try:
         dt = datetime.fromisoformat(str(date_raw).replace('Z', '+00:00'))
         months_ru = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
-        return f"{dt.day} {months_ru[dt.month-1]} {dt.year}"
+        return f"{dt.day} {months_ru[dt.month-1]}"
     except:
         try:
             dt = datetime.strptime(str(date_raw)[:10], '%Y-%m-%d')
             months_ru = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
-            return f"{dt.day} {months_ru[dt.month-1]} {dt.year}"
+            return f"{dt.day} {months_ru[dt.month-1]}"
         except:
             return "Недавно"
+
 
 def extract_employment_type(job: Dict) -> str:
     """Extract employment type"""
     emp = job.get('employment_type', '') or job.get('type', '') or job.get('job_type', '') or job.get('contract_type', '')
     emp_lower = str(emp).lower()
     if 'full' in emp_lower or 'полная' in emp_lower:
-        return "⏰ Полная занятость"
+        return "⏰ Полная"
     elif 'part' in emp_lower or 'частичная' in emp_lower:
-        return "⏱ Частичная занятость"
+        return "⏱ Частичная"
     elif 'contract' in emp_lower or 'контракт' in emp_lower:
         return "📝 Контракт"
     elif emp:
         return f"⏰ {emp}"
     return "⏰ Не указана"
 
+
 def extract_description(job: Dict, max_length: int = 350) -> str:
     """Extract and sanitize description"""
     desc = job.get('description', '')
-    desc = re.sub(r'<[^>]+>', '', desc)  # Remove HTML tags
+    desc = re.sub(r'<[^>]+>', '', desc)
     desc = ' '.join(desc.split())
     if len(desc) > max_length:
         desc = desc[:max_length].rsplit(' ', 1)[0] + '...'
     return desc or "Описание не указано"
+
 
 def is_suitable_job(job: Dict) -> bool:
     """Check if job matches criteria (remote + IT role)"""
@@ -385,8 +594,9 @@ def is_suitable_job(job: Dict) -> bool:
     has_it_role = any(role in text for role in IT_ROLES)
     return has_remote and has_it_role
 
-def format_job_message(job: Dict) -> str:
-    """Format job message with HTML sanitization - CRITICAL FIX!"""
+
+def format_job_message_legacy(job: Dict) -> str:
+    """Legacy HTML formatter (fallback)"""
     level = job.get('level', 'Junior')
     emoji = "🟢" if level == "Junior" else "🟡" if level == "Middle" else "🔵"
     salary = extract_salary(job)
@@ -395,26 +605,26 @@ def format_job_message(job: Dict) -> str:
     employment = extract_employment_type(job)
     description = extract_description(job)
     
-    # Sanitize ALL user-generated content with escape_html() - CRITICAL FIX!
     title = escape_html(job['title'])
     company = escape_html(job['company'])
     location = escape_html(job.get('location', 'Remote'))
     source = escape_html(job['source'])
+    category = job.get('category', 'other')
+    cat_emoji = {'development': '💻', 'qa': '🧪', 'devops': '🔧', 'data': '📊', 
+                 'marketing': '📢', 'sales': '💼', 'pm': '📋', 'design': '🎨'}.get(category, '📌')
     
-    # Validate URL
     url = job.get('url', '').strip()
     if not url or not url.startswith('http'):
-        url = 'https://example.com'  # fallback
+        url = 'https://example.com'
     
     parts = [
-        f"{emoji} <b>{title}</b>",
+        f"{cat_emoji} <b>{title}</b>",
         "",
         f"🏢 <b>Компания:</b> {company}",
         f"📍 <b>Локация:</b> {location}",
         f"💵 <b>Зарплата:</b> {salary}",
         f"🎯 <b>Уровень:</b> {level}",
-        f"📅 <b>Дата публикации:</b> {posted_date}",
-        employment,
+        f"📅 <b>Дата:</b> {posted_date} | {employment}",
         "",
         f"📋 <b>Описание:</b>",
         description,
@@ -434,17 +644,16 @@ def format_job_message(job: Dict) -> str:
         f"📌 Источник: {source}"
     ])
     
-    message = "\n".join(parts)  # ✅ FIXED: proper newline
+    message = "\n".join(parts)
     
-    # Telegram message length limit: 4096 chars
     if len(message) > 4096:
         message = message[:4090] + "...\n<i>(сообщение сокращено)</i>"
     
     return message
 
-# ==================== API FETCHERS (NEW SOURCES ADDED) ====================
+# ==================== API FETCHERS ====================
 def fetch_remotive() -> List[Dict]:
-    """Remotive API - 100% remote, качественные вакансии"""
+    """Remotive API - 100% remote"""
     try:
         url = "https://remotive.com/api/remote-jobs?category=software-dev"
         response = requests.get(url, headers=get_headers(), timeout=15)
@@ -471,8 +680,9 @@ def fetch_remotive() -> List[Dict]:
         logger.error(f"❌ Remotive error: {e}")
         return []
 
+
 def fetch_remoteok() -> List[Dict]:
-    """RemoteOK API - качественные remote вакансии"""
+    """RemoteOK API"""
     try:
         url = "https://remoteok.com/api"
         response = requests.get(url, headers=get_headers(), timeout=15)
@@ -480,7 +690,7 @@ def fetch_remoteok() -> List[Dict]:
         data = response.json()
         
         jobs = []
-        for job in data[1:]:  # Skip first element (metadata)
+        for job in data[1:]:
             jobs.append({
                 'title': job.get('position', ''),
                 'company': job.get('company', ''),
@@ -499,15 +709,12 @@ def fetch_remoteok() -> List[Dict]:
         logger.error(f"❌ RemoteOK error: {e}")
         return []
 
+
 def fetch_arbeitnow() -> List[Dict]:
-    """Arbeitnow API - бесплатный, без лимитов, европейские вакансии"""
+    """Arbeitnow API"""
     try:
         url = "https://www.arbeitnow.com/api/job-board-api"
-        params = {
-            'page': 1,
-            'limit': 50,
-            'tags': 'it,software,developer,engineer'
-        }
+        params = {'page': 1, 'limit': 50, 'tags': 'it,software,developer,engineer'}
         response = requests.get(url, params=params, headers=get_headers(), timeout=15)
         response.raise_for_status()
         data = response.json()
@@ -516,7 +723,7 @@ def fetch_arbeitnow() -> List[Dict]:
         for job in data.get('data', []):
             salary = 'Не указана'
             if job.get('salary_min') and job.get('salary_max'):
-                salary = f"${job['salary_min']:,}-${job['salary_max']:,}"
+                salary = f"${job['salary_min']:,}-${job['salary_max']:}"
             elif job.get('salary_min'):
                 salary = f"от ${job['salary_min']:,}"
             
@@ -538,14 +745,12 @@ def fetch_arbeitnow() -> List[Dict]:
         logger.error(f"❌ Arbeitnow error: {e}")
         return []
 
+
 def fetch_himalayas() -> List[Dict]:
-    """Himalayas API - вакансии с зарплатами"""
+    """Himalayas API"""
     try:
         url = "https://himalayas.app/api/v1/jobs"
-        params = {
-            'limit': 30,
-            'remote': 'true'
-        }
+        params = {'limit': 30, 'remote': 'true'}
         response = requests.get(url, params=params, headers=get_headers(), timeout=15)
         response.raise_for_status()
         data = response.json()
@@ -575,8 +780,9 @@ def fetch_himalayas() -> List[Dict]:
         logger.error(f"❌ Himalayas error: {e}")
         return []
 
+
 def fetch_weworkremotely() -> List[Dict]:
-    """We Work Remotely JSON API - высочайшее качество"""
+    """We Work Remotely JSON API"""
     try:
         url = "https://weworkremotely.com/remote-jobs.json"
         response = requests.get(url, headers=get_headers(), timeout=15)
@@ -602,6 +808,7 @@ def fetch_weworkremotely() -> List[Dict]:
     except Exception as e:
         logger.error(f"❌ We Work Remotely error: {e}")
         return []
+
 
 def fetch_jobicy() -> List[Dict]:
     """Jobicy API"""
@@ -630,6 +837,7 @@ def fetch_jobicy() -> List[Dict]:
     except Exception as e:
         logger.error(f"❌ Jobicy error: {e}")
         return []
+
 
 def fetch_adzuna() -> List[Dict]:
     """Adzuna API"""
@@ -687,8 +895,9 @@ def fetch_adzuna() -> List[Dict]:
         logger.error(f"❌ Adzuna general error: {e}")
         return []
 
+
 def fetch_headhunter() -> List[Dict]:
-    """HeadHunter API - публичный эндпоинт"""
+    """HeadHunter API"""
     try:
         url = "https://api.hh.ru/vacancies"
         params = {
@@ -741,6 +950,7 @@ def fetch_headhunter() -> List[Dict]:
         logger.error(f"❌ HeadHunter error: {e}")
         return []
 
+
 def fetch_superjob() -> List[Dict]:
     """SuperJob API"""
     try:
@@ -749,14 +959,8 @@ def fetch_superjob() -> List[Dict]:
             return []
         
         url = "https://api.superjob.ru/2.0/vacancies/"
-        headers = {
-            'X-Api-App-Id': Config.SUPERJOB_API_KEY,
-            **get_headers()
-        }
-        params = {
-            'keyword': 'программист разработчик',
-            'count': 20
-        }
+        headers = {'X-Api-App-Id': Config.SUPERJOB_API_KEY, **get_headers()}
+        params = {'keyword': 'программист разработчик', 'count': 20}
         
         response = requests.get(url, headers=headers, params=params, timeout=15)
         
@@ -796,19 +1000,45 @@ def fetch_superjob() -> List[Dict]:
         logger.error(f"❌ SuperJob error: {e}")
         return []
 
+
+async def fetch_telegram_channels() -> List[Dict]:
+    """Fetch jobs from Telegram channels"""
+    if not Config.ENABLE_TELEGRAM_CHANNELS:
+        return []
+    
+    if not TELEGRAM_PARSER_AVAILABLE:
+        logger.debug("⚠️ Telegram parser not available")
+        return []
+    
+    if not Config.TELEGRAM_API_ID or not Config.TELEGRAM_API_HASH:
+        logger.debug("⚠️ Telegram API credentials not configured")
+        return []
+    
+    try:
+        # Для cron-запуска используем 1 час, для ручного - 24 часа
+        hours_back = 1
+        jobs = await fetch_telegram_jobs(hours_back=hours_back)
+        logger.info(f"📥 Fetched {len(jobs)} jobs from Telegram channels")
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ Telegram channels error: {e}")
+        return []
+
 # ==================== TELEGRAM BOT ====================
 class JobBot:
-    """Telegram bot with admin commands"""
+    """Telegram bot with enhanced features"""
     
     def __init__(self, application: Application, db: DatabaseConnection):
         self.application = application
         self.db = db
         self.is_paused = False
+        self.formatter = JobMessageFormatter() if FORMATTER_AVAILABLE else None
+        self.classifier = JobClassifier() if CLASSIFIER_AVAILABLE else None
     
     async def check_admin(self, update: Update) -> bool:
         """Check if user is admin"""
         if not Config.ADMIN_USER_ID:
-            return True  # No admin configured - allow all
+            return True
         
         user_id = update.effective_user.id
         if user_id != Config.ADMIN_USER_ID:
@@ -819,13 +1049,20 @@ class JobBot:
     
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
-        await update.message.reply_text(
+        welcome_text = (
             "👋 Привет! Я бот для сбора IT-вакансий Junior/Middle уровня.\n\n"
-            "Доступные команды:\n"
+            "*Доступные команды:*\n"
             "/status - Статистика бота\n"
-            "/last 5 - Последние 5 вакансий\n"
-            "/pause - Приостановить публикацию\n"
-            "/resume - Возобновить публикацию"
+            "/last N - Последние N вакансий\n"
+            "/favorites - Мои сохраненные вакансии\n"
+            "/categories - Настройка категорий\n"
+            "/pause - Приостановить публикацию (admin)\n"
+            "/resume - Возобновить публикацию (admin)"
+        )
+        
+        await update.message.reply_text(
+            welcome_text,
+            parse_mode=ParseMode.MARKDOWN
         )
     
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -833,18 +1070,37 @@ class JobBot:
         if not await self.check_admin(update):
             return
         
-        # Count posted jobs from DB
         result = self.db.fetchone('SELECT COUNT(*) FROM posted_jobs')
         total_posted = result[0] if result else 0
         
-        message = (
-            "📊 <b>Статистика бота:</b>\n\n"
-            f"✅ Всего опубликовано: {total_posted}\n"
-            f"⏸️ Статус: {'Приостановлен' if self.is_paused else 'Активен'}\n"
-            f"🕐 Последнее обновление: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        # Count by category
+        cat_results = self.db.fetchall(
+            'SELECT category, COUNT(*) FROM posted_jobs GROUP BY category'
         )
+        categories = {row[0]: row[1] for row in cat_results}
         
-        await update.message.reply_text(message, parse_mode='HTML')
+        stats = {
+            'total_jobs': total_posted,
+            'total_sources': 9 + (10 if Config.ENABLE_TELEGRAM_CHANNELS else 0),
+            'is_paused': self.is_paused,
+            'last_update': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'categories': categories,
+        }
+        
+        if self.formatter:
+            message = self.formatter.format_status_message(stats)
+            await update.message.reply_text(
+                message,
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+        else:
+            message = (
+                "📊 <b>Статистика бота:</b>\n\n"
+                f"✅ Всего опубликовано: {total_posted}\n"
+                f"⏸️ Статус: {'Приостановлен' if self.is_paused else 'Активен'}\n"
+                f"🕐 Обновление: {stats['last_update']}"
+            )
+            await update.message.reply_text(message, parse_mode='HTML')
     
     async def cmd_last(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /last N command"""
@@ -860,7 +1116,7 @@ class JobBot:
                 pass
         
         results = self.db.fetchall(
-            'SELECT title, company, level, posted_at, source FROM posted_jobs '
+            'SELECT title, company, level, category, posted_at, source FROM posted_jobs '
             'ORDER BY posted_at DESC LIMIT ?',
             (limit,)
         )
@@ -869,22 +1125,69 @@ class JobBot:
             await update.message.reply_text("📭 Нет опубликованных вакансий")
             return
         
-        message = f"🆕 <b>Последние {len(results)} вакансий:</b>\n\n"
-        for row in results:
-            title, company, level, posted_at, source = row
-            try:
-                dt = datetime.strptime(posted_at, '%Y-%m-%d %H:%M:%S')
-                date_str = dt.strftime('%d.%m.%Y %H:%M')
-            except:
-                date_str = "Недавно"
-            
-            message += (
-                f"• {escape_html(title)}\n"
-                f"  🏢 {escape_html(company)} | 🎯 {level}\n"
-                f"  📡 {source} | 📅 {date_str}\n\n"
-            )
+        jobs = [
+            {
+                'title': row[0],
+                'company': row[1],
+                'level': row[2],
+                'category': row[3],
+            }
+            for row in results
+        ]
         
-        await update.message.reply_text(message, parse_mode='HTML')
+        if self.formatter:
+            message = self.formatter.format_job_list(jobs, limit)
+            await update.message.reply_text(
+                message,
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+        else:
+            message = f"🆕 <b>Последние {len(results)} вакансий:</b>\n\n"
+            for row in results:
+                title, company, level, category, posted_at, source = row
+                message += f"• {escape_html(title)}\n  🏢 {escape_html(company)} | 🎯 {level}\n\n"
+            await update.message.reply_text(message, parse_mode='HTML')
+    
+    async def cmd_favorites(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /favorites command"""
+        user_id = update.effective_user.id
+        favorites = self.db.get_user_favorites(user_id)
+        
+        if self.formatter:
+            message = self.formatter.format_favorites_list(favorites)
+            await update.message.reply_text(
+                message,
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+        else:
+            if not favorites:
+                await update.message.reply_text("💾 Список избранного пуст")
+            else:
+                message = f"💾 <b>Избранное ({len(favorites)}):</b>\n\n"
+                for job in favorites[:10]:
+                    message += f"• {escape_html(job['title'])}\n  🏢 {escape_html(job['company'])}\n\n"
+                await update.message.reply_text(message, parse_mode='HTML')
+    
+    async def cmd_categories(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /categories command"""
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        enabled = settings['enabled_categories']
+        
+        if self.formatter:
+            keyboard = self.formatter.create_category_settings_keyboard(enabled)
+            await update.message.reply_text(
+                "📂 *Настройка категорий:*\n\n"
+                "Выберите категории для отображения:",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(keyboard['inline_keyboard'])
+            )
+        else:
+            cat_list = "\n".join([f"  • {CATEGORY_NAMES_RU.get(c, c)}" for c in enabled])
+            await update.message.reply_text(
+                f"📂 Активные категории:\n{cat_list}\n\n"
+                f"(Детальная настройка доступна с модулем форматирования)"
+            )
     
     async def cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /pause command"""
@@ -904,26 +1207,97 @@ class JobBot:
         await update.message.reply_text("▶️ Публикация возобновлена")
         logger.info("▶️ Bot resumed by admin")
     
+    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle inline keyboard callbacks"""
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data
+        user_id = update.effective_user.id
+        
+        if data.startswith('save:'):
+            job_hash = data.split(':', 1)[1]
+            self.db.add_favorite(user_id, job_hash)
+            await query.edit_message_text(
+                query.message.text + "\n\n💾 *Сохранено в избранное*",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=None
+            )
+        
+        elif data.startswith('expand:'):
+            # Получаем полную информацию о вакансии и показываем развернутый вид
+            await query.answer("Разворачиваю... (в разработке)")
+        
+        elif data.startswith('compact:'):
+            await query.answer("Сворачиваю... (в разработке)")
+        
+        elif data.startswith('hide_cat:'):
+            category = data.split(':', 1)[1]
+            self.db.hide_category_for_user(user_id, category)
+            cat_name = CATEGORY_NAMES_RU.get(category, category)
+            await query.answer(f"Категория {cat_name} скрыта")
+            await query.edit_message_text(
+                query.message.text + f"\n\n🚫 Категория '{cat_name}' скрыта",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=None
+            )
+        
+        elif data.startswith('toggle_cat:'):
+            category = data.split(':', 1)[1]
+            settings = self.db.get_user_settings(user_id)
+            enabled = settings['enabled_categories']
+            
+            if category in enabled:
+                enabled.remove(category)
+            else:
+                enabled.append(category)
+            
+            self.db.update_user_categories(user_id, enabled)
+            
+            # Обновляем клавиатуру
+            if self.formatter:
+                keyboard = self.formatter.create_category_settings_keyboard(enabled)
+                await query.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup(keyboard['inline_keyboard'])
+                )
+        
+        elif data == 'close_settings':
+            await query.delete_message()
+    
     async def post_job(self, job: Dict) -> bool:
-        """Post job to channel with flood control - CRITICAL FIX!"""
+        """Post job to channel with enhanced formatting"""
         if self.is_paused:
             logger.info("⏸️ Skipped posting (bot is paused)")
             return False
         
         try:
-            message = format_job_message(job)
-            await self.application.bot.send_message(
-                chat_id=Config.CHANNEL_ID,
-                text=message,
-                parse_mode='HTML',
-                disable_web_page_preview=True
-            )
-            logger.info(f"✅ Posted: {job.get('title', 'N/A')} at {job.get('company', 'N/A')}")
+            # Используем новый форматтер если доступен
+            if Config.ENABLE_MARKDOWN_V2 and self.formatter:
+                formatted = self.formatter.format_job(job, view_mode='compact')
+                await self.application.bot.send_message(
+                    chat_id=Config.CHANNEL_ID,
+                    text=formatted.text,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=InlineKeyboardMarkup(formatted.reply_markup['inline_keyboard']),
+                    disable_web_page_preview=formatted.disable_web_page_preview
+                )
+            else:
+                # Fallback на legacy HTML форматирование
+                message = format_job_message_legacy(job)
+                await self.application.bot.send_message(
+                    chat_id=Config.CHANNEL_ID,
+                    text=message,
+                    parse_mode='HTML',
+                    disable_web_page_preview=True
+                )
+            
+            logger.info(f"✅ Posted: {job.get('title', 'N/A')} [{job.get('category', 'other')}]")
             return True
+            
         except RetryAfter as e:
             logger.warning(f"⏳ Telegram flood control: retry after {e.retry_after}s")
             await asyncio.sleep(e.retry_after)
-            return await self.post_job(job)  # Retry once
+            return await self.post_job(job)
         except TimedOut:
             logger.error("❌ Telegram timeout")
             return False
@@ -933,12 +1307,16 @@ class JobBot:
 
 # ==================== MAIN LOOP ====================
 async def main():
-    """Main application loop with admin interface - CRITICAL FIXES!"""
+    """Main application loop"""
     logger.info("=" * 60)
-    logger.info("🚀 Job Bot Starting (v5.3 - FULLY FIXED & VERIFIED)")
+    logger.info("🚀 Job Bot Starting (v6.0 - Enhanced Edition)")
     logger.info(f"📡 Channel: {Config.CHANNEL_ID}")
-    logger.info(f"⏱️  Check interval: {Config.CHECK_INTERVAL}s")
+    logger.info(f"⏱️ Check interval: {Config.CHECK_INTERVAL}s")
     logger.info(f"📊 Max posts per cycle: {Config.MAX_POSTS_PER_CYCLE}")
+    logger.info(f"🤖 MarkdownV2: {Config.ENABLE_MARKDOWN_V2}")
+    logger.info(f"📱 Telegram channels: {Config.ENABLE_TELEGRAM_CHANNELS}")
+    logger.info(f"🧠 Classifier: {CLASSIFIER_AVAILABLE}")
+    logger.info(f"🎨 Formatter: {FORMATTER_AVAILABLE}")
     if Config.ADMIN_USER_ID:
         logger.info(f"👤 Admin user ID: {Config.ADMIN_USER_ID}")
     logger.info("=" * 60)
@@ -946,7 +1324,7 @@ async def main():
     # Initialize database
     db = init_database()
     
-    # Setup Telegram bot with Application (v20+ API) - CRITICAL FIX!
+    # Setup Telegram bot
     application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
     job_bot = JobBot(application, db)
     
@@ -954,8 +1332,11 @@ async def main():
     application.add_handler(CommandHandler("start", job_bot.cmd_start))
     application.add_handler(CommandHandler("status", job_bot.cmd_status))
     application.add_handler(CommandHandler("last", job_bot.cmd_last))
+    application.add_handler(CommandHandler("favorites", job_bot.cmd_favorites))
+    application.add_handler(CommandHandler("categories", job_bot.cmd_categories))
     application.add_handler(CommandHandler("pause", job_bot.cmd_pause))
     application.add_handler(CommandHandler("resume", job_bot.cmd_resume))
+    application.add_handler(CallbackQueryHandler(job_bot.handle_callback))
     
     # Start bot
     await application.initialize()
@@ -970,11 +1351,11 @@ async def main():
         loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s, application, db)))
     
     # Main collection loop
-    fetch_functions = [
+    api_fetch_functions = [
         (fetch_remotive, "Remotive"),
         (fetch_remoteok, "RemoteOK"),
-        (fetch_arbeitnow, "Arbeitnow"),      # NEW SOURCE!
-        (fetch_himalayas, "Himalayas"),      # NEW SOURCE!
+        (fetch_arbeitnow, "Arbeitnow"),
+        (fetch_himalayas, "Himalayas"),
         (fetch_weworkremotely, "We Work Remotely"),
         (fetch_jobicy, "Jobicy"),
         (fetch_headhunter, "HeadHunter"),
@@ -992,25 +1373,39 @@ async def main():
             logger.info("🔄 Starting job collection cycle...")
             all_jobs = []
             
-            # Run sync fetchers in executor to avoid blocking event loop - CRITICAL FIX!
-            for fetch_func, source_name in fetch_functions:
+            # Fetch from API sources
+            for fetch_func, source_name in api_fetch_functions:
                 jobs = await loop.run_in_executor(
                     None, safe_fetch_with_retry, fetch_func, source_name
                 )
                 all_jobs.extend(jobs)
                 logger.info(f"📥 Fetched {len(jobs)} jobs from {source_name}")
             
+            # Fetch from Telegram channels
+            if Config.ENABLE_TELEGRAM_CHANNELS:
+                tg_jobs = await fetch_telegram_channels()
+                all_jobs.extend(tg_jobs)
+            
             logger.info(f"📊 Total jobs fetched: {len(all_jobs)}")
             
-            # Filter and classify
+            # Filter, classify and process
             classified_jobs = []
             for job in all_jobs:
                 if not is_suitable_job(job):
                     continue
+                
+                # Classify level
                 level = classify_job_level(job)
                 if level:
                     job['level'] = level
-                    classified_jobs.append(job)
+                else:
+                    continue
+                
+                # Auto-classify category
+                category = auto_classify_category(job)
+                job['category'] = category
+                
+                classified_jobs.append(job)
             
             logger.info(f"🎯 Suitable Junior/Middle jobs: {len(classified_jobs)}")
             
@@ -1020,28 +1415,27 @@ async def main():
                 if not is_duplicate_job(job, db):
                     if await job_bot.post_job(job):
                         posted_count += 1
-                        await asyncio.sleep(DELAYS['between_posts'])  # ✅ FIXED: await asyncio.sleep
+                        await asyncio.sleep(DELAYS['between_posts'])
             
             logger.info(f"✅ Posted {posted_count} new jobs to channel")
             logger.info(f"⏳ Waiting {Config.CHECK_INTERVAL//60} minutes before next cycle...")
-            await asyncio.sleep(Config.CHECK_INTERVAL)  # ✅ FIXED: await asyncio.sleep
+            await asyncio.sleep(Config.CHECK_INTERVAL)
             
         except Exception as e:
             logger.error(f"❌ Error in main loop: {e}", exc_info=True)
             await asyncio.sleep(300)
 
+
 async def shutdown(signal, application, db):
     """Graceful shutdown handler"""
     logger.info(f"🛑 Received exit signal {signal.name}")
     
-    # Stop bot
     await application.stop()
     await application.shutdown()
-    
-    # Close database
     db.close()
     logger.info("👋 Bot shutdown complete")
     sys.exit(0)
+
 
 if __name__ == "__main__":
     try:

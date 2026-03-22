@@ -1,3 +1,12 @@
+# Core dependencies
 python-telegram-bot==20.6
 python-dotenv==1.0.0
 requests==2.31.0
+
+# Telegram channel parsing (optional)
+# Установите для работы с Telegram-каналами:
+# pip install telethon
+telethon>=1.28.5
+
+# Optional: для продвинутой обработки дат
+# python-dateutil>=2.8.0
