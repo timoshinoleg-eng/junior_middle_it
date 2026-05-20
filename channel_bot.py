@@ -23,12 +23,13 @@ import signal
 import asyncio
 import re
 import requests
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+import xml.etree.ElementTree as ET
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, Bot
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, 
     CallbackQueryHandler, filters
 )
-from telegram.error import RetryAfter, TimedOut
+from telegram.error import InvalidToken, RetryAfter, TelegramError, TimedOut
 from telegram.constants import ParseMode
 from dotenv import load_dotenv
 
@@ -65,8 +66,34 @@ class Config:
     SUPERJOB_API_KEY = os.getenv('SUPERJOB_API_KEY')
     ADZUNA_APP_ID = os.getenv('ADZUNA_APP_ID')
     ADZUNA_APP_KEY = os.getenv('ADZUNA_APP_KEY')
+    HEADHUNTER_USER_AGENT = os.getenv(
+        'HEADHUNTER_USER_AGENT',
+        'RestoBotVacancyParser/1.0 (https://github.com/timoshinoleg-eng/junior_middle_it)'
+    )
+    HEADHUNTER_ACCESS_TOKEN = os.getenv('HEADHUNTER_ACCESS_TOKEN')
+    REED_API_KEY = os.getenv('REED_API_KEY')
+    JOOBLE_API_KEY = os.getenv('JOOBLE_API_KEY')
+    FINDWORK_API_TOKEN = os.getenv('FINDWORK_API_TOKEN')
+    USAJOBS_API_KEY = os.getenv('USAJOBS_API_KEY')
+    USAJOBS_USER_AGENT = os.getenv('USAJOBS_USER_AGENT')
+    APIFY_API_TOKEN = os.getenv('APIFY_API_TOKEN')
+    APIFY_ENABLE_PAID_ACTORS = os.getenv('APIFY_ENABLE_PAID_ACTORS', 'false').lower() == 'true'
+    APIFY_MAX_ITEMS = int(os.getenv('APIFY_MAX_ITEMS', '30'))
+    CRON_SECRET = os.getenv('CRON_SECRET')
+    DEDUP_MODE = os.getenv('DEDUP_MODE', 'sqlite')
+    RECENT_TELEGRAM_MESSAGES = int(os.getenv('RECENT_TELEGRAM_MESSAGES', '800'))
+    GREENHOUSE_BOARDS = os.getenv('GREENHOUSE_BOARDS', 'gitlab,canonical,elastic').split(',')
+    LEVER_COMPANIES = os.getenv(
+        'LEVER_COMPANIES',
+        'Instrumentl,2brains,360learning'
+    ).split(',')
+    ASHBY_COMPANIES = os.getenv(
+        'ASHBY_COMPANIES',
+        'cursor,linear,supabase,openai'
+    ).split(',')
     TELEGRAM_API_ID = os.getenv('TELEGRAM_API_ID')
     TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
+    TELEGRAM_SESSION_NAME = os.getenv('TELEGRAM_SESSION_NAME')
     CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1800'))
     MAX_POSTS_PER_CYCLE = int(os.getenv('MAX_POSTS_PER_CYCLE', '15'))
     ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
@@ -97,14 +124,17 @@ class Config:
             return False
         return True
 
-if not Config.validate():
-    sys.exit(1)
-
 # ==================== LOGGING SETUP ====================
 def setup_logger():
     """Setup structured logging to console and file"""
     log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
     log_file = os.getenv('LOG_FILE', 'bot.log')
+    enable_file_log = os.getenv('DISABLE_FILE_LOG', '').lower() != 'true' and not os.getenv('VERCEL')
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
     
     # Create logs directory
     log_path = Path(log_file)
@@ -126,15 +156,19 @@ def setup_logger():
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
     
-    # File handler
-    file_handler = logging.FileHandler(log_file, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    file_handler.setFormatter(file_formatter)
-    logger.addHandler(file_handler)
+    # File handler is disabled on read-only serverless filesystems such as Vercel.
+    if enable_file_log:
+        try:
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler.setLevel(logging.DEBUG)
+            file_formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            file_handler.setFormatter(file_formatter)
+            logger.addHandler(file_handler)
+        except OSError as e:
+            logger.warning(f"File logging disabled: {e}")
     
     return logger
 
@@ -185,6 +219,17 @@ IT_ROLES = [
 ]
 
 REMOTE_KEYWORDS = ["remote", "удаленно", "удалённо", "work from home", "дистанционно", "wfh"]
+REMOTE_ONLY_SOURCES = {
+    "Remotive",
+    "RemoteOK",
+    "Himalayas",
+    "We Work Remotely",
+    "Jobicy",
+    "DevITJobs UK",
+    "HN Who is Hiring",
+    "CryptocurrencyJobs",
+    "Wellfound",
+}
 
 TECH_STACK = [
     'Python', 'JavaScript', 'TypeScript', 'React', 'Vue', 'Angular',
@@ -411,8 +456,15 @@ def generate_job_hash(job: Dict) -> str:
     return hashlib.md5(f"{title}_{company}".encode()).hexdigest()
 
 
+def extract_urls_from_text(text: str) -> List[str]:
+    """Extract URLs from plain/Markdown/HTML text."""
+    if not text:
+        return []
+    return [url.rstrip(').,]>\'"') for url in re.findall(r'https?://[^\s\])>]+', text)]
+
+
 def is_duplicate_job(job: Dict, db: DatabaseConnection) -> bool:
-    """Check and register job deduplication with cleanup"""
+    """Check job deduplication with cleanup."""
     # Cleanup old records (>7 days)
     cleanup_threshold = datetime.now() - timedelta(days=7)
     db.execute('DELETE FROM posted_jobs WHERE posted_at < ?', (cleanup_threshold,))
@@ -425,10 +477,16 @@ def is_duplicate_job(job: Dict, db: DatabaseConnection) -> bool:
     if result:
         logger.debug(f"⏭️ Duplicate skipped: {job.get('title', 'N/A')}")
         return True
-    
-    # Register new job
+
+    return False
+
+
+def register_posted_job(job: Dict, db: DatabaseConnection) -> None:
+    """Register a job after it has been successfully posted."""
+    job_hash = job.get('hash') or generate_job_hash(job)
+    job['hash'] = job_hash
     db.execute(
-        'INSERT INTO posted_jobs (hash, title, company, level, url, source, category) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT OR IGNORE INTO posted_jobs (hash, title, company, level, url, source, category) VALUES (?, ?, ?, ?, ?, ?, ?)',
         (
             job_hash,
             job.get('title', ''),
@@ -440,7 +498,6 @@ def is_duplicate_job(job: Dict, db: DatabaseConnection) -> bool:
         )
     )
     logger.debug(f"💾 Saved new job: {job.get('title', 'N/A')}")
-    return False
 
 # ==================== UTILS ====================
 def get_headers() -> Dict[str, str]:
@@ -457,6 +514,36 @@ def escape_html(text: str) -> str:
             .replace('>', '&gt;')
             .replace('"', '&quot;')
     )
+
+
+def strip_html(text: str) -> str:
+    """Remove HTML tags and normalize whitespace."""
+    if not text:
+        return ''
+    text = re.sub(r'<[^>]+>', ' ', str(text))
+    return ' '.join(text.split())
+
+
+def first_text(parent, *names: str) -> str:
+    """Extract first matching child text from an XML element."""
+    for name in names:
+        child = parent.find(name)
+        if child is not None and child.text:
+            return child.text.strip()
+    return ''
+
+
+def non_empty_csv(values: List[str]) -> List[str]:
+    return [value.strip() for value in values if value and value.strip()]
+
+
+def has_text_signal(text: str, signal: str) -> bool:
+    """Match a keyword or phrase without accidental substring hits."""
+    signal = signal.strip().lower()
+    if not signal:
+        return False
+    pattern = r'(?<![\w])' + re.escape(signal) + r'(?![\w])'
+    return re.search(pattern, text, flags=re.IGNORECASE) is not None
 
 
 def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) -> List[Dict]:
@@ -486,12 +573,12 @@ def classify_job_level(job_data: Dict) -> Optional[str]:
     full_text = f"{job_data.get('title', '')} {job_data.get('description', '')}".lower()
     
     # Exclude senior+ roles first
-    if any(word in full_text for word in EXCLUDE_SIGNALS):
+    if any(has_text_signal(full_text, word) for word in EXCLUDE_SIGNALS):
         return None
     
-    if any(signal in full_text for signal in JUNIOR_SIGNALS):
+    if any(has_text_signal(full_text, signal) for signal in JUNIOR_SIGNALS):
         return "Junior"
-    if any(signal in full_text for signal in MIDDLE_SIGNALS):
+    if any(has_text_signal(full_text, signal) for signal in MIDDLE_SIGNALS):
         return "Middle"
     if any(role in full_text for role in IT_ROLES):
         return "Junior"
@@ -589,8 +676,9 @@ def extract_description(job: Dict, max_length: int = 350) -> str:
 
 def is_suitable_job(job: Dict) -> bool:
     """Check if job matches criteria (remote + IT role)"""
-    text = f"{job['title']} {job.get('description', '')}".lower()
-    has_remote = any(kw in text for kw in REMOTE_KEYWORDS)
+    text = f"{job.get('title', '')} {job.get('description', '')} {job.get('location', '')}".lower()
+    source = job.get('source', '').split(':', 1)[0]
+    has_remote = source in REMOTE_ONLY_SOURCES or any(kw in text for kw in REMOTE_KEYWORDS)
     has_it_role = any(role in text for role in IT_ROLES)
     return has_remote and has_it_role
 
@@ -749,8 +837,8 @@ def fetch_arbeitnow() -> List[Dict]:
 def fetch_himalayas() -> List[Dict]:
     """Himalayas API"""
     try:
-        url = "https://himalayas.app/api/v1/jobs"
-        params = {'limit': 30, 'remote': 'true'}
+        url = "https://himalayas.app/jobs/api"
+        params = {'limit': 50, 'offset': 0}
         response = requests.get(url, params=params, headers=get_headers(), timeout=15)
         response.raise_for_status()
         data = response.json()
@@ -759,20 +847,20 @@ def fetch_himalayas() -> List[Dict]:
         for job in data.get('jobs', []):
             salary = 'Не указана'
             if job.get('minSalary') and job.get('maxSalary'):
-                currency = job.get('salaryCurrency', 'USD')
+                currency = job.get('currency', 'USD')
                 salary = f"{job['minSalary']:,}-{job['maxSalary']:,} {currency}"
             
             jobs.append({
                 'title': job.get('title', ''),
-                'company': job.get('company', {}).get('name', ''),
-                'description': job.get('description', ''),
-                'url': job.get('applicationUrl', ''),
+                'company': job.get('companyName', ''),
+                'description': job.get('excerpt') or strip_html(job.get('description', '')),
+                'url': job.get('applicationLink') or f"https://himalayas.app/companies/{job.get('companySlug', '')}/jobs/{job.get('guid', '')}",
                 'salary': salary,
                 'location': 'Remote',
-                'published': job.get('createdAt', ''),
+                'published': job.get('pubDate', ''),
                 'employment_type': job.get('employmentType', ''),
                 'source': 'Himalayas',
-                'tags': job.get('tags', [])
+                'tags': job.get('categories', []) + job.get('parentCategories', [])
             })
         
         return jobs
@@ -782,23 +870,26 @@ def fetch_himalayas() -> List[Dict]:
 
 
 def fetch_weworkremotely() -> List[Dict]:
-    """We Work Remotely JSON API"""
+    """We Work Remotely RSS feed"""
     try:
-        url = "https://weworkremotely.com/remote-jobs.json"
-        response = requests.get(url, headers=get_headers(), timeout=15)
+        url = "https://weworkremotely.com/categories/remote-programming-jobs.rss"
+        headers = {**get_headers(), 'Accept': 'application/rss+xml, application/xml;q=0.9, */*;q=0.8'}
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
-        data = response.json()
+        root = ET.fromstring(response.content)
         
         jobs = []
-        for job in data.get('jobs', [])[:20]:
+        for item in root.findall('.//item')[:30]:
+            title = first_text(item, 'title')
+            company = first_text(item, '{http://purl.org/dc/elements/1.1/}creator') or 'We Work Remotely'
             jobs.append({
-                'title': job.get('title', ''),
-                'company': job.get('company', {}).get('name', ''),
-                'description': job.get('description', ''),
-                'url': f"https://weworkremotely.com{job.get('url', '')}",
+                'title': title,
+                'company': company,
+                'description': strip_html(first_text(item, 'description')),
+                'url': first_text(item, 'link'),
                 'salary': 'Не указана',
                 'location': 'Remote',
-                'published': job.get('date', ''),
+                'published': first_text(item, 'pubDate'),
                 'employment_type': '',
                 'source': 'We Work Remotely',
                 'tags': []
@@ -836,6 +927,230 @@ def fetch_jobicy() -> List[Dict]:
         return jobs
     except Exception as e:
         logger.error(f"❌ Jobicy error: {e}")
+        return []
+
+
+def fetch_devitjobs() -> List[Dict]:
+    """DevITJobs UK XML feed."""
+    try:
+        response = requests.get("https://devitjobs.uk/job_feed.xml", headers=get_headers(), timeout=25)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        jobs = []
+        for item in root.findall('.//job')[:200]:
+            title = first_text(item, 'title', 'name')
+            description = strip_html(first_text(item, 'description'))
+            location = first_text(item, 'location', 'region', 'country') or 'Remote'
+            if 'remote' not in f"{title} {description} {location}".lower():
+                continue
+            jobs.append({
+                'title': title,
+                'company': first_text(item, 'company', 'company-name') or 'N/A',
+                'description': description,
+                'url': first_text(item, 'url', 'link', 'apply_url'),
+                'salary': first_text(item, 'salary') or 'Не указана',
+                'location': location,
+                'published': first_text(item, 'pubdate'),
+                'employment_type': first_text(item, 'jobtype', 'job-type', 'job-status'),
+                'source': 'DevITJobs UK',
+                'tags': []
+            })
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ DevITJobs error: {e}")
+        return []
+
+
+def fetch_hackernews() -> List[Dict]:
+    """HN Algolia comments from latest Who is Hiring thread."""
+    try:
+        story_resp = requests.get(
+            "https://hn.algolia.com/api/v1/search_by_date",
+            params={'query': 'remote', 'tags': 'story,author_whoishiring'},
+            headers=get_headers(),
+            timeout=15
+        )
+        story_resp.raise_for_status()
+        stories = story_resp.json().get('hits', [])
+        if not stories:
+            return []
+
+        story_id = stories[0].get('objectID')
+        response = requests.get(
+            "https://hn.algolia.com/api/v1/search_by_date",
+            params={'query': 'remote', 'tags': f'comment,story_{story_id}', 'hitsPerPage': 50},
+            headers=get_headers(),
+            timeout=15
+        )
+        response.raise_for_status()
+        jobs = []
+        for hit in response.json().get('hits', []):
+            text = strip_html(hit.get('comment_text', ''))
+            if not text:
+                continue
+            if text.count('|') < 2:
+                continue
+            if '?' in text[:160]:
+                continue
+            title = text.split('|', 1)[0].strip()[:120] or hit.get('story_title', 'HN Who is Hiring')
+            jobs.append({
+                'title': title,
+                'company': title.split(' ', 1)[0],
+                'description': text,
+                'url': f"https://news.ycombinator.com/item?id={hit.get('objectID')}",
+                'salary': 'Не указана',
+                'location': 'Remote',
+                'published': hit.get('created_at', ''),
+                'employment_type': '',
+                'source': 'HN Who is Hiring',
+                'tags': []
+            })
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ HN Algolia error: {e}")
+        return []
+
+
+def fetch_reed() -> List[Dict]:
+    """Reed API, requires REED_API_KEY."""
+    if not Config.REED_API_KEY:
+        logger.warning("⚠️ Reed API key not found, skipping")
+        return []
+    try:
+        response = requests.get(
+            "https://www.reed.co.uk/api/1.0/search",
+            auth=(Config.REED_API_KEY, ''),
+            params={'keywords': 'junior middle software developer', 'location': 'remote', 'resultsToTake': 50},
+            timeout=15
+        )
+        response.raise_for_status()
+        jobs = []
+        for item in response.json().get('results', []):
+            salary = 'Не указана'
+            if item.get('minimumSalary') or item.get('maximumSalary'):
+                salary = f"{item.get('minimumSalary') or 0:,.0f}-{item.get('maximumSalary') or 0:,.0f} GBP"
+            jobs.append({
+                'title': item.get('jobTitle', ''),
+                'company': item.get('employerName', ''),
+                'description': item.get('jobDescription', ''),
+                'url': item.get('jobUrl', ''),
+                'salary': salary,
+                'location': item.get('locationName', 'Remote'),
+                'published': item.get('date', ''),
+                'employment_type': item.get('jobType', ''),
+                'source': 'Reed',
+                'tags': []
+            })
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ Reed error: {e}")
+        return []
+
+
+def fetch_jooble() -> List[Dict]:
+    """Jooble API, requires JOOBLE_API_KEY."""
+    if not Config.JOOBLE_API_KEY:
+        logger.warning("⚠️ Jooble API key not found, skipping")
+        return []
+    try:
+        response = requests.post(
+            f"https://jooble.org/api/v2/jobs/{Config.JOOBLE_API_KEY}",
+            json={'keywords': 'junior middle developer remote', 'location': 'Remote', 'page': 1},
+            headers=get_headers(),
+            timeout=15
+        )
+        response.raise_for_status()
+        jobs = []
+        for item in response.json().get('jobs', []):
+            jobs.append({
+                'title': item.get('title', ''),
+                'company': item.get('company', ''),
+                'description': item.get('snippet', ''),
+                'url': item.get('link', ''),
+                'salary': item.get('salary', '') or 'Не указана',
+                'location': item.get('location', 'Remote'),
+                'published': item.get('updated', ''),
+                'employment_type': item.get('type', ''),
+                'source': 'Jooble',
+                'tags': []
+            })
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ Jooble error: {e}")
+        return []
+
+
+def fetch_findwork() -> List[Dict]:
+    """FindWork.dev API, requires FINDWORK_API_TOKEN."""
+    if not Config.FINDWORK_API_TOKEN:
+        logger.warning("⚠️ FindWork token not found, skipping")
+        return []
+    try:
+        response = requests.get(
+            "https://findwork.dev/api/jobs/",
+            headers={'Authorization': f'Token {Config.FINDWORK_API_TOKEN}', **get_headers()},
+            params={'search': 'remote junior middle python developer'},
+            timeout=15
+        )
+        response.raise_for_status()
+        data = response.json()
+        items = data.get('results', data if isinstance(data, list) else [])
+        jobs = []
+        for item in items:
+            jobs.append({
+                'title': item.get('role', '') or item.get('title', ''),
+                'company': item.get('company_name', '') or item.get('company', ''),
+                'description': item.get('text', '') or item.get('description', ''),
+                'url': item.get('url', ''),
+                'salary': 'Не указана',
+                'location': item.get('location', 'Remote'),
+                'published': item.get('date_posted', ''),
+                'employment_type': '',
+                'source': 'FindWork',
+                'tags': item.get('keywords', [])
+            })
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ FindWork error: {e}")
+        return []
+
+
+def fetch_usajobs() -> List[Dict]:
+    """USAJobs API, requires USAJOBS_API_KEY and USAJOBS_USER_AGENT."""
+    if not Config.USAJOBS_API_KEY or not Config.USAJOBS_USER_AGENT:
+        logger.warning("⚠️ USAJobs credentials not found, skipping")
+        return []
+    try:
+        response = requests.get(
+            "https://data.usajobs.gov/api/search",
+            headers={
+                'Host': 'data.usajobs.gov',
+                'User-Agent': Config.USAJOBS_USER_AGENT,
+                'Authorization-Key': Config.USAJOBS_API_KEY,
+            },
+            params={'Keyword': 'IT developer software', 'RemoteIndicator': 'true', 'ResultsPerPage': 50},
+            timeout=15
+        )
+        response.raise_for_status()
+        jobs = []
+        for item in response.json().get('SearchResult', {}).get('SearchResultItems', []):
+            desc = item.get('MatchedObjectDescriptor', {})
+            salary = desc.get('PositionRemuneration', [{}])[0] if desc.get('PositionRemuneration') else {}
+            jobs.append({
+                'title': desc.get('PositionTitle', ''),
+                'company': desc.get('OrganizationName', ''),
+                'description': desc.get('QualificationSummary', ''),
+                'url': desc.get('PositionURI', ''),
+                'salary': f"{salary.get('MinimumRange', '')}-{salary.get('MaximumRange', '')} {salary.get('RateIntervalCode', '')}".strip('- '),
+                'location': 'Remote',
+                'published': desc.get('PublicationStartDate', ''),
+                'employment_type': desc.get('PositionSchedule', [{}])[0].get('Name', '') if desc.get('PositionSchedule') else '',
+                'source': 'USAJobs',
+                'tags': []
+            })
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ USAJobs error: {e}")
         return []
 
 
@@ -900,15 +1215,32 @@ def fetch_headhunter() -> List[Dict]:
     """HeadHunter API"""
     try:
         url = "https://api.hh.ru/vacancies"
+        headers = {
+            'User-Agent': Config.HEADHUNTER_USER_AGENT,
+            'Accept': 'application/json',
+        }
+        if Config.HEADHUNTER_ACCESS_TOKEN:
+            headers['Authorization'] = f"Bearer {Config.HEADHUNTER_ACCESS_TOKEN}"
+
         params = {
-            'text': 'программист разработчик developer remote удалённо',
+            'text': 'python OR javascript OR frontend OR backend OR qa OR devops OR data',
             'per_page': 50,
             'page': 0,
-            'schedule': 'remote'
+            'schedule': 'remote',
+            'experience': ('noExperience', 'between1And3', 'between3And6'),
+            'employment': ('full', 'part', 'project'),
+            'order_by': 'publication_time',
+            'period': 14,
+            'search_field': ('name', 'description')
         }
         
-        headers = get_headers()
         response = requests.get(url, params=params, headers=headers, timeout=15)
+        if response.status_code == 403 and not Config.HEADHUNTER_ACCESS_TOKEN:
+            logger.warning(
+                "⚠️ HeadHunter /vacancies returned 403 without OAuth. "
+                "Set HEADHUNTER_ACCESS_TOKEN if anonymous vacancy search is blocked."
+            )
+            return []
         response.raise_for_status()
         data = response.json()
         
@@ -931,14 +1263,16 @@ def fetch_headhunter() -> List[Dict]:
             
             employment = item.get('employment', {})
             employment_name = employment.get('name', '') if isinstance(employment, dict) else ''
+            experience = item.get('experience', {})
+            experience_name = experience.get('name', '') if isinstance(experience, dict) else ''
             
             jobs.append({
                 'title': item.get('name', ''),
                 'company': item.get('employer', {}).get('name', ''),
-                'description': description,
+                'description': f"{description} {experience_name}",
                 'url': item.get('alternate_url', ''),
                 'salary': salary,
-                'location': item.get('area', {}).get('name', 'Удалённо'),
+                'location': 'Удалённо',
                 'published': item.get('published_at', ''),
                 'employment_type': employment_name,
                 'source': 'HeadHunter',
@@ -1001,6 +1335,307 @@ def fetch_superjob() -> List[Dict]:
         return []
 
 
+def fetch_greenhouse() -> List[Dict]:
+    """Greenhouse public boards for configured company tokens."""
+    jobs = []
+    for board in non_empty_csv(Config.GREENHOUSE_BOARDS):
+        try:
+            response = requests.get(
+                f"https://api.greenhouse.io/v1/boards/{board}/jobs",
+                params={'content': 'true'},
+                headers=get_headers(),
+                timeout=15
+            )
+            response.raise_for_status()
+            for item in response.json().get('jobs', []):
+                offices = item.get('offices') or []
+                location = ', '.join([office.get('name', '') for office in offices if office.get('name')]) or 'Remote'
+                jobs.append({
+                    'title': item.get('title', ''),
+                    'company': board,
+                    'description': strip_html(item.get('content', '')),
+                    'url': item.get('absolute_url', ''),
+                    'salary': 'Не указана',
+                    'location': location,
+                    'published': item.get('updated_at', ''),
+                    'employment_type': '',
+                    'source': f'Greenhouse:{board}',
+                    'tags': [dept.get('name', '') for dept in item.get('departments', []) if dept.get('name')]
+                })
+        except Exception as e:
+            logger.error(f"❌ Greenhouse {board} error: {e}")
+    return jobs
+
+
+def fetch_lever() -> List[Dict]:
+    """Lever public postings for configured company IDs."""
+    jobs = []
+    for company in non_empty_csv(Config.LEVER_COMPANIES):
+        try:
+            response = requests.get(
+                f"https://api.lever.co/v0/postings/{company}",
+                params={'mode': 'json'},
+                headers=get_headers(),
+                timeout=15
+            )
+            response.raise_for_status()
+            for item in response.json():
+                categories = item.get('categories') or {}
+                location = categories.get('location', 'Remote')
+                workplace_type = item.get('workplaceType') or item.get('workplace_type') or ''
+                if str(workplace_type).lower() == 'remote' and 'remote' not in location.lower():
+                    location = f"{location}, Remote" if location else 'Remote'
+                jobs.append({
+                    'title': item.get('text', ''),
+                    'company': company,
+                    'description': strip_html(item.get('descriptionPlain', '') or item.get('description', '')),
+                    'url': item.get('hostedUrl', '') or item.get('applyUrl', ''),
+                    'salary': 'Не указана',
+                    'location': location,
+                    'published': str(item.get('createdAt', '')),
+                    'employment_type': categories.get('commitment', ''),
+                    'source': f'Lever:{company}',
+                    'tags': [categories.get('team', '')] if categories.get('team') else []
+                })
+        except Exception as e:
+            logger.error(f"❌ Lever {company} error: {e}")
+    return jobs
+
+
+def fetch_ashby() -> List[Dict]:
+    """Ashby public job boards for configured company names."""
+    jobs = []
+    for company in non_empty_csv(Config.ASHBY_COMPANIES):
+        try:
+            response = requests.get(
+                f"https://api.ashbyhq.com/posting-api/job-board/{company}",
+                headers=get_headers(),
+                timeout=20
+            )
+            response.raise_for_status()
+            for item in response.json().get('jobs', []):
+                location = item.get('locationName') or item.get('location', 'Remote')
+                jobs.append({
+                    'title': item.get('title', ''),
+                    'company': company,
+                    'description': strip_html(item.get('descriptionHtml', '') or item.get('descriptionPlain', '')),
+                    'url': item.get('jobUrl', '') or item.get('applyUrl', ''),
+                    'salary': item.get('compensation', '') or 'Не указана',
+                    'location': location,
+                    'published': item.get('publishedAt', ''),
+                    'employment_type': item.get('employmentType', ''),
+                    'source': f'Ashby:{company}',
+                    'tags': [item.get('department', '')] if item.get('department') else []
+                })
+        except Exception as e:
+            logger.error(f"❌ Ashby {company} error: {e}")
+    return jobs
+
+
+def fetch_apify_actor_jobs(actor_id: str, source_name: str, payload: Dict) -> List[Dict]:
+    """Run an Apify actor if APIFY_API_TOKEN is configured and normalize common job fields."""
+    if not Config.APIFY_API_TOKEN:
+        logger.warning(f"⚠️ Apify token not found, skipping {source_name}")
+        return []
+    try:
+        response = requests.post(
+            f"https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items",
+            params={'token': Config.APIFY_API_TOKEN, 'clean': 'true'},
+            json=payload,
+            headers=get_headers(),
+            timeout=90
+        )
+        response.raise_for_status()
+        jobs = []
+        for item in response.json():
+            title = item.get('title') or item.get('jobTitle') or item.get('position') or ''
+            company = item.get('company') or item.get('companyName') or item.get('organization') or ''
+            url = item.get('url') or item.get('jobUrl') or item.get('applyUrl') or item.get('link') or ''
+            description = item.get('description') or item.get('jobDescription') or item.get('text') or ''
+            jobs.append({
+                'title': title,
+                'company': company,
+                'description': strip_html(description),
+                'url': url,
+                'salary': item.get('salary') or item.get('compensation') or 'Не указана',
+                'location': item.get('location') or item.get('jobLocation') or 'Remote',
+                'published': item.get('published') or item.get('postedAt') or item.get('date') or '',
+                'employment_type': item.get('employmentType') or item.get('type') or '',
+                'source': source_name,
+                'tags': item.get('tags', []) if isinstance(item.get('tags', []), list) else []
+            })
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ {source_name} Apify error: {e}")
+        return []
+
+
+def fetch_apify_usajobs() -> List[Dict]:
+    """USAJobs via Apify actor, requires APIFY_API_TOKEN."""
+    if not Config.APIFY_API_TOKEN:
+        logger.warning("⚠️ Apify token not found, skipping USAJobs Apify")
+        return []
+    try:
+        payload = {
+            'keyword': 'IT specialist remote software developer python javascript',
+            'jobCategoryCode': '2210',
+            'remoteIndicator': 'True',
+            'datePosted': 30,
+            'maxItems': Config.APIFY_MAX_ITEMS,
+            'sortField': 'opendate',
+            'sortDirection': 'Desc',
+        }
+        response = requests.post(
+            "https://api.apify.com/v2/acts/parseforge~usajobs-scraper/run-sync-get-dataset-items",
+            params={'token': Config.APIFY_API_TOKEN, 'clean': 'true'},
+            json=payload,
+            headers=get_headers(),
+            timeout=120
+        )
+        response.raise_for_status()
+        jobs = []
+        for item in response.json():
+            salary = 'Не указана'
+            if item.get('salaryMin') or item.get('salaryMax'):
+                salary = (
+                    f"{item.get('salaryMin') or 0:,.0f}-{item.get('salaryMax') or 0:,.0f} "
+                    f"{item.get('salaryInterval', '')}"
+                ).strip()
+            remote = bool(item.get('remoteJob'))
+            location = 'Remote' if remote else item.get('locationDisplay', '')
+            jobs.append({
+                'title': item.get('positionTitle', ''),
+                'company': item.get('organizationName', '') or item.get('departmentName', ''),
+                'description': ' '.join([
+                    item.get('qualificationSummary', ''),
+                    item.get('jobSummary', ''),
+                    item.get('majorDuties', ''),
+                    'Remote' if remote else '',
+                ]),
+                'url': item.get('jobUrl', '') or item.get('applyUrl', ''),
+                'salary': salary,
+                'location': location,
+                'published': item.get('openDate', ''),
+                'employment_type': item.get('positionSchedule', ''),
+                'source': 'Apify USAJobs',
+                'tags': item.get('jobCategories', []),
+            })
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ Apify USAJobs error: {e}")
+        return []
+
+
+def fetch_apify_all_jobs() -> List[Dict]:
+    """LinkedIn/Indeed/Glassdoor-style aggregator via Apify."""
+    if not Config.APIFY_API_TOKEN:
+        logger.warning("⚠️ Apify token not found, skipping All Jobs Scraper")
+        return []
+    try:
+        payload = {
+            'keyword': 'junior software developer OR middle software developer OR junior python OR junior qa',
+            'country': 'United States',
+            'max_results': Config.APIFY_MAX_ITEMS,
+            'remote_only': True,
+            'job_type': 'all',
+            'currency': 'USD',
+        }
+        response = requests.post(
+            "https://api.apify.com/v2/acts/agentx~all-jobs-scraper/run-sync-get-dataset-items",
+            params={'token': Config.APIFY_API_TOKEN, 'clean': 'true'},
+            json=payload,
+            headers=get_headers(),
+            timeout=180
+        )
+        response.raise_for_status()
+        jobs = []
+        for item in response.json():
+            if item.get('is_remote') is False and item.get('work_from_home') is False:
+                continue
+            salary = 'Не указана'
+            if item.get('salary_minimum') or item.get('salary_maximum'):
+                salary = (
+                    f"{item.get('salary_minimum') or 0:,.0f}-{item.get('salary_maximum') or 0:,.0f} "
+                    f"{item.get('salary_currency', '')} {item.get('salary_period', '')}"
+                ).strip()
+            jobs.append({
+                'title': item.get('title', ''),
+                'company': item.get('company_name', ''),
+                'description': item.get('description', ''),
+                'url': item.get('official_url') or item.get('platform_url', ''),
+                'salary': salary,
+                'location': item.get('location', 'Remote') or 'Remote',
+                'published': item.get('posted_date', '') or item.get('processed_at', ''),
+                'employment_type': item.get('job_type', ''),
+                'source': f"Apify All Jobs:{item.get('platform', 'unknown')}",
+                'tags': item.get('skills', []) if isinstance(item.get('skills', []), list) else [],
+            })
+        return jobs
+    except Exception as e:
+        logger.error(f"❌ Apify All Jobs error: {e}")
+        return []
+
+
+def fetch_cryptocurrencyjobs() -> List[Dict]:
+    return fetch_apify_actor_jobs(
+        'aezakmi~cryptocurrency-jobs-scraper',
+        'CryptocurrencyJobs',
+        {'queries': ['remote junior developer', 'remote qa', 'remote python']}
+    )
+
+
+def fetch_wellfound() -> List[Dict]:
+    return fetch_apify_actor_jobs(
+        'clearpath~wellfound-api-job-scraper',
+        'Wellfound',
+        {'query': 'remote junior developer', 'remote': True}
+    )
+
+
+def get_api_fetch_functions():
+    """Configured API fetchers in execution order."""
+    fetchers = [
+        (fetch_remotive, "Remotive"),
+        (fetch_remoteok, "RemoteOK"),
+        (fetch_arbeitnow, "Arbeitnow"),
+        (fetch_himalayas, "Himalayas"),
+        (fetch_weworkremotely, "We Work Remotely"),
+        (fetch_jobicy, "Jobicy"),
+        (fetch_devitjobs, "DevITJobs UK"),
+        (fetch_hackernews, "HN Who is Hiring"),
+        (fetch_headhunter, "HeadHunter"),
+    ]
+    if Config.SUPERJOB_API_KEY:
+        fetchers.append((fetch_superjob, "SuperJob"))
+    if Config.ADZUNA_APP_ID and Config.ADZUNA_APP_KEY:
+        fetchers.append((fetch_adzuna, "Adzuna"))
+    if Config.REED_API_KEY:
+        fetchers.append((fetch_reed, "Reed"))
+    if Config.JOOBLE_API_KEY:
+        fetchers.append((fetch_jooble, "Jooble"))
+    if Config.FINDWORK_API_TOKEN:
+        fetchers.append((fetch_findwork, "FindWork"))
+    if Config.USAJOBS_API_KEY and Config.USAJOBS_USER_AGENT:
+        fetchers.append((fetch_usajobs, "USAJobs"))
+    if non_empty_csv(Config.GREENHOUSE_BOARDS):
+        fetchers.append((fetch_greenhouse, "Greenhouse"))
+    if non_empty_csv(Config.LEVER_COMPANIES):
+        fetchers.append((fetch_lever, "Lever"))
+    if non_empty_csv(Config.ASHBY_COMPANIES):
+        fetchers.append((fetch_ashby, "Ashby"))
+    if Config.APIFY_API_TOKEN:
+        fetchers.extend([
+            (fetch_apify_usajobs, "Apify USAJobs"),
+            (fetch_apify_all_jobs, "Apify All Jobs"),
+        ])
+        if Config.APIFY_ENABLE_PAID_ACTORS:
+            fetchers.extend([
+                (fetch_cryptocurrencyjobs, "CryptocurrencyJobs"),
+                (fetch_wellfound, "Wellfound"),
+            ])
+    return fetchers
+
+
 async def fetch_telegram_channels() -> List[Dict]:
     """Fetch jobs from Telegram channels"""
     if not Config.ENABLE_TELEGRAM_CHANNELS:
@@ -1023,6 +1658,154 @@ async def fetch_telegram_channels() -> List[Dict]:
     except Exception as e:
         logger.error(f"❌ Telegram channels error: {e}")
         return []
+
+
+async def get_recent_channel_job_hashes(limit: Optional[int] = None) -> set:
+    """Read recent channel messages via Telethon and return hashes for posted job URLs."""
+    if not TELEGRAM_PARSER_AVAILABLE:
+        return set()
+    if not Config.TELEGRAM_API_ID or not Config.TELEGRAM_API_HASH:
+        return set()
+    try:
+        parser = TelegramJobParser()
+        if not await parser.connect():
+            return set()
+        hashes = set()
+        try:
+            entity = await parser.client.get_entity(Config.CHANNEL_ID)
+            async for message in parser.client.iter_messages(entity, limit=limit or Config.RECENT_TELEGRAM_MESSAGES):
+                text = getattr(message, 'message', '') or ''
+                urls = extract_urls_from_text(text)
+                if getattr(message, 'reply_markup', None):
+                    for row in getattr(message.reply_markup, 'rows', []) or []:
+                        for button in getattr(row, 'buttons', []) or []:
+                            url = getattr(button, 'url', None)
+                            if url:
+                                urls.append(url)
+                for url in urls:
+                    hashes.add(hashlib.sha256(url.strip().encode()).hexdigest()[:16])
+        finally:
+            await parser.disconnect()
+        logger.info(f"🔎 Loaded {len(hashes)} recent channel job hashes")
+        return hashes
+    except Exception as e:
+        logger.warning(f"⚠️ Could not load recent channel history for dedup: {e}")
+        return set()
+
+
+async def post_job_with_bot(bot: Bot, job: Dict) -> bool:
+    """Post a job using a bare Bot instance, suitable for cron/serverless."""
+    try:
+        if Config.ENABLE_MARKDOWN_V2 and FORMATTER_AVAILABLE:
+            formatter = JobMessageFormatter()
+            formatted = formatter.format_job(job, view_mode='compact')
+            await bot.send_message(
+                chat_id=Config.CHANNEL_ID,
+                text=formatted.text,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=InlineKeyboardMarkup(formatted.reply_markup['inline_keyboard']),
+                disable_web_page_preview=formatted.disable_web_page_preview
+            )
+        else:
+            await bot.send_message(
+                chat_id=Config.CHANNEL_ID,
+                text=format_job_message_legacy(job),
+                parse_mode='HTML',
+                disable_web_page_preview=True
+            )
+        logger.info(f"✅ Posted: {job.get('title', 'N/A')} [{job.get('source', 'N/A')}]")
+        return True
+    except RetryAfter as e:
+        logger.warning(f"⏳ Telegram flood control: retry after {e.retry_after}s")
+        await asyncio.sleep(e.retry_after)
+        return await post_job_with_bot(bot, job)
+    except Exception as e:
+        logger.error(f"❌ Failed to post job: {e}")
+        return False
+
+
+async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: Optional[int] = None) -> Dict:
+    """Run a single collection/publication cycle for serverless cron deployments."""
+    if not Config.validate():
+        return {'ok': False, 'error': 'invalid_config'}
+
+    db = init_database() if use_sqlite else None
+    bot = Bot(Config.TELEGRAM_BOT_TOKEN)
+    try:
+        await bot.get_me()
+    except InvalidToken:
+        logger.error("❌ TELEGRAM_BOT_TOKEN is invalid")
+        return {'ok': False, 'error': 'invalid_telegram_bot_token'}
+    except TelegramError as e:
+        logger.error(f"❌ Telegram bot preflight failed: {e}")
+        return {'ok': False, 'error': 'telegram_bot_preflight_failed', 'detail': str(e)}
+
+    started = time.monotonic()
+    all_jobs = []
+    source_results = []
+
+    try:
+        for fetch_func, source_name in get_api_fetch_functions():
+            if source_budget_seconds and time.monotonic() - started > source_budget_seconds:
+                logger.warning(f"⏱️ Source budget exceeded, stopping before {source_name}")
+                break
+            jobs = safe_fetch_with_retry(fetch_func, source_name, max_retries=1)
+            all_jobs.extend(jobs)
+            source_results.append({'source': source_name, 'fetched': len(jobs)})
+            logger.info(f"📥 Fetched {len(jobs)} jobs from {source_name}")
+
+        if Config.ENABLE_TELEGRAM_CHANNELS:
+            tg_jobs = await fetch_telegram_channels()
+            all_jobs.extend(tg_jobs)
+            source_results.append({'source': 'Telegram channels', 'fetched': len(tg_jobs)})
+
+        classified_jobs = []
+        for job in all_jobs:
+            if not is_suitable_job(job):
+                continue
+            level = classify_job_level(job)
+            if not level:
+                continue
+            job['level'] = level
+            job['category'] = auto_classify_category(job)
+            job['hash'] = generate_job_hash(job)
+            classified_jobs.append(job)
+
+        recent_hashes = set()
+        if not use_sqlite or Config.DEDUP_MODE == 'telegram_history':
+            recent_hashes = await get_recent_channel_job_hashes()
+
+        posted_count = duplicate_count = failed_count = 0
+        for job in classified_jobs:
+            if posted_count >= Config.MAX_POSTS_PER_CYCLE:
+                break
+            if job.get('hash') in recent_hashes:
+                duplicate_count += 1
+                continue
+            if db and is_duplicate_job(job, db):
+                duplicate_count += 1
+                continue
+            if await post_job_with_bot(bot, job):
+                if db:
+                    register_posted_job(job, db)
+                recent_hashes.add(job.get('hash'))
+                posted_count += 1
+                await asyncio.sleep(DELAYS['between_posts'])
+            else:
+                failed_count += 1
+
+        return {
+            'ok': True,
+            'fetched': len(all_jobs),
+            'suitable': len(classified_jobs),
+            'posted': posted_count,
+            'duplicates': duplicate_count,
+            'failed': failed_count,
+            'sources': source_results,
+        }
+    finally:
+        if db:
+            db.close()
 
 # ==================== TELEGRAM BOT ====================
 class JobBot:
@@ -1081,7 +1864,7 @@ class JobBot:
         
         stats = {
             'total_jobs': total_posted,
-            'total_sources': 9 + (10 if Config.ENABLE_TELEGRAM_CHANNELS else 0),
+            'total_sources': len(get_api_fetch_functions()) + (10 if Config.ENABLE_TELEGRAM_CHANNELS else 0),
             'is_paused': self.is_paused,
             'last_update': datetime.now().strftime('%Y-%m-%d %H:%M'),
             'categories': categories,
@@ -1308,6 +2091,9 @@ class JobBot:
 # ==================== MAIN LOOP ====================
 async def main():
     """Main application loop"""
+    if not Config.validate():
+        sys.exit(1)
+
     logger.info("=" * 60)
     logger.info("🚀 Job Bot Starting (v6.0 - Enhanced Edition)")
     logger.info(f"📡 Channel: {Config.CHANNEL_ID}")
@@ -1351,17 +2137,7 @@ async def main():
         loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s, application, db)))
     
     # Main collection loop
-    api_fetch_functions = [
-        (fetch_remotive, "Remotive"),
-        (fetch_remoteok, "RemoteOK"),
-        (fetch_arbeitnow, "Arbeitnow"),
-        (fetch_himalayas, "Himalayas"),
-        (fetch_weworkremotely, "We Work Remotely"),
-        (fetch_jobicy, "Jobicy"),
-        (fetch_headhunter, "HeadHunter"),
-        (fetch_superjob, "SuperJob"),
-        (fetch_adzuna, "Adzuna")
-    ]
+    api_fetch_functions = get_api_fetch_functions()
     
     while True:
         try:
@@ -1411,13 +2187,25 @@ async def main():
             
             # Post jobs
             posted_count = 0
-            for job in classified_jobs[:Config.MAX_POSTS_PER_CYCLE]:
-                if not is_duplicate_job(job, db):
-                    if await job_bot.post_job(job):
-                        posted_count += 1
-                        await asyncio.sleep(DELAYS['between_posts'])
+            duplicate_count = 0
+            failed_count = 0
+            for job in classified_jobs:
+                if posted_count >= Config.MAX_POSTS_PER_CYCLE:
+                    break
+                if is_duplicate_job(job, db):
+                    duplicate_count += 1
+                    continue
+                if await job_bot.post_job(job):
+                    register_posted_job(job, db)
+                    posted_count += 1
+                    await asyncio.sleep(DELAYS['between_posts'])
+                else:
+                    failed_count += 1
             
-            logger.info(f"✅ Posted {posted_count} new jobs to channel")
+            logger.info(
+                f"✅ Posted {posted_count} new jobs to channel "
+                f"(duplicates skipped: {duplicate_count}, failed: {failed_count})"
+            )
             logger.info(f"⏳ Waiting {Config.CHECK_INTERVAL//60} minutes before next cycle...")
             await asyncio.sleep(Config.CHECK_INTERVAL)
             

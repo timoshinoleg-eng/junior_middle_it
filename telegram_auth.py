@@ -47,7 +47,10 @@ async def main():
     print(f"\n📱 API ID: {api_id}")
     print(f"🔑 API Hash: {api_hash[:10]}...")
     
-    session_file = 'job_parser_session.session'
+    session_name = os.getenv('TELEGRAM_SESSION_NAME', 'job_parser_session')
+    if session_name.endswith('.session'):
+        session_name = session_name[:-8]
+    session_file = f'{session_name}.session' if session_name else '.session'
     
     # Check for existing session
     if Path(session_file).exists():
@@ -62,7 +65,7 @@ async def main():
     
     print("\n🔄 Подключение к Telegram...")
     
-    client = TelegramClient('job_parser_session', int(api_id), api_hash)
+    client = TelegramClient(session_name or '.session', int(api_id), api_hash)
     
     try:
         await client.connect()

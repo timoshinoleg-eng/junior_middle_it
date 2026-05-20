@@ -22,6 +22,7 @@ import os
 import re
 import hashlib
 import logging
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from dataclasses import dataclass
 # Telethon импортируется conditionally
 try:
     from telethon import TelegramClient
+    from telethon.sessions import StringSession
     from telethon.tl.types import Message
     TELETHON_AVAILABLE = True
 except ImportError:
@@ -122,6 +124,353 @@ TELEGRAM_CHANNELS = {
     },
 }
 
+TELEGRAM_CHANNELS.update({
+    # === PYTHON / FRONTEND / BACKEND ===
+    'python_jobs': {
+        'username': 'python_jobs',
+        'name': 'Python Jobs',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'development',
+        'priority': 1,
+    },
+    'frontend_jobs': {
+        'username': 'frontend_jobs',
+        'name': 'Frontend Jobs',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'development',
+        'priority': 1,
+    },
+    'fordev': {
+        'username': 'fordev',
+        'name': 'ForDev Backend/Frontend',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'priority': 1,
+    },
+    'gogetajob': {
+        'username': 'gogetajob',
+        'name': 'Go Get A Job (Golang)',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'development',
+        'priority': 1,
+    },
+    'jobforphp': {
+        'username': 'jobforphp',
+        'name': 'Job for PHP',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'development',
+        'priority': 2,
+    },
+    'forruby': {
+        'username': 'forruby',
+        'name': 'Job for Ruby & Elixir',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'development',
+        'priority': 2,
+    },
+    'alljvmjobs': {
+        'username': 'alljvmjobs',
+        'name': 'JVM Jobs',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'development',
+        'priority': 2,
+    },
+    'forallmobile': {
+        'username': 'forallmobile',
+        'name': 'Job for Mobile',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'development',
+        'priority': 2,
+    },
+    'wordpress_jobs': {
+        'username': 'wordpress_jobs',
+        'name': 'WordPress Jobs',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'development',
+        'priority': 3,
+    },
+
+    # === QA / DEVOPS / DATA ===
+    'forallqa': {
+        'username': 'forallqa',
+        'name': 'Job for QA',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'qa',
+        'priority': 1,
+    },
+    'qa_jobs': {
+        'username': 'qa_jobs',
+        'name': 'QA Вакансии',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'qa',
+        'priority': 1,
+    },
+    'devops_jobs': {
+        'username': 'devops_jobs',
+        'name': 'DevOps Jobs',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'devops',
+        'priority': 1,
+    },
+    'itarchitect_jobs': {
+        'username': 'itarchitect_jobs',
+        'name': 'IT Architect Jobs',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'architecture',
+        'priority': 2,
+    },
+    'datasciencejobs': {
+        'username': 'datasciencejobs',
+        'name': 'Data Science Jobs',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'data',
+        'priority': 2,
+    },
+    'analysts_hunter': {
+        'username': 'analysts_hunter',
+        'name': 'Работа ищет аналитиков',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'analytics',
+        'priority': 2,
+    },
+    'data_jobs': {
+        'username': 'data_jobs',
+        'name': 'Data Jobs',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'data',
+        'priority': 2,
+    },
+
+    # === PRODUCT / DESIGN / GAMEDEV ===
+    'product_jobs': {
+        'username': 'product_jobs',
+        'name': 'Product Jobs',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'pm',
+        'priority': 2,
+    },
+    'uiux_jobs': {
+        'username': 'uiux_jobs',
+        'name': 'UI/UX Jobs',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'design',
+        'priority': 2,
+    },
+    'vakansii_dlya_dizaynera': {
+        'username': 'vakansii_dlya_dizaynera',
+        'name': 'ВАКАНСИИ ДЛЯ ДИЗАЙНЕРА',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'design',
+        'priority': 2,
+    },
+    'designhunters': {
+        'username': 'designhunters',
+        'name': 'Design Hunters',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'design',
+        'priority': 2,
+    },
+    'devjobs': {
+        'username': 'devjobs',
+        'name': 'Game Development Jobs',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'gamedev',
+        'priority': 2,
+    },
+    'gamedevjob': {
+        'username': 'gamedevjob',
+        'name': 'Работа в геймдеве',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'category': 'gamedev',
+        'priority': 2,
+    },
+
+    # === GENERAL IT / REMOTE / JUNIOR ===
+    'over100': {
+        'username': 'over100',
+        'name': 'Работа в Digital за 100k+',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'priority': 3,
+    },
+    'seohr': {
+        'username': 'seohr',
+        'name': 'SEO HR',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'priority': 3,
+    },
+    'partnerkin_job': {
+        'username': 'partnerkin_job',
+        'name': 'Вакансии Партнеркин',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'priority': 3,
+    },
+    'Relocats': {
+        'username': 'Relocats',
+        'name': 'IT Relocation',
+        'filter_remote': False,
+        'filter_level': False,
+        'priority': 2,
+    },
+    'jobs_abroad': {
+        'username': 'jobs_abroad',
+        'name': 'Jobs abroad',
+        'filter_remote': False,
+        'filter_level': False,
+        'priority': 2,
+    },
+    'geekjobs': {
+        'username': 'geekjobs',
+        'name': 'Job in IT&Digital',
+        'filter_remote': False,
+        'filter_level': False,
+        'priority': 1,
+    },
+    'jobs_it': {
+        'username': 'jobs_it',
+        'name': 'Jobs_IT',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо', 'worldwide'],
+        'filter_level': False,
+        'priority': 1,
+    },
+    'coding_ru': {
+        'username': 'coding_ru',
+        'name': 'Coding Ru',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'priority': 2,
+    },
+    'jobscode_infull': {
+        'username': 'jobscode_infull',
+        'name': 'Jobs Code | In full',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'priority': 1,
+    },
+    'jobGeeks': {
+        'username': 'jobGeeks',
+        'name': 'IT Вакансии',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'priority': 2,
+    },
+    'zizu_IT_RU': {
+        'username': 'zizu_IT_RU',
+        'name': 'IT вакансии для всех',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'priority': 2,
+    },
+    'profunctor_jobs': {
+        'username': 'profunctor_jobs',
+        'name': 'Profunctor Jobs',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'priority': 2,
+    },
+    'getitrussia': {
+        'username': 'getitrussia',
+        'name': 'GetIT World',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'priority': 2,
+    },
+    'Remoteit': {
+        'username': 'Remoteit',
+        'name': 'Remote IT',
+        'filter_remote': False,
+        'filter_level': False,
+        'priority': 1,
+    },
+    'vezdeworker': {
+        'username': 'vezdeworker',
+        'name': 'ВездеWorker IT',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо', 'фриланс'],
+        'filter_level': False,
+        'priority': 2,
+    },
+    'myjobit': {
+        'username': 'myjobit',
+        'name': 'MyJobIT',
+        'filter_remote': True,
+        'keywords': ['remote', 'удаленно', 'удалённо'],
+        'filter_level': False,
+        'priority': 2,
+    },
+    'jobforjunior': {
+        'username': 'jobforjunior',
+        'name': 'Job for Junior',
+        'filter_remote': False,
+        'filter_level': True,
+        'level_keywords': ['junior', 'jr', 'стажер', 'intern', 'entry'],
+        'priority': 1,
+    },
+    'junior_vacancies': {
+        'username': 'junior_vacancies',
+        'name': 'Junior Vacancies',
+        'filter_remote': False,
+        'filter_level': True,
+        'level_keywords': ['junior', 'jr', 'стажер', 'intern'],
+        'priority': 1,
+    },
+})
+
 # Ключевые слова для извлечения данных
 COMPANY_PATTERNS = [
     r'(?:компания|company)[\s:]*(\S[^\n]+)',
@@ -182,13 +531,50 @@ class ParsedJob:
     content_hash: str  # Для дедупликации
 
 
+def get_default_session_name() -> str:
+    """Return configured Telethon session name without requiring re-auth."""
+    configured = os.getenv('TELEGRAM_SESSION_NAME')
+    if configured:
+        return configured[:-8] if configured.endswith('.session') else configured
+    if os.path.exists('.session'):
+        return '.session'
+    return 'job_parser_session'
+
+
+def get_telegram_session():
+    """Return StringSession from env or configured file session name."""
+    session_string = os.getenv('TELEGRAM_SESSION_STRING')
+    if session_string and TELETHON_AVAILABLE:
+        return StringSession(session_string)
+    return get_default_session_name()
+
+
+def parse_telegram_proxy():
+    """Parse TELEGRAM_PROXY for Telethon, e.g. socks5://127.0.0.1:9050."""
+    proxy_url = os.getenv('TELEGRAM_PROXY')
+    if not proxy_url:
+        return None
+    parsed = urlparse(proxy_url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {'socks5', 'socks4', 'http'}:
+        logger.warning(f"⚠️ Unsupported TELEGRAM_PROXY scheme: {parsed.scheme}")
+        return None
+    if not parsed.hostname or not parsed.port:
+        logger.warning("⚠️ TELEGRAM_PROXY must include host and port")
+        return None
+    proxy = (scheme, parsed.hostname, parsed.port)
+    if parsed.username:
+        proxy += (True, parsed.username, parsed.password or '')
+    return proxy
+
+
 class TelegramJobParser:
     """
     Парсер вакансий из Telegram-каналов с использованием Telethon.
     """
     
     def __init__(self, api_id: Optional[str] = None, api_hash: Optional[str] = None, 
-                 session_name: str = 'job_parser_session'):
+                 session_name: Optional[str] = None):
         """
         Инициализация парсера.
         
@@ -211,7 +597,8 @@ class TelegramJobParser:
                 "Получите их на https://my.telegram.org/apps"
             )
         
-        self.session_name = session_name
+        self.session_name = session_name or get_telegram_session()
+        self.proxy = parse_telegram_proxy()
         self.client: Optional[TelegramClient] = None
     
     async def connect(self) -> bool:
@@ -220,7 +607,8 @@ class TelegramJobParser:
             self.client = TelegramClient(
                 self.session_name, 
                 int(self.api_id), 
-                self.api_hash
+                self.api_hash,
+                proxy=self.proxy
             )
             await self.client.connect()
             
@@ -606,7 +994,7 @@ async def fetch_telegram_jobs(hours_back: int = 1) -> List[Dict]:
         logger.warning("⚠️ Telethon не установлен. Пропускаем Telegram-каналы.")
         return []
     
-    if not os.getenv('TELEGRAM_API_ID') or not os.getenv('TELEGRAM_API_ID'):
+    if not os.getenv('TELEGRAM_API_ID') or not os.getenv('TELEGRAM_API_HASH'):
         logger.warning("⚠️ TELEGRAM_API_ID/TELEGRAM_API_HASH не настроены. "
                       "Пропускаем Telegram-каналы.")
         return []
