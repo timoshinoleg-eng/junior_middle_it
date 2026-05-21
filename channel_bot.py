@@ -1724,21 +1724,96 @@ async def post_job_with_bot(bot: Bot, job: Dict) -> bool:
         return False
 
 
+async def post_job_with_telethon(job: Dict) -> bool:
+    """Post a job through the authorized Telegram user session as a Bot API fallback."""
+    if not TELEGRAM_PARSER_AVAILABLE:
+        logger.error("❌ Telethon parser is not available for fallback posting")
+        return False
+    if not Config.TELEGRAM_API_ID or not Config.TELEGRAM_API_HASH:
+        logger.error("❌ TELEGRAM_API_ID/TELEGRAM_API_HASH are required for Telethon fallback posting")
+        return False
+
+    parser = TelegramJobParser()
+    try:
+        if not await parser.connect():
+            return False
+        entity = await parser.client.get_entity(Config.CHANNEL_ID)
+        text = format_job_message_legacy(job)
+        await parser.client.send_message(
+            entity,
+            text,
+            parse_mode='html',
+            link_preview=False,
+        )
+        logger.info(f"✅ Posted via Telethon: {job.get('title', 'N/A')} [{job.get('source', 'N/A')}]")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to post job via Telethon: {e}")
+        return False
+    finally:
+        await parser.disconnect()
+
+
+async def check_telethon_post_permissions() -> Dict:
+    """Verify that the configured user session can publish to the target channel."""
+    if not TELEGRAM_PARSER_AVAILABLE:
+        return {'ok': False, 'error': 'telethon_unavailable'}
+    if not Config.TELEGRAM_API_ID or not Config.TELEGRAM_API_HASH:
+        return {'ok': False, 'error': 'telegram_api_credentials_missing'}
+
+    parser = TelegramJobParser()
+    try:
+        if not await parser.connect():
+            return {'ok': False, 'error': 'telegram_user_session_not_authorized'}
+        entity = await parser.client.get_entity(Config.CHANNEL_ID)
+        rights = getattr(entity, 'admin_rights', None)
+        creator = bool(getattr(entity, 'creator', False))
+        can_post = creator or bool(rights and getattr(rights, 'post_messages', False))
+        if not can_post:
+            logger.error("❌ Telegram user session cannot post to CHANNEL_ID")
+            return {'ok': False, 'error': 'telegram_post_permission_required'}
+        return {'ok': True}
+    except Exception as e:
+        logger.error(f"❌ Telethon post permission preflight failed: {e}")
+        return {'ok': False, 'error': 'telegram_post_permission_check_failed', 'detail': str(e)}
+    finally:
+        await parser.disconnect()
+
+
 async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: Optional[int] = None) -> Dict:
     """Run a single collection/publication cycle for serverless cron deployments."""
     if not Config.validate():
         return {'ok': False, 'error': 'invalid_config'}
 
     db = init_database() if use_sqlite else None
-    bot = Bot(Config.TELEGRAM_BOT_TOKEN)
+    bot = None
+    post_transport = 'bot'
+    if Config.TELEGRAM_BOT_TOKEN:
+        bot = Bot(Config.TELEGRAM_BOT_TOKEN)
+    else:
+        post_transport = 'telethon'
+
     try:
-        await bot.get_me()
+        if bot:
+            await bot.get_me()
     except InvalidToken:
-        logger.error("❌ TELEGRAM_BOT_TOKEN is invalid")
-        return {'ok': False, 'error': 'invalid_telegram_bot_token'}
+        logger.warning("⚠️ TELEGRAM_BOT_TOKEN is invalid, switching to Telethon fallback posting")
+        bot = None
+        post_transport = 'telethon'
     except TelegramError as e:
-        logger.error(f"❌ Telegram bot preflight failed: {e}")
-        return {'ok': False, 'error': 'telegram_bot_preflight_failed', 'detail': str(e)}
+        logger.warning(f"⚠️ Telegram bot preflight failed, switching to Telethon fallback posting: {e}")
+        bot = None
+        post_transport = 'telethon'
+
+    if not bot:
+        telethon_preflight = await check_telethon_post_permissions()
+        if not telethon_preflight.get('ok'):
+            return {
+                'ok': False,
+                'error': telethon_preflight.get('error'),
+                'detail': telethon_preflight.get('detail'),
+                'transport': post_transport,
+            }
 
     started = time.monotonic()
     all_jobs = []
@@ -1785,7 +1860,11 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
             if db and is_duplicate_job(job, db):
                 duplicate_count += 1
                 continue
-            if await post_job_with_bot(bot, job):
+            if bot:
+                posted = await post_job_with_bot(bot, job)
+            else:
+                posted = await post_job_with_telethon(job)
+            if posted:
                 if db:
                     register_posted_job(job, db)
                 recent_hashes.add(job.get('hash'))
@@ -1801,6 +1880,7 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
             'posted': posted_count,
             'duplicates': duplicate_count,
             'failed': failed_count,
+            'transport': post_transport,
             'sources': source_results,
         }
     finally:
