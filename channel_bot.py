@@ -245,6 +245,15 @@ NON_IT_TITLE_EXCLUDES = [
     "recruiter", "talent", "marketing", "seo", "office"
 ]
 
+RESUME_BLOCK_SIGNALS = [
+    "#резюме", "#resume", "#cv", "резюме", "curriculum vitae",
+    "зарплатные ожидания", "salary expectations", "ожидания по зарплате",
+    "формат работы:", "о себе:", "ищу работу", "в поиске работы",
+    "open to work", "looking for a job", "looking for work",
+    "years of experience", "года опыта", "лет опыта", "мой стек",
+    "мой опыт", "готов к", "рассматриваю предложения"
+]
+
 SOURCE_PUBLICATION_PRIORITY = {
     "TG": 1,
     "Ashby": 2,
@@ -591,6 +600,12 @@ def has_text_signal(text: str, signal: str) -> bool:
     return re.search(pattern, text, flags=re.IGNORECASE) is not None
 
 
+def is_resume_or_candidate_profile_text(text: str) -> bool:
+    """Detect resume/CV/candidate-profile posts that are not vacancies."""
+    text_lower = str(text or '').lower()
+    return any(signal in text_lower for signal in RESUME_BLOCK_SIGNALS)
+
+
 def base_source_name(job: Dict) -> str:
     """Return source family name for fair publication rotation."""
     return str(job.get('source', '') or 'Unknown').split(':', 1)[0].strip() or 'Unknown'
@@ -790,6 +805,10 @@ def is_suitable_job(job: Dict) -> bool:
     title = str(job.get('title', '')).lower()
     text = f"{job.get('title', '')} {job.get('description', '')} {job.get('location', '')}".lower()
     source = job.get('source', '').split(':', 1)[0]
+    if is_resume_or_candidate_profile_text(text):
+        return False
+    if source == 'TG' and not str(job.get('url', '')).startswith('http'):
+        return False
     has_remote = source in REMOTE_ONLY_SOURCES or any(kw in text for kw in REMOTE_KEYWORDS)
     if any(has_text_signal(title, signal) for signal in NON_IT_TITLE_EXCLUDES):
         return False

@@ -513,6 +513,15 @@ LEVEL_KEYWORDS = {
     'senior': ['senior', 'sr', 'sr.', 'lead', 'principal', 'staff', 'architect', 'старший', 'ведущий'],
 }
 
+RESUME_BLOCK_SIGNALS = [
+    '#резюме', '#resume', '#cv', 'резюме', 'curriculum vitae',
+    'зарплатные ожидания', 'salary expectations', 'ожидания по зарплате',
+    'формат работы:', 'о себе:', 'ищу работу', 'в поиске работы',
+    'open to work', 'looking for a job', 'looking for work',
+    'years of experience', 'года опыта', 'лет опыта', 'мой стек',
+    'мой опыт', 'готов к', 'рассматриваю предложения'
+]
+
 
 @dataclass
 class ParsedJob:
@@ -811,6 +820,9 @@ class TelegramJobParser:
             return None
         
         text = message.text
+        text_lower = text.lower()
+        if any(signal in text_lower for signal in RESUME_BLOCK_SIGNALS):
+            return None
         
         # Фильтрация по remote
         if not self._is_remote_job(text, channel_config):
@@ -822,7 +834,6 @@ class TelegramJobParser:
         
         # Проверка на рекламу/спам (простая)
         spam_keywords = ['купить', 'продажа', 'скидка', 'распродажа', 'crypto', 'casino', 'ставки']
-        text_lower = text.lower()
         for kw in spam_keywords:
             if kw in text_lower:
                 return None
@@ -833,6 +844,8 @@ class TelegramJobParser:
         salary = self._extract_salary(text)
         location = self._extract_location(text)
         url = self._extract_url(text)
+        if not url:
+            return None
         tags = self._extract_tech_stack(text)
         level = self._detect_level(text)
         content_hash = self._generate_content_hash(text)
