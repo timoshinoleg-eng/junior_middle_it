@@ -102,6 +102,7 @@ TELEGRAM_API_HASH=your_api_hash_here
 TELEGRAM_SESSION_NAME=job_parser_session
 TELEGRAM_SESSION_STRING=optional_string_session_for_serverless
 TELEGRAM_PROXY=socks5://127.0.0.1:9050  # опционально, если VM не ходит в Telegram напрямую
+TELEGRAM_HOURS_BACK=48
 ENABLE_TELEGRAM_CHANNELS=true
 ```
 

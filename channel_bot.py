@@ -16,6 +16,7 @@ import sqlite3
 import hashlib
 import logging
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
@@ -82,6 +83,7 @@ class Config:
     CRON_SECRET = os.getenv('CRON_SECRET')
     DEDUP_MODE = os.getenv('DEDUP_MODE', 'sqlite')
     RECENT_TELEGRAM_MESSAGES = int(os.getenv('RECENT_TELEGRAM_MESSAGES', '800'))
+    TELEGRAM_HOURS_BACK = int(os.getenv('TELEGRAM_HOURS_BACK', '48'))
     GREENHOUSE_BOARDS = os.getenv('GREENHOUSE_BOARDS', 'gitlab,canonical,elastic').split(',')
     LEVER_COMPANIES = os.getenv(
         'LEVER_COMPANIES',
@@ -181,6 +183,13 @@ DELAYS = {
     'after_error': 30,
     'between_posts': 3
 }
+if os.getenv('VERCEL'):
+    DELAYS.update({
+        'between_apis': 0,
+        'random_jitter': 0,
+        'after_error': 5,
+        'between_posts': 1,
+    })
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -202,7 +211,7 @@ MIDDLE_SIGNALS = [
 
 EXCLUDE_SIGNALS = [
     "senior", "sr.", "sr ", "lead", "principal", "staff engineer",
-    "architect", "head of", "director", "manager", "vp",
+    "staff", "architect", "head of", "director", "manager", "vp",
     "vice president", "cto", "cfo", "chief", "c-level",
     "старший", "ведущий", "руководитель", "главный"
 ]
@@ -217,6 +226,42 @@ IT_ROLES = [
     "разработчик", "программист", "инженер", "тестировщик",
     "менеджер проекта", "product owner", "scrum master"
 ]
+
+TITLE_IT_SIGNALS = [
+    "developer", "engineer", "programmer", "software", "frontend", "front-end",
+    "backend", "back-end", "full-stack", "fullstack", "devops", "sre",
+    "qa", "tester", "automation", "data scientist", "data analyst",
+    "machine learning", "ml engineer", "ai engineer", "ios", "android",
+    "mobile", "react", "vue", "angular", "python", "javascript",
+    "typescript", "java", "php", "ruby", "golang", "node", "web",
+    "security", "cloud", "database", "разработчик", "программист",
+    "инженер", "тестировщик", "аналитик данных"
+]
+
+NON_IT_TITLE_EXCLUDES = [
+    "assistant", "writer", "content writer", "copywriter", "reviewer",
+    "tax", "law", "legal", "accountant", "bookkeeper", "sales",
+    "account executive", "customer support", "customer success",
+    "recruiter", "talent", "marketing", "seo", "office"
+]
+
+SOURCE_PUBLICATION_PRIORITY = {
+    "TG": 1,
+    "Ashby": 2,
+    "Greenhouse": 3,
+    "Lever": 4,
+    "Apify All Jobs": 5,
+    "Apify USAJobs": 6,
+    "DevITJobs UK": 7,
+    "HN Who is Hiring": 8,
+    "SuperJob": 9,
+    "We Work Remotely": 10,
+    "Jobicy": 11,
+    "Himalayas": 12,
+    "Arbeitnow": 13,
+    "Remotive": 14,
+    "RemoteOK": 15,
+}
 
 REMOTE_KEYWORDS = ["remote", "удаленно", "удалённо", "work from home", "дистанционно", "wfh"]
 REMOTE_ONLY_SOURCES = {
@@ -546,6 +591,71 @@ def has_text_signal(text: str, signal: str) -> bool:
     return re.search(pattern, text, flags=re.IGNORECASE) is not None
 
 
+def base_source_name(job: Dict) -> str:
+    """Return source family name for fair publication rotation."""
+    return str(job.get('source', '') or 'Unknown').split(':', 1)[0].strip() or 'Unknown'
+
+
+def parse_job_datetime(job: Dict) -> Optional[datetime]:
+    """Best-effort parsing of heterogeneous source date fields."""
+    raw = job.get('published') or job.get('created') or job.get('publication_date') or job.get('date_published')
+    if not raw:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    for candidate in (value, value[:19], value[:10]):
+        try:
+            return datetime.fromisoformat(candidate.replace('Z', '+00:00')).replace(tzinfo=None)
+        except Exception:
+            pass
+    for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y'):
+        try:
+            return datetime.strptime(value[:10], fmt)
+        except Exception:
+            pass
+    return None
+
+
+def job_quality_score(job: Dict) -> tuple:
+    """Rank jobs inside each source by recency and useful metadata."""
+    published = parse_job_datetime(job)
+    timestamp = published.timestamp() if published else 0
+    salary_bonus = 1 if extract_salary(job) != 'Не указана' else 0
+    url_bonus = 1 if str(job.get('url', '')).startswith('http') else 0
+    level_bonus = 1 if job.get('level') in {'Junior', 'Middle'} else 0
+    return (timestamp, salary_bonus, url_bonus, level_bonus)
+
+
+def diversify_jobs_by_source(jobs: List[Dict], limit: int) -> List[Dict]:
+    """Round-robin jobs across source families instead of draining early sources first."""
+    grouped: "OrderedDict[str, List[Dict]]" = OrderedDict()
+    for job in jobs:
+        grouped.setdefault(base_source_name(job), []).append(job)
+    for source_jobs in grouped.values():
+        source_jobs.sort(key=job_quality_score, reverse=True)
+    grouped = OrderedDict(
+        sorted(
+            grouped.items(),
+            key=lambda item: (SOURCE_PUBLICATION_PRIORITY.get(item[0], 100), item[0].lower())
+        )
+    )
+
+    selected = []
+    while len(selected) < limit and grouped:
+        empty_sources = []
+        for source, source_jobs in grouped.items():
+            if not source_jobs:
+                empty_sources.append(source)
+                continue
+            selected.append(source_jobs.pop(0))
+            if len(selected) >= limit:
+                break
+        for source in empty_sources:
+            grouped.pop(source, None)
+    return selected
+
+
 def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) -> List[Dict]:
     """Retry wrapper with exponential backoff"""
     for attempt in range(max_retries):
@@ -570,6 +680,7 @@ def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) ->
 # ==================== JOB PROCESSING ====================
 def classify_job_level(job_data: Dict) -> Optional[str]:
     """Classify job level with exclusion logic"""
+    title_text = str(job_data.get('title', '')).lower()
     full_text = f"{job_data.get('title', '')} {job_data.get('description', '')}".lower()
     
     # Exclude senior+ roles first
@@ -580,7 +691,7 @@ def classify_job_level(job_data: Dict) -> Optional[str]:
         return "Junior"
     if any(has_text_signal(full_text, signal) for signal in MIDDLE_SIGNALS):
         return "Middle"
-    if any(role in full_text for role in IT_ROLES):
+    if any(has_text_signal(title_text, role) for role in TITLE_IT_SIGNALS):
         return "Junior"
     return None
 
@@ -676,10 +787,13 @@ def extract_description(job: Dict, max_length: int = 350) -> str:
 
 def is_suitable_job(job: Dict) -> bool:
     """Check if job matches criteria (remote + IT role)"""
+    title = str(job.get('title', '')).lower()
     text = f"{job.get('title', '')} {job.get('description', '')} {job.get('location', '')}".lower()
     source = job.get('source', '').split(':', 1)[0]
     has_remote = source in REMOTE_ONLY_SOURCES or any(kw in text for kw in REMOTE_KEYWORDS)
-    has_it_role = any(role in text for role in IT_ROLES)
+    if any(has_text_signal(title, signal) for signal in NON_IT_TITLE_EXCLUDES):
+        return False
+    has_it_role = any(has_text_signal(title, role) for role in TITLE_IT_SIGNALS)
     return has_remote and has_it_role
 
 
@@ -1650,8 +1764,7 @@ async def fetch_telegram_channels() -> List[Dict]:
         return []
     
     try:
-        # Для cron-запуска используем 1 час, для ручного - 24 часа
-        hours_back = 1
+        hours_back = Config.TELEGRAM_HOURS_BACK
         jobs = await fetch_telegram_jobs(hours_back=hours_back)
         logger.info(f"📥 Fetched {len(jobs)} jobs from Telegram channels")
         return jobs
@@ -1830,9 +1943,12 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
             logger.info(f"📥 Fetched {len(jobs)} jobs from {source_name}")
 
         if Config.ENABLE_TELEGRAM_CHANNELS:
-            tg_jobs = await fetch_telegram_channels()
-            all_jobs.extend(tg_jobs)
-            source_results.append({'source': 'Telegram channels', 'fetched': len(tg_jobs)})
+            if source_budget_seconds and time.monotonic() - started > source_budget_seconds:
+                logger.warning("⏱️ Source budget exceeded before Telegram channels")
+            else:
+                tg_jobs = await fetch_telegram_channels()
+                all_jobs.extend(tg_jobs)
+                source_results.append({'source': 'Telegram channels', 'fetched': len(tg_jobs)})
 
         classified_jobs = []
         for job in all_jobs:
@@ -1850,16 +1966,25 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
         if not use_sqlite or Config.DEDUP_MODE == 'telegram_history':
             recent_hashes = await get_recent_channel_job_hashes()
 
-        posted_count = duplicate_count = failed_count = 0
+        publish_candidates = []
+        duplicate_count = failed_count = 0
         for job in classified_jobs:
-            if posted_count >= Config.MAX_POSTS_PER_CYCLE:
-                break
             if job.get('hash') in recent_hashes:
                 duplicate_count += 1
                 continue
             if db and is_duplicate_job(job, db):
                 duplicate_count += 1
                 continue
+            publish_candidates.append(job)
+
+        selected_jobs = diversify_jobs_by_source(publish_candidates, Config.MAX_POSTS_PER_CYCLE)
+        selected_sources = {}
+        for job in selected_jobs:
+            selected_sources[base_source_name(job)] = selected_sources.get(base_source_name(job), 0) + 1
+        logger.info(f"🎯 Selected {len(selected_jobs)} jobs for posting by source: {selected_sources}")
+
+        posted_count = 0
+        for job in selected_jobs:
             if bot:
                 posted = await post_job_with_bot(bot, job)
             else:
@@ -1877,10 +2002,12 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
             'ok': True,
             'fetched': len(all_jobs),
             'suitable': len(classified_jobs),
+            'candidates': len(publish_candidates),
             'posted': posted_count,
             'duplicates': duplicate_count,
             'failed': failed_count,
             'transport': post_transport,
+            'selected_sources': selected_sources,
             'sources': source_results,
         }
     finally:
