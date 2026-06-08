@@ -37,6 +37,17 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 # Импорт новых модулей (с fallback)
 try:
     from job_classifier import JobClassifier, get_job_category_info
@@ -64,6 +75,8 @@ class Config:
     """Application configuration with validation"""
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
     CHANNEL_ID = os.getenv('CHANNEL_ID', '')
+    WEBSHARE_API_KEY = os.getenv('WEBSHARE_API_KEY') or os.getenv('WEBSHARE_TOKEN')
+    WEBSHARE_COUNTRIES = os.getenv('WEBSHARE_COUNTRIES', '')
     SUPERJOB_API_KEY = os.getenv('SUPERJOB_API_KEY')
     ADZUNA_APP_ID = os.getenv('ADZUNA_APP_ID')
     ADZUNA_APP_KEY = os.getenv('ADZUNA_APP_KEY')
@@ -79,11 +92,11 @@ class Config:
     USAJOBS_USER_AGENT = os.getenv('USAJOBS_USER_AGENT')
     APIFY_API_TOKEN = os.getenv('APIFY_API_TOKEN')
     APIFY_ENABLE_PAID_ACTORS = os.getenv('APIFY_ENABLE_PAID_ACTORS', 'false').lower() == 'true'
-    APIFY_MAX_ITEMS = int(os.getenv('APIFY_MAX_ITEMS', '30'))
+    APIFY_MAX_ITEMS = env_int('APIFY_MAX_ITEMS', 30)
     CRON_SECRET = os.getenv('CRON_SECRET')
     DEDUP_MODE = os.getenv('DEDUP_MODE', 'sqlite')
-    RECENT_TELEGRAM_MESSAGES = int(os.getenv('RECENT_TELEGRAM_MESSAGES', '800'))
-    TELEGRAM_HOURS_BACK = int(os.getenv('TELEGRAM_HOURS_BACK', '48'))
+    RECENT_TELEGRAM_MESSAGES = env_int('RECENT_TELEGRAM_MESSAGES', 800)
+    TELEGRAM_HOURS_BACK = env_int('TELEGRAM_HOURS_BACK', 48)
     GREENHOUSE_BOARDS = os.getenv('GREENHOUSE_BOARDS', 'gitlab,canonical,elastic').split(',')
     LEVER_COMPANIES = os.getenv(
         'LEVER_COMPANIES',
@@ -96,8 +109,8 @@ class Config:
     TELEGRAM_API_ID = os.getenv('TELEGRAM_API_ID')
     TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
     TELEGRAM_SESSION_NAME = os.getenv('TELEGRAM_SESSION_NAME')
-    CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1800'))
-    MAX_POSTS_PER_CYCLE = int(os.getenv('MAX_POSTS_PER_CYCLE', '15'))
+    CHECK_INTERVAL = env_int('CHECK_INTERVAL', 1800)
+    MAX_POSTS_PER_CYCLE = env_int('MAX_POSTS_PER_CYCLE', 40)
     ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
     ENABLE_TELEGRAM_CHANNELS = os.getenv('ENABLE_TELEGRAM_CHANNELS', 'true').lower() == 'true'
     ENABLE_MARKDOWN_V2 = os.getenv('ENABLE_MARKDOWN_V2', 'true').lower() == 'true'
@@ -175,6 +188,60 @@ def setup_logger():
     return logger
 
 logger = setup_logger()
+
+
+def configure_webshare_proxy() -> Optional[str]:
+    """Configure process-wide HTTP(S) proxy from Webshare if no proxy is set."""
+    if os.getenv('HTTP_PROXY') or os.getenv('HTTPS_PROXY'):
+        return None
+
+    api_key = os.getenv('WEBSHARE_API_KEY') or os.getenv('WEBSHARE_TOKEN') or Config.WEBSHARE_API_KEY
+    if not api_key:
+        return None
+
+    params = {
+        'mode': 'direct',
+        'page': 1,
+        'page_size': 10,
+        'valid': 'true',
+    }
+    countries = os.getenv('WEBSHARE_COUNTRIES') or Config.WEBSHARE_COUNTRIES
+    if countries:
+        params['country_code__in'] = countries
+
+    try:
+        response = requests.get(
+            'https://proxy.webshare.io/api/v2/proxy/list/',
+            headers={'Authorization': f'Token {api_key}'},
+            params=params,
+            timeout=20,
+        )
+        response.raise_for_status()
+        proxies = response.json().get('results', [])
+        proxy = next((item for item in proxies if item.get('valid')), None) or (proxies[0] if proxies else None)
+        if not proxy:
+            logger.warning("Webshare proxy list is empty")
+            return None
+
+        proxy_url = (
+            f"http://{proxy['username']}:{proxy['password']}@"
+            f"{proxy['proxy_address']}:{proxy['port']}"
+        )
+        os.environ['HTTP_PROXY'] = proxy_url
+        os.environ['HTTPS_PROXY'] = proxy_url
+        if not os.getenv('TELEGRAM_PROXY'):
+            os.environ['TELEGRAM_PROXY'] = proxy_url
+        logger.info(
+            "Configured Webshare proxy: country=%s city=%s address=%s port=%s",
+            proxy.get('country_code'),
+            proxy.get('city_name'),
+            str(proxy.get('proxy_address', '')).rsplit('.', 1)[0] + '.*',
+            proxy.get('port'),
+        )
+        return proxy_url
+    except Exception as e:
+        logger.error(f"Webshare proxy setup failed: {e}")
+        return None
 
 # ==================== CONSTANTS ====================
 DELAYS = {
@@ -373,6 +440,15 @@ class DatabaseConnection:
         c.execute("CREATE INDEX IF NOT EXISTS idx_favorites_user ON user_favorites(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tg_hashes_created ON telegram_content_hashes(created_at)")
         
+        # Meta table for one-shot migrations and flags
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         # Migration: add category if not exists
         try:
             c.execute("SELECT category FROM posted_jobs LIMIT 1")
@@ -499,9 +575,20 @@ def init_database() -> DatabaseConnection:
     return DatabaseConnection()
 
 
+from urllib.parse import urlsplit, urlunsplit
+
+
+def normalize_url(url: str) -> str:
+    """Strip query params and fragments for stable deduplication."""
+    if not url:
+        return ''
+    p = urlsplit(url.strip())
+    return urlunsplit((p.scheme, p.netloc, p.path, '', ''))
+
+
 def generate_job_hash(job: Dict) -> str:
-    """Generate robust hash using URL (primary) or title+company (fallback)"""
-    url = job.get('url', '').strip()
+    """Generate robust hash using normalized URL (primary) or title+company (fallback)"""
+    url = normalize_url(job.get('url', ''))
     if url:
         return hashlib.sha256(url.encode()).hexdigest()[:16]
     
@@ -552,6 +639,103 @@ def register_posted_job(job: Dict, db: DatabaseConnection) -> None:
         )
     )
     logger.debug(f"💾 Saved new job: {job.get('title', 'N/A')}")
+
+
+def run_hash_migration(db: DatabaseConnection) -> bool:
+    """One-shot idempotent migration of posted_jobs hashes to normalized URLs.
+    
+    Uses db.conn directly to keep the entire migration in a single SQLite transaction.
+    """
+    conn = db.conn
+    try:
+        c = conn.cursor()
+
+        # Ensure meta table exists (defensive, _initialize already creates it)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Check if already done or failed previously
+        c.execute("SELECT value FROM meta WHERE key = ?", ('hash_migration_done',))
+        result = c.fetchone()
+        if result and result[0] in ('1', 'error'):
+            logger.info("⏭️ Hash migration already completed or previously failed")
+            conn.commit()
+            return True
+
+        logger.info("🔄 Starting hash migration for posted_jobs...")
+
+        # Load all existing rows
+        c.execute("SELECT rowid, hash, url, title, company FROM posted_jobs ORDER BY rowid")
+        rows = c.fetchall()
+        if not rows:
+            logger.info("✅ No posted_jobs to migrate")
+            c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", ('hash_migration_done', '1'))
+            conn.commit()
+            return True
+
+        # Compute new hashes and keep old->new mapping for user_favorites sync
+        new_hashes: Dict[str, List[int]] = {}
+        old_to_new: Dict[str, str] = {}
+        for row in rows:
+            rowid, old_hash, url, title, company = row
+            job = {'url': url or '', 'title': title or '', 'company': company or ''}
+            new_hash = generate_job_hash(job)
+            new_hashes.setdefault(new_hash, []).append(rowid)
+            old_to_new[old_hash] = new_hash
+
+        deleted_count = 0
+        updated_count = 0
+        for new_hash, rowids in new_hashes.items():
+            if len(rowids) > 1:
+                keep_rowid = min(rowids)
+                to_delete = [rid for rid in rowids if rid != keep_rowid]
+                for rid in to_delete:
+                    c.execute("DELETE FROM posted_jobs WHERE rowid = ?", (rid,))
+                    deleted_count += 1
+                c.execute("UPDATE posted_jobs SET hash = ? WHERE rowid = ?", (new_hash, keep_rowid))
+                updated_count += 1
+            else:
+                c.execute("UPDATE posted_jobs SET hash = ? WHERE rowid = ?", (new_hash, rowids[0]))
+                updated_count += 1
+
+        # Sync user_favorites so they point to new hashes and remove orphans
+        for old_hash, new_hash in old_to_new.items():
+            c.execute(
+                "UPDATE user_favorites SET job_hash = ? WHERE job_hash = ?",
+                (new_hash, old_hash)
+            )
+        c.execute(
+            "DELETE FROM user_favorites WHERE job_hash NOT IN (SELECT hash FROM posted_jobs)"
+        )
+
+        c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", ('hash_migration_done', '1'))
+        conn.commit()
+        logger.info(
+            f"✅ Hash migration complete: {updated_count} updated, {deleted_count} duplicates removed"
+        )
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Hash migration failed: {e}", exc_info=True)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        try:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                ('hash_migration_done', 'error')
+            )
+            conn.commit()
+        except Exception:
+            pass
+        return False
 
 # ==================== UTILS ====================
 def get_headers() -> Dict[str, str]:
@@ -932,71 +1116,92 @@ def fetch_remoteok() -> List[Dict]:
 
 
 def fetch_arbeitnow() -> List[Dict]:
-    """Arbeitnow API"""
+    """Arbeitnow API with pagination."""
     try:
-        url = "https://www.arbeitnow.com/api/job-board-api"
-        params = {'page': 1, 'limit': 50, 'tags': 'it,software,developer,engineer'}
-        response = requests.get(url, params=params, headers=get_headers(), timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        
-        jobs = []
-        for job in data.get('data', []):
-            salary = 'Не указана'
-            if job.get('salary_min') and job.get('salary_max'):
-                salary = f"${job['salary_min']:,}-${job['salary_max']:}"
-            elif job.get('salary_min'):
-                salary = f"от ${job['salary_min']:,}"
-            
-            jobs.append({
-                'title': job.get('title', ''),
-                'company': job.get('company_name', ''),
-                'description': job.get('description', ''),
-                'url': job.get('url', ''),
-                'salary': salary,
-                'location': job.get('location', 'Remote'),
-                'published': job.get('created_at', ''),
-                'employment_type': job.get('employment_type', ''),
-                'source': 'Arbeitnow',
-                'tags': job.get('tags', [])
-            })
-        
-        return jobs
+        all_jobs = []
+        for page in range(1, 4):
+            url = "https://www.arbeitnow.com/api/job-board-api"
+            params = {'page': page, 'limit': 50, 'tags': 'it,software,developer,engineer'}
+            response = requests.get(url, params=params, headers=get_headers(), timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            jobs = data.get('data', [])
+            if not jobs:
+                break
+
+            for job in jobs:
+                salary = 'Не указана'
+                if job.get('salary_min') and job.get('salary_max'):
+                    salary = f"${job['salary_min']:,}-${job['salary_max']:}"
+                elif job.get('salary_min'):
+                    salary = f"от ${job['salary_min']:,}"
+
+                all_jobs.append({
+                    'title': job.get('title', ''),
+                    'company': job.get('company_name', ''),
+                    'description': job.get('description', ''),
+                    'url': job.get('url', ''),
+                    'salary': salary,
+                    'location': job.get('location', 'Remote'),
+                    'published': job.get('created_at', ''),
+                    'employment_type': job.get('employment_type', ''),
+                    'source': 'Arbeitnow',
+                    'tags': job.get('tags', [])
+                })
+
+            if len(jobs) < 50:
+                break
+            time.sleep(1)
+
+        return all_jobs
     except Exception as e:
         logger.error(f"❌ Arbeitnow error: {e}")
         return []
 
 
 def fetch_himalayas() -> List[Dict]:
-    """Himalayas API"""
+    """Himalayas API with pagination."""
     try:
-        url = "https://himalayas.app/jobs/api"
-        params = {'limit': 50, 'offset': 0}
-        response = requests.get(url, params=params, headers=get_headers(), timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        
-        jobs = []
-        for job in data.get('jobs', []):
-            salary = 'Не указана'
-            if job.get('minSalary') and job.get('maxSalary'):
-                currency = job.get('currency', 'USD')
-                salary = f"{job['minSalary']:,}-{job['maxSalary']:,} {currency}"
-            
-            jobs.append({
-                'title': job.get('title', ''),
-                'company': job.get('companyName', ''),
-                'description': job.get('excerpt') or strip_html(job.get('description', '')),
-                'url': job.get('applicationLink') or f"https://himalayas.app/companies/{job.get('companySlug', '')}/jobs/{job.get('guid', '')}",
-                'salary': salary,
-                'location': 'Remote',
-                'published': job.get('pubDate', ''),
-                'employment_type': job.get('employmentType', ''),
-                'source': 'Himalayas',
-                'tags': job.get('categories', []) + job.get('parentCategories', [])
-            })
-        
-        return jobs
+        all_jobs = []
+        offset = 0
+        limit = 50
+        for _ in range(3):
+            url = "https://himalayas.app/jobs/api"
+            params = {'limit': limit, 'offset': offset}
+            response = requests.get(url, params=params, headers=get_headers(), timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            jobs = data.get('jobs', [])
+            if not jobs:
+                break
+
+            for job in jobs:
+                salary = 'Не указана'
+                if job.get('minSalary') and job.get('maxSalary'):
+                    currency = job.get('currency', 'USD')
+                    salary = f"{job['minSalary']:,}-{job['maxSalary']:,} {currency}"
+
+                all_jobs.append({
+                    'title': job.get('title', ''),
+                    'company': job.get('companyName', ''),
+                    'description': job.get('excerpt') or strip_html(job.get('description', '')),
+                    'url': job.get('applicationLink') or f"https://himalayas.app/companies/{job.get('companySlug', '')}/jobs/{job.get('guid', '')}",
+                    'salary': salary,
+                    'location': 'Remote',
+                    'published': job.get('pubDate', ''),
+                    'employment_type': job.get('employmentType', ''),
+                    'source': 'Himalayas',
+                    'tags': job.get('categories', []) + job.get('parentCategories', [])
+                })
+
+            offset += limit
+            if len(jobs) < limit:
+                break
+            time.sleep(1)
+
+        return all_jobs
     except Exception as e:
         logger.error(f"❌ Himalayas error: {e}")
         return []
@@ -1345,7 +1550,7 @@ def fetch_adzuna() -> List[Dict]:
 
 
 def fetch_headhunter() -> List[Dict]:
-    """HeadHunter API"""
+    """HeadHunter API with pagination (up to 3 pages)."""
     try:
         url = "https://api.hh.ru/vacancies"
         headers = {
@@ -1355,64 +1560,72 @@ def fetch_headhunter() -> List[Dict]:
         if Config.HEADHUNTER_ACCESS_TOKEN:
             headers['Authorization'] = f"Bearer {Config.HEADHUNTER_ACCESS_TOKEN}"
 
-        params = {
-            'text': 'python OR javascript OR frontend OR backend OR qa OR devops OR data',
-            'per_page': 50,
-            'page': 0,
-            'schedule': 'remote',
-            'experience': ('noExperience', 'between1And3', 'between3And6'),
-            'employment': ('full', 'part', 'project'),
-            'order_by': 'publication_time',
-            'period': 14,
-            'search_field': ('name', 'description')
-        }
-        
-        response = requests.get(url, params=params, headers=headers, timeout=15)
-        if response.status_code == 403 and not Config.HEADHUNTER_ACCESS_TOKEN:
-            logger.warning(
-                "⚠️ HeadHunter /vacancies returned 403 without OAuth. "
-                "Set HEADHUNTER_ACCESS_TOKEN if anonymous vacancy search is blocked."
-            )
-            return []
-        response.raise_for_status()
-        data = response.json()
-        
-        jobs = []
-        for item in data.get('items', []):
-            salary_info = item.get('salary')
-            salary = 'Не указана'
-            
-            if salary_info:
-                currency = salary_info.get('currency', 'RUB')
-                if salary_info.get('from') and salary_info.get('to'):
-                    salary = f"{salary_info['from']:,}-{salary_info['to']:,} {currency}"
-                elif salary_info.get('from'):
-                    salary = f"от {salary_info['from']:,} {currency}"
-                elif salary_info.get('to'):
-                    salary = f"до {salary_info['to']:,} {currency}"
-            
-            snippet = item.get('snippet', {})
-            description = f"{snippet.get('requirement', '')} {snippet.get('responsibility', '')}"
-            
-            employment = item.get('employment', {})
-            employment_name = employment.get('name', '') if isinstance(employment, dict) else ''
-            experience = item.get('experience', {})
-            experience_name = experience.get('name', '') if isinstance(experience, dict) else ''
-            
-            jobs.append({
-                'title': item.get('name', ''),
-                'company': item.get('employer', {}).get('name', ''),
-                'description': f"{description} {experience_name}",
-                'url': item.get('alternate_url', ''),
-                'salary': salary,
-                'location': 'Удалённо',
-                'published': item.get('published_at', ''),
-                'employment_type': employment_name,
-                'source': 'HeadHunter',
-                'tags': []
-            })
-        
-        return jobs
+        all_jobs = []
+        for page in range(0, 3):
+            params = {
+                'text': 'python OR javascript OR frontend OR backend OR qa OR devops OR data',
+                'per_page': 50,
+                'page': page,
+                'schedule': 'remote',
+                'experience': ('noExperience', 'between1And3', 'between3And6'),
+                'employment': ('full', 'part', 'project'),
+                'order_by': 'publication_time',
+                'period': 14,
+                'search_field': ('name', 'description')
+            }
+
+            response = requests.get(url, params=params, headers=headers, timeout=15)
+            if response.status_code == 403 and not Config.HEADHUNTER_ACCESS_TOKEN:
+                logger.warning(
+                    "⚠️ HeadHunter /vacancies returned 403 without OAuth. "
+                    "Set HEADHUNTER_ACCESS_TOKEN if anonymous vacancy search is blocked."
+                )
+                return []
+            response.raise_for_status()
+            data = response.json()
+            items = data.get('items', [])
+            if not items:
+                break
+
+            for item in items:
+                salary_info = item.get('salary')
+                salary = 'Не указана'
+
+                if salary_info:
+                    currency = salary_info.get('currency', 'RUB')
+                    if salary_info.get('from') and salary_info.get('to'):
+                        salary = f"{salary_info['from']:,}-{salary_info['to']:,} {currency}"
+                    elif salary_info.get('from'):
+                        salary = f"от {salary_info['from']:,} {currency}"
+                    elif salary_info.get('to'):
+                        salary = f"до {salary_info['to']:,} {currency}"
+
+                snippet = item.get('snippet', {})
+                description = f"{snippet.get('requirement', '')} {snippet.get('responsibility', '')}"
+
+                employment = item.get('employment', {})
+                employment_name = employment.get('name', '') if isinstance(employment, dict) else ''
+                experience = item.get('experience', {})
+                experience_name = experience.get('name', '') if isinstance(experience, dict) else ''
+
+                all_jobs.append({
+                    'title': item.get('name', ''),
+                    'company': item.get('employer', {}).get('name', ''),
+                    'description': f"{description} {experience_name}",
+                    'url': item.get('alternate_url', ''),
+                    'salary': salary,
+                    'location': 'Удалённо',
+                    'published': item.get('published_at', ''),
+                    'employment_type': employment_name,
+                    'source': 'HeadHunter',
+                    'tags': []
+                })
+
+            if page >= data.get('pages', 1) - 1:
+                break
+            time.sleep(1)
+
+        return all_jobs
     except Exception as e:
         logger.error(f"❌ HeadHunter error: {e}")
         return []
@@ -1815,7 +2028,7 @@ async def get_recent_channel_job_hashes(limit: Optional[int] = None) -> set:
                             if url:
                                 urls.append(url)
                 for url in urls:
-                    hashes.add(hashlib.sha256(url.strip().encode()).hexdigest()[:16])
+                    hashes.add(hashlib.sha256(normalize_url(url).encode()).hexdigest()[:16])
         finally:
             await parser.disconnect()
         logger.info(f"🔎 Loaded {len(hashes)} recent channel job hashes")
@@ -1916,8 +2129,11 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
     """Run a single collection/publication cycle for serverless cron deployments."""
     if not Config.validate():
         return {'ok': False, 'error': 'invalid_config'}
+    configure_webshare_proxy()
 
     db = init_database() if use_sqlite else None
+    if db:
+        run_hash_migration(db)
     bot = None
     post_transport = 'bot'
     if Config.TELEGRAM_BOT_TOKEN:
@@ -1996,11 +2212,23 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
                 continue
             publish_candidates.append(job)
 
-        selected_jobs = diversify_jobs_by_source(publish_candidates, Config.MAX_POSTS_PER_CYCLE)
+        selected_jobs = publish_candidates
+        selected_jobs.sort(key=job_quality_score, reverse=True)
+
+        # Soft cap: publish top N best jobs per cycle to protect serverless timeouts
+        total_selected = len(selected_jobs)
+        if total_selected > Config.MAX_POSTS_PER_CYCLE:
+            logger.info(f"🎯 Отобрано {total_selected} вакансий для публикации (лимит {Config.MAX_POSTS_PER_CYCLE})")
+            if Config.MAX_POSTS_PER_CYCLE > 40:
+                logger.warning(f"⚠️ Лимит публикации ({Config.MAX_POSTS_PER_CYCLE}) превышает 40 — риск таймаута в serverless-окружении")
+            selected_jobs = selected_jobs[:Config.MAX_POSTS_PER_CYCLE]
+        else:
+            logger.info(f"🎯 Отобрано {total_selected} вакансий для публикации (лимит {Config.MAX_POSTS_PER_CYCLE})")
+
         selected_sources = {}
         for job in selected_jobs:
             selected_sources[base_source_name(job)] = selected_sources.get(base_source_name(job), 0) + 1
-        logger.info(f"🎯 Selected {len(selected_jobs)} jobs for posting by source: {selected_sources}")
+        logger.info(f"📊 Posting by source: {selected_sources}")
 
         posted_count = 0
         for job in selected_jobs:
@@ -2319,6 +2547,7 @@ async def main():
     """Main application loop"""
     if not Config.validate():
         sys.exit(1)
+    configure_webshare_proxy()
 
     logger.info("=" * 60)
     logger.info("🚀 Job Bot Starting (v6.0 - Enhanced Edition)")
@@ -2335,6 +2564,7 @@ async def main():
     
     # Initialize database
     db = init_database()
+    run_hash_migration(db)
     
     # Setup Telegram bot
     application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
@@ -2411,16 +2641,36 @@ async def main():
             
             logger.info(f"🎯 Suitable Junior/Middle jobs: {len(classified_jobs)}")
             
-            # Post jobs
-            posted_count = 0
+            # Deduplicate and sort by quality before posting
+            publish_candidates = []
             duplicate_count = 0
-            failed_count = 0
             for job in classified_jobs:
-                if posted_count >= Config.MAX_POSTS_PER_CYCLE:
-                    break
                 if is_duplicate_job(job, db):
                     duplicate_count += 1
                     continue
+                publish_candidates.append(job)
+
+            publish_candidates.sort(key=job_quality_score, reverse=True)
+
+            # Soft cap: publish top N best jobs per cycle
+            total_selected = len(publish_candidates)
+            if total_selected > Config.MAX_POSTS_PER_CYCLE:
+                logger.info(f"🎯 Отобрано {total_selected} вакансий для публикации (лимит {Config.MAX_POSTS_PER_CYCLE})")
+                if Config.MAX_POSTS_PER_CYCLE > 40:
+                    logger.warning(f"⚠️ Лимит публикации ({Config.MAX_POSTS_PER_CYCLE}) превышает 40 — риск таймаута в serverless-окружении")
+                selected_jobs = publish_candidates[:Config.MAX_POSTS_PER_CYCLE]
+            else:
+                logger.info(f"🎯 Отобрано {total_selected} вакансий для публикации (лимит {Config.MAX_POSTS_PER_CYCLE})")
+                selected_jobs = publish_candidates
+
+            # Post all suitable jobs with rate-limiting
+            posted_count = 0
+            failed_count = 0
+            for i, job in enumerate(selected_jobs):
+                # Telegram flood control: ~20 msg/min per chat safety pause
+                if i > 0 and i % 20 == 0:
+                    logger.info("⏳ Rate-limit safety pause: 60s after 20 messages")
+                    await asyncio.sleep(60)
                 if await job_bot.post_job(job):
                     register_posted_job(job, db)
                     posted_count += 1
