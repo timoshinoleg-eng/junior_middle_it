@@ -135,7 +135,11 @@ https://junior-middle-it.vercel.app/api/health
 https://junior-middle-it.vercel.app/api/cron
 ```
 
-`/api/cron` защищен `CRON_SECRET`; передавайте его как `Authorization: Bearer <CRON_SECRET>`. На Vercel Hobby встроенный cron ограничен daily-запуском, поэтому для 30-минутного расписания используется GitHub Actions workflow `.github/workflows/vercel-cron.yml`.
+`/api/cron` защищен `CRON_SECRET`; передавайте его как `Authorization: Bearer <CRON_SECRET>`.
+
+**Cron расписание:** 4 запуска в сутки (00:00, 06:00, 12:00, 18:00 UTC) через GitHub Actions workflow `.github/workflows/vercel-cron.yml`. Vercel Hobby cron ограничен 1 запуском/сутки, поэтому используется внешний триггер.
+
+Для ручного запуска: `workflow_dispatch` в GitHub Actions или прямой GET/POST на `/api/cron` с `Authorization: Bearer <CRON_SECRET>`.
 
 ### 5. Выполнить миграцию базы данных
 ```bash

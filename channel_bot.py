@@ -2197,8 +2197,12 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
             job['hash'] = generate_job_hash(job)
             classified_jobs.append(job)
 
+        # Deduplication: always load recent hashes from channel history on serverless
+        # (where SQLite is unavailable) to prevent reposting across cron invocations.
         recent_hashes = set()
-        if not use_sqlite or Config.DEDUP_MODE == 'telegram_history':
+        if not use_sqlite:
+            recent_hashes = await get_recent_channel_job_hashes()
+        elif Config.DEDUP_MODE == 'telegram_history':
             recent_hashes = await get_recent_channel_job_hashes()
 
         publish_candidates = []

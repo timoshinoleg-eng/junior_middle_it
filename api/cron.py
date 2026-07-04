@@ -35,7 +35,7 @@ class handler(BaseHTTPRequestHandler):
         result = asyncio.run(
             collect_and_post_once(
                 use_sqlite=False,
-                source_budget_seconds=int(os.getenv("SOURCE_BUDGET_SECONDS", "240")),
+                source_budget_seconds=int(os.getenv("SOURCE_BUDGET_SECONDS", "480")),
             )
         )
         self._send_json(200 if result.get("ok") else 500, result)
