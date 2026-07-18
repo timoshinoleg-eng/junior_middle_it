@@ -168,11 +168,15 @@ class Config:
     SALARY_REPORT_WEEKDAY = env_int('SALARY_REPORT_WEEKDAY', 0)  # 0=Mon … 6=Sun (APScheduler)
     SALARY_REPORT_HOUR_UTC = env_int('SALARY_REPORT_HOUR_UTC', 10)
     GROWTH_STATS_DAYS = env_int('GROWTH_STATS_DAYS', 7)
-    # v6.4 multi-track: route categories → specialty channels
-    # Example: development,qa,devops:@junior_dev;data:@junior_data;design,pm:@junior_design;*:@junior_all
+    # v6.4 multi-track — Вариант A (primary): CHANNEL_ROUTES one-liner
+    # development,devops:@dev;qa:@qa;data:@data;design,pm:@design;*:@main
     ENABLE_MULTI_TRACK = os.getenv('ENABLE_MULTI_TRACK', 'false').lower() == 'true'
-    CHANNEL_ROUTES_RAW = os.getenv('CHANNEL_ROUTES', '')
-    # Convenience aliases (optional, merged into routes if set)
+    CHANNEL_ROUTES_RAW = os.getenv(
+        'CHANNEL_ROUTES',
+        # empty default → multi-track only when user sets routes / ENABLE_MULTI_TRACK
+        '',
+    )
+    # Вариант B (optional): only if CHANNEL_ROUTES empty
     CHANNEL_ID_DEV = os.getenv('CHANNEL_ID_DEV', '')
     CHANNEL_ID_QA = os.getenv('CHANNEL_ID_QA', '')
     CHANNEL_ID_DATA = os.getenv('CHANNEL_ID_DATA', '')
@@ -183,28 +187,30 @@ class Config:
     
     @classmethod
     def _build_channel_routes(cls) -> list:
-        """Merge CHANNEL_ROUTES string + CHANNEL_ID_* shortcuts."""
+        """
+        Вариант A: CHANNEL_ROUTES string wins.
+        Вариант B: CHANNEL_ID_* shortcuts only when CHANNEL_ROUTES is empty.
+        """
         if not GROWTH_UTILS_AVAILABLE:
             return []
         routes = parse_channel_routes(cls.CHANNEL_ROUTES_RAW)
-        # Shortcuts if explicit routes empty or as supplements
+        if routes:
+            # Variant A only — do not merge shortcuts (avoid duplicate targets)
+            return routes
+        # Variant B fallback
         shortcuts = [
             (('development', 'devops'), cls.CHANNEL_ID_DEV),
             (('qa',), cls.CHANNEL_ID_QA),
             (('data',), cls.CHANNEL_ID_DATA),
             (('design', 'pm'), cls.CHANNEL_ID_DESIGN),
         ]
-        existing_chs = {ch for _, ch in routes}
         for cats, ch in shortcuts:
             ch = (ch or '').strip()
             if not ch:
                 continue
             if not (ch.startswith('@') or ch.startswith('-')):
                 ch = f'@{ch}'
-            if ch in existing_chs:
-                continue
             routes.append((list(cats), ch))
-            existing_chs.add(ch)
         return routes
 
     @classmethod

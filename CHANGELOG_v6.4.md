@@ -3,21 +3,27 @@
 ## What
 Route vacancies to specialty Telegram channels by category instead of one firehose.
 
-## Config
+## Config — Вариант A (рекомендуемый)
+
+Одна строка `CHANNEL_ROUTES`. `CHANNEL_ID` = main + fallback (`*` в routes).
+
 ```env
 ENABLE_MULTI_TRACK=true
 CHANNEL_ID=@junior_all
 CHANNEL_ROUTES=development,devops:@junior_dev;qa:@junior_qa;data:@junior_data;design,pm:@junior_design;*:@junior_all
-
-# or shortcuts:
-CHANNEL_ID_DEV=@junior_dev
-CHANNEL_ID_QA=@junior_qa
-CHANNEL_ID_DATA=@junior_data
-CHANNEL_ID_DESIGN=@junior_design
-
-MULTI_TRACK_MIRROR_MAIN=false   # also post specialty jobs to CHANNEL_ID
+MULTI_TRACK_MIRROR_MAIN=false
 MULTI_TRACK_POST_DELAY=1.0
 ```
+
+| Правило | Куда |
+|---------|------|
+| development, devops | `@junior_dev` |
+| qa | `@junior_qa` |
+| data | `@junior_data` |
+| design, pm | `@junior_design` |
+| `*` (остальное) | `@junior_all` (= `CHANNEL_ID`) |
+
+Вариант B (shortcuts `CHANNEL_ID_DEV`…) — только если `CHANNEL_ROUTES` пуст.
 
 ## Behavior
 - Job category → matching track channel(s)
