@@ -10,10 +10,12 @@ from growth_utils import (
     fuzzy_is_near_duplicate,
     job_fingerprint,
     job_matches_profile,
+    parse_channel_routes,
     parse_salary_to_usd_min,
     parse_start_payload,
     passes_channel_tracks,
     passes_min_salary,
+    resolve_channels_for_job,
     serialize_job_payload,
 )
 
@@ -119,6 +121,53 @@ class GrowthUtilsTests(unittest.TestCase):
         s = apply_premium_to_settings({"hide_senior": True}, True)
         self.assertFalse(s["hide_senior"])
         self.assertTrue(s["premium_unlocked"])
+
+    def test_parse_channel_routes(self):
+        raw = "development,qa,devops:@dev;data:@data;*:@main"
+        routes = parse_channel_routes(raw)
+        self.assertEqual(len(routes), 3)
+        self.assertIn("development", routes[0][0])
+        self.assertEqual(routes[0][1], "@dev")
+        self.assertEqual(routes[2][1], "@main")
+
+    def test_resolve_channels_specialty(self):
+        routes = parse_channel_routes(
+            "development,devops:@dev;qa:@qa;data:@data;*:@main"
+        )
+        ch = resolve_channels_for_job(
+            {"category": "development"},
+            routes,
+            default_channel="@main",
+            enabled=True,
+            mirror_main=False,
+        )
+        self.assertEqual(ch, ["@dev"])
+        ch_m = resolve_channels_for_job(
+            {"category": "qa"},
+            routes,
+            default_channel="@main",
+            enabled=True,
+            mirror_main=True,
+        )
+        self.assertEqual(ch_m, ["@qa", "@main"])
+
+    def test_resolve_channels_fallback(self):
+        routes = parse_channel_routes("development:@dev;*:@main")
+        ch = resolve_channels_for_job(
+            {"category": "marketing"},
+            routes,
+            default_channel="@main",
+            enabled=True,
+        )
+        self.assertEqual(ch, ["@main"])
+        # multi-track off
+        ch2 = resolve_channels_for_job(
+            {"category": "development"},
+            routes,
+            default_channel="@main",
+            enabled=False,
+        )
+        self.assertEqual(ch2, ["@main"])
 
 
 if __name__ == "__main__":

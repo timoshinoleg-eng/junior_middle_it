@@ -76,13 +76,16 @@ try:
         apply_premium_to_settings,
         build_referral_link,
         build_salary_magnet_report,
+        describe_channel_routes,
         enrich_job_salary_fields,
         fuzzy_is_near_duplicate,
         job_fingerprint,
         job_matches_profile,
+        parse_channel_routes,
         parse_start_payload,
         passes_channel_tracks,
         passes_min_salary,
+        resolve_channels_for_job,
         serialize_job_payload,
     )
     GROWTH_UTILS_AVAILABLE = True
@@ -165,7 +168,45 @@ class Config:
     SALARY_REPORT_WEEKDAY = env_int('SALARY_REPORT_WEEKDAY', 0)  # 0=Mon … 6=Sun (APScheduler)
     SALARY_REPORT_HOUR_UTC = env_int('SALARY_REPORT_HOUR_UTC', 10)
     GROWTH_STATS_DAYS = env_int('GROWTH_STATS_DAYS', 7)
+    # v6.4 multi-track: route categories → specialty channels
+    # Example: development,qa,devops:@junior_dev;data:@junior_data;design,pm:@junior_design;*:@junior_all
+    ENABLE_MULTI_TRACK = os.getenv('ENABLE_MULTI_TRACK', 'false').lower() == 'true'
+    CHANNEL_ROUTES_RAW = os.getenv('CHANNEL_ROUTES', '')
+    # Convenience aliases (optional, merged into routes if set)
+    CHANNEL_ID_DEV = os.getenv('CHANNEL_ID_DEV', '')
+    CHANNEL_ID_QA = os.getenv('CHANNEL_ID_QA', '')
+    CHANNEL_ID_DATA = os.getenv('CHANNEL_ID_DATA', '')
+    CHANNEL_ID_DESIGN = os.getenv('CHANNEL_ID_DESIGN', '')
+    MULTI_TRACK_MIRROR_MAIN = os.getenv('MULTI_TRACK_MIRROR_MAIN', 'false').lower() == 'true'
+    MULTI_TRACK_POST_DELAY = float(os.getenv('MULTI_TRACK_POST_DELAY', '1.0'))
+    CHANNEL_ROUTES: list = []  # filled in validate()
     
+    @classmethod
+    def _build_channel_routes(cls) -> list:
+        """Merge CHANNEL_ROUTES string + CHANNEL_ID_* shortcuts."""
+        if not GROWTH_UTILS_AVAILABLE:
+            return []
+        routes = parse_channel_routes(cls.CHANNEL_ROUTES_RAW)
+        # Shortcuts if explicit routes empty or as supplements
+        shortcuts = [
+            (('development', 'devops'), cls.CHANNEL_ID_DEV),
+            (('qa',), cls.CHANNEL_ID_QA),
+            (('data',), cls.CHANNEL_ID_DATA),
+            (('design', 'pm'), cls.CHANNEL_ID_DESIGN),
+        ]
+        existing_chs = {ch for _, ch in routes}
+        for cats, ch in shortcuts:
+            ch = (ch or '').strip()
+            if not ch:
+                continue
+            if not (ch.startswith('@') or ch.startswith('-')):
+                ch = f'@{ch}'
+            if ch in existing_chs:
+                continue
+            routes.append((list(cats), ch))
+            existing_chs.add(ch)
+        return routes
+
     @classmethod
     def validate(cls) -> bool:
         errors = []
@@ -175,6 +216,16 @@ class Config:
             errors.append("❌ CHANNEL_ID is required")
         if cls.CHANNEL_ID and not (cls.CHANNEL_ID.startswith('@') or cls.CHANNEL_ID.startswith('-')):
             errors.append(f"❌ CHANNEL_ID should start with '@' or '-', got: {cls.CHANNEL_ID}")
+
+        cls.CHANNEL_ROUTES = cls._build_channel_routes()
+        if cls.ENABLE_MULTI_TRACK and not cls.CHANNEL_ROUTES:
+            errors.append(
+                "❌ ENABLE_MULTI_TRACK=true but no routes: set CHANNEL_ROUTES "
+                "or CHANNEL_ID_DEV / CHANNEL_ID_QA / CHANNEL_ID_DATA"
+            )
+        for _, ch in cls.CHANNEL_ROUTES:
+            if not (ch.startswith('@') or ch.startswith('-')):
+                errors.append(f"❌ Bad multi-track channel id: {ch}")
         
         # Validate ADMIN_USER_ID
         if cls.ADMIN_USER_ID:
@@ -2474,20 +2525,29 @@ async def get_recent_channel_job_hashes(limit: Optional[int] = None) -> set:
         return set()
 
 
-async def post_job_with_bot(bot: Bot, job: Dict, db: Optional[DatabaseConnection] = None) -> bool:
-    """Post a job using a bare Bot instance, suitable for cron/serverless."""
+def get_target_channels(job: Dict) -> List[str]:
+    """Multi-track target chats for a job (or single CHANNEL_ID)."""
+    if GROWTH_UTILS_AVAILABLE:
+        return resolve_channels_for_job(
+            job,
+            routes=Config.CHANNEL_ROUTES,
+            default_channel=Config.CHANNEL_ID,
+            enabled=Config.ENABLE_MULTI_TRACK,
+            mirror_main=Config.MULTI_TRACK_MIRROR_MAIN,
+        )
+    return [Config.CHANNEL_ID] if Config.CHANNEL_ID else []
+
+
+async def _send_job_to_chat(bot: Bot, job: Dict, chat_id: str) -> bool:
+    """Low-level send one job message to one chat."""
     try:
-        job_hash = job.get('hash') or generate_job_hash(job)
-        job['hash'] = job_hash
-        if db:
-            db.save_job_payload(job_hash, job)
         if Config.ENABLE_MARKDOWN_V2 and FORMATTER_AVAILABLE:
             formatter = JobMessageFormatter()
             formatted = formatter.format_job(
                 job, view_mode='compact', bot_username=Config.BOT_USERNAME
             )
             await bot.send_message(
-                chat_id=Config.CHANNEL_ID,
+                chat_id=chat_id,
                 text=formatted.text,
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=InlineKeyboardMarkup(formatted.reply_markup['inline_keyboard']),
@@ -2495,20 +2555,45 @@ async def post_job_with_bot(bot: Bot, job: Dict, db: Optional[DatabaseConnection
             )
         else:
             await bot.send_message(
-                chat_id=Config.CHANNEL_ID,
+                chat_id=chat_id,
                 text=format_job_message_legacy(job),
                 parse_mode='HTML',
                 disable_web_page_preview=True
             )
-        logger.info(f"✅ Posted: {job.get('title', 'N/A')} [{job.get('source', 'N/A')}]")
         return True
     except RetryAfter as e:
-        logger.warning(f"⏳ Telegram flood control: retry after {e.retry_after}s")
+        logger.warning(f"⏳ Flood control {chat_id}: retry after {e.retry_after}s")
         await asyncio.sleep(e.retry_after)
-        return await post_job_with_bot(bot, job, db=db)
+        return await _send_job_to_chat(bot, job, chat_id)
     except Exception as e:
-        logger.error(f"❌ Failed to post job: {e}")
+        logger.error(f"❌ Send fail → {chat_id}: {e}")
         return False
+
+
+async def post_job_with_bot(bot: Bot, job: Dict, db: Optional[DatabaseConnection] = None) -> bool:
+    """Post a job using a bare Bot instance, suitable for cron/serverless (multi-track aware)."""
+    job_hash = job.get('hash') or generate_job_hash(job)
+    job['hash'] = job_hash
+    if db:
+        db.save_job_payload(job_hash, job)
+
+    targets = get_target_channels(job)
+    if not targets:
+        logger.error("❌ No target channels for job")
+        return False
+
+    any_ok = False
+    for i, chat_id in enumerate(targets):
+        if i > 0:
+            await asyncio.sleep(Config.MULTI_TRACK_POST_DELAY)
+        ok = await _send_job_to_chat(bot, job, chat_id)
+        if ok:
+            any_ok = True
+            logger.info(
+                f"✅ Posted → {chat_id}: {job.get('title', 'N/A')} "
+                f"[{job.get('category', 'other')}|{job.get('source', 'N/A')}]"
+            )
+    return any_ok
 
 
 async def post_job_with_telethon(job: Dict) -> bool:
@@ -2810,15 +2895,29 @@ class JobBot:
             setup_hint = "\n\n⚙️ *Настрой профиль:* /setup — категории, зарплата, стек, личный digest."
 
         thr = Config.REF_REWARD_THRESHOLD
+        tracks_line = ""
+        if Config.ENABLE_MULTI_TRACK and Config.CHANNEL_ROUTES:
+            bits = []
+            for cats, ch in Config.CHANNEL_ROUTES:
+                if any(c in ("*", "all", "default") for c in cats):
+                    continue
+                label = "/".join(CATEGORY_NAMES_RU.get(c, c) for c in cats[:3])
+                link = f"https://t.me/{ch.lstrip('@')}" if str(ch).startswith("@") else str(ch)
+                bits.append(f"• {label}: {link}")
+            if bits:
+                tracks_line = "\n\n🛤️ *Треки:*\n" + "\n".join(bits[:6])
+
         welcome_text = (
             "👋 Привет! Я собираю *Junior/Middle remote IT*-вакансии.\n\n"
-            f"📌 Канал (лента): {channel_link}\n"
+            f"📌 Главный канал: {channel_link}\n"
             f"📬 Личный digest: /digest on — подборка в ЛС по профилю.\n"
             f"⚡ Мгновенные алерты: /alerts on — 1–2 топа за цикл.\n"
-            f"🏆 Premium: пригласи {thr}+ друзей (/ref) → Senior + больше digests.\n\n"
+            f"🏆 Premium: пригласи {thr}+ друзей (/ref) → Senior + больше digests."
+            f"{tracks_line}\n\n"
             "*Команды:*\n"
             "/setup — онбординг профиля\n"
             "/digest on|off|now · /alerts on|off\n"
+            "/tracks — куда уходит какая категория\n"
             "/profile · /ref · /favorites · /categories\n"
             "/stats_growth · /last · /status — admin"
             f"{setup_hint}"
@@ -2982,6 +3081,23 @@ class JobBot:
             lines.append(f"  {d}: {c}")
         await update.message.reply_text("\n".join(lines))
         self.db.log_event(update.effective_user.id, 'stats_growth_view', {'days': days})
+
+    async def cmd_tracks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show multi-track channel routing map."""
+        if not Config.ENABLE_MULTI_TRACK:
+            await update.message.reply_text(
+                "Multi-track выключен (ENABLE_MULTI_TRACK=false).\n"
+                f"Всё идёт в {Config.CHANNEL_ID}"
+            )
+            return
+        if GROWTH_UTILS_AVAILABLE:
+            text = "🛤️ Multi-track routes\n\n" + describe_channel_routes(
+                Config.CHANNEL_ROUTES, Config.CHANNEL_ID, CATEGORY_NAMES_RU
+            )
+            text += f"\n\nmirror_main={Config.MULTI_TRACK_MIRROR_MAIN}"
+        else:
+            text = f"Main only: {Config.CHANNEL_ID}"
+        await update.message.reply_text(text)
 
     def _effective_profile(self, user_id: int) -> Dict:
         """Profile + premium soft rewards applied."""
@@ -3442,50 +3558,83 @@ class JobBot:
             return
     
     async def post_job(self, job: Dict) -> bool:
-        """Post job to channel with enhanced formatting"""
+        """Post job to one or more track channels (multi-track aware)."""
         if self.is_paused:
             logger.info("⏸️ Skipped posting (bot is paused)")
             return False
 
-        # Ensure hash + payload cache for expand/compact
         job_hash = job.get('hash') or generate_job_hash(job)
         job['hash'] = job_hash
         self.db.save_job_payload(job_hash, job)
-        
-        try:
-            if Config.ENABLE_MARKDOWN_V2 and self.formatter:
-                formatted = self.formatter.format_job(
-                    job, view_mode='compact', bot_username=Config.BOT_USERNAME
-                )
-                await self.application.bot.send_message(
-                    chat_id=Config.CHANNEL_ID,
-                    text=formatted.text,
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=InlineKeyboardMarkup(formatted.reply_markup['inline_keyboard']),
-                    disable_web_page_preview=formatted.disable_web_page_preview
-                )
-            else:
-                message = format_job_message_legacy(job)
-                await self.application.bot.send_message(
-                    chat_id=Config.CHANNEL_ID,
-                    text=message,
-                    parse_mode='HTML',
-                    disable_web_page_preview=True
-                )
-            
-            logger.info(f"✅ Posted: {job.get('title', 'N/A')} [{job.get('category', 'other')}]")
-            return True
-            
-        except RetryAfter as e:
-            logger.warning(f"⏳ Telegram flood control: retry after {e.retry_after}s")
-            await asyncio.sleep(e.retry_after)
-            return await self.post_job(job)
-        except TimedOut:
-            logger.error("❌ Telegram timeout")
+
+        targets = get_target_channels(job)
+        if not targets:
+            logger.error("❌ No target channels for job")
             return False
-        except Exception as e:
-            logger.error(f"❌ Failed to post job: {e}")
-            return False
+
+        any_ok = False
+        for i, chat_id in enumerate(targets):
+            if i > 0:
+                await asyncio.sleep(Config.MULTI_TRACK_POST_DELAY)
+            try:
+                if Config.ENABLE_MARKDOWN_V2 and self.formatter:
+                    formatted = self.formatter.format_job(
+                        job, view_mode='compact', bot_username=Config.BOT_USERNAME
+                    )
+                    await self.application.bot.send_message(
+                        chat_id=chat_id,
+                        text=formatted.text,
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup(
+                            formatted.reply_markup['inline_keyboard']
+                        ),
+                        disable_web_page_preview=formatted.disable_web_page_preview
+                    )
+                else:
+                    await self.application.bot.send_message(
+                        chat_id=chat_id,
+                        text=format_job_message_legacy(job),
+                        parse_mode='HTML',
+                        disable_web_page_preview=True
+                    )
+                any_ok = True
+                logger.info(
+                    f"✅ Posted → {chat_id}: {job.get('title', 'N/A')} "
+                    f"[{job.get('category', 'other')}]"
+                )
+            except RetryAfter as e:
+                logger.warning(f"⏳ Flood control {chat_id}: {e.retry_after}s")
+                await asyncio.sleep(e.retry_after)
+                try:
+                    # one retry after flood wait
+                    if Config.ENABLE_MARKDOWN_V2 and self.formatter:
+                        formatted = self.formatter.format_job(
+                            job, view_mode='compact', bot_username=Config.BOT_USERNAME
+                        )
+                        await self.application.bot.send_message(
+                            chat_id=chat_id,
+                            text=formatted.text,
+                            parse_mode=ParseMode.MARKDOWN_V2,
+                            reply_markup=InlineKeyboardMarkup(
+                                formatted.reply_markup['inline_keyboard']
+                            ),
+                            disable_web_page_preview=True,
+                        )
+                    else:
+                        await self.application.bot.send_message(
+                            chat_id=chat_id,
+                            text=format_job_message_legacy(job),
+                            parse_mode='HTML',
+                            disable_web_page_preview=True,
+                        )
+                    any_ok = True
+                except Exception as e2:
+                    logger.error(f"❌ Retry fail → {chat_id}: {e2}")
+            except TimedOut:
+                logger.error(f"❌ Timeout → {chat_id}")
+            except Exception as e:
+                logger.error(f"❌ Failed → {chat_id}: {e}")
+        return any_ok
 
 # ==================== MAIN LOOP ====================
 async def main():
@@ -3495,8 +3644,8 @@ async def main():
     configure_webshare_proxy()
 
     logger.info("=" * 60)
-    logger.info("🚀 Job Bot Starting (v6.3 — growth ops)")
-    logger.info(f"📡 Channel: {Config.CHANNEL_ID}")
+    logger.info("🚀 Job Bot Starting (v6.4 — multi-track)")
+    logger.info(f"📡 Main channel: {Config.CHANNEL_ID}")
     logger.info(f"⏱️ Check interval: {Config.CHECK_INTERVAL}s")
     logger.info(f"📊 Max posts per cycle: {Config.MAX_POSTS_PER_CYCLE}")
     logger.info(f"🤖 MarkdownV2: {Config.ENABLE_MARKDOWN_V2}")
@@ -3507,7 +3656,13 @@ async def main():
     logger.info(f"🗓️ Dedup retention days: {Config.DEDUP_RETENTION_DAYS}")
     logger.info(f"🔀 Source diversify: {Config.ENABLE_SOURCE_DIVERSIFY}")
     logger.info(f"💵 Global min salary USD: {Config.GLOBAL_MIN_SALARY_USD}")
-    logger.info(f"📂 Channel tracks: {Config.CHANNEL_TRACKS}")
+    logger.info(f"📂 Channel tracks filter: {Config.CHANNEL_TRACKS}")
+    logger.info(f"🛤️ Multi-track: {Config.ENABLE_MULTI_TRACK} mirror_main={Config.MULTI_TRACK_MIRROR_MAIN}")
+    if Config.ENABLE_MULTI_TRACK and GROWTH_UTILS_AVAILABLE:
+        logger.info(
+            "🛤️ Routes:\n"
+            + describe_channel_routes(Config.CHANNEL_ROUTES, Config.CHANNEL_ID, CATEGORY_NAMES_RU)
+        )
     logger.info(f"📬 Personal digest: {Config.ENABLE_PERSONAL_DIGEST}")
     logger.info(f"⚡ Realtime alerts: {Config.ENABLE_REALTIME_ALERTS}")
     logger.info(f"🏆 Ref premium threshold: {Config.REF_REWARD_THRESHOLD}")
@@ -3536,6 +3691,7 @@ async def main():
     application.add_handler(CommandHandler("digest", job_bot.cmd_digest))
     application.add_handler(CommandHandler("alerts", job_bot.cmd_alerts))
     application.add_handler(CommandHandler("stats_growth", job_bot.cmd_stats_growth))
+    application.add_handler(CommandHandler("tracks", job_bot.cmd_tracks))
     application.add_handler(CommandHandler("status", job_bot.cmd_status))
     application.add_handler(CommandHandler("last", job_bot.cmd_last))
     application.add_handler(CommandHandler("favorites", job_bot.cmd_favorites))

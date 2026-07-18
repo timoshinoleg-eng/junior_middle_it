@@ -222,6 +222,117 @@ def passes_channel_tracks(job: Dict, allowed: List[str]) -> bool:
     return cat in allowed_norm
 
 
+def parse_channel_routes(raw: str) -> List[Tuple[List[str], str]]:
+    """
+    Parse multi-track routing string.
+
+    Format (semicolon-separated rules):
+      development,qa,devops:@junior_dev;data:@junior_data;design,pm:@junior_design;*:@junior_all
+
+    Each rule: categories,comma-separated : channel_id
+    Special categories: * or all = catch-all / default for unmatched.
+    Returns list of (categories_lower, channel_id) in order.
+    """
+    routes: List[Tuple[List[str], str]] = []
+    if not raw or not str(raw).strip():
+        return routes
+    for part in str(raw).split(";"):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        # split only on last colon? channel can be @name or -100id
+        # use first colon after categories - categories don't have colon
+        cats_part, ch = part.rsplit(":", 1)
+        ch = ch.strip()
+        if not ch:
+            continue
+        if not (ch.startswith("@") or ch.startswith("-") or ch.lstrip("-").isdigit()):
+            # allow bare username → @username
+            if ch.replace("_", "").isalnum():
+                ch = f"@{ch}"
+            else:
+                continue
+        cats = [c.strip().lower() for c in cats_part.split(",") if c.strip()]
+        if cats:
+            routes.append((cats, ch))
+    return routes
+
+
+def resolve_channels_for_job(
+    job: Dict,
+    routes: List[Tuple[List[str], str]],
+    default_channel: str,
+    enabled: bool = True,
+    mirror_main: bool = False,
+) -> List[str]:
+    """
+    Resolve target chat_ids for a job.
+
+    - If multi-track disabled or no routes: [default_channel]
+    - Else: all specialty routes matching category + catch-all (*) routes
+    - Unmatched category → default_channel (or * route if defined)
+    - mirror_main: also append default_channel when specialty matched
+    """
+    default_channel = (default_channel or "").strip()
+    if not enabled or not routes:
+        return [default_channel] if default_channel else []
+
+    cat = str(job.get("category") or "other").lower()
+    specialty: List[str] = []
+    catchalls: List[str] = []
+
+    for cats, ch in routes:
+        is_star = any(c in ("*", "all", "default") for c in cats)
+        if is_star:
+            if ch not in catchalls:
+                catchalls.append(ch)
+            continue
+        if cat in cats and ch not in specialty:
+            specialty.append(ch)
+
+    channels: List[str] = []
+    if specialty:
+        channels.extend(specialty)
+        if mirror_main and default_channel and default_channel not in channels:
+            channels.append(default_channel)
+    else:
+        # unmatched → catch-all routes or default CHANNEL_ID
+        if catchalls:
+            channels.extend(catchalls)
+        elif default_channel:
+            channels.append(default_channel)
+
+    # de-dupe preserve order
+    seen = set()
+    out = []
+    for ch in channels:
+        if ch and ch not in seen:
+            seen.add(ch)
+            out.append(ch)
+    return out
+
+
+def describe_channel_routes(
+    routes: List[Tuple[List[str], str]],
+    default_channel: str,
+    category_names: Optional[Dict[str, str]] = None,
+) -> str:
+    """Human-readable routes for logs /stats."""
+    category_names = category_names or {}
+    lines = []
+    for cats, ch in routes:
+        labels = []
+        for c in cats:
+            if c in ("*", "all", "default"):
+                labels.append("*")
+            else:
+                labels.append(category_names.get(c, c))
+        lines.append(f"{', '.join(labels)} → {ch}")
+    if default_channel:
+        lines.append(f"fallback → {default_channel}")
+    return "\n".join(lines) if lines else f"single → {default_channel}"
+
+
 def apply_premium_to_settings(settings: Dict, premium: bool) -> Dict:
     """Soft ref reward: premium users see senior + larger digests (caller sets max)."""
     s = dict(settings or {})
