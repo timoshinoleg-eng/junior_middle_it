@@ -6,10 +6,12 @@ from growth_utils import (
     apply_premium_to_settings,
     build_referral_link,
     build_salary_magnet_report,
+    compute_publish_score,
     enrich_job_salary_fields,
     fuzzy_is_near_duplicate,
     job_fingerprint,
     job_matches_profile,
+    normalize_job_title_company,
     parse_channel_routes,
     parse_salary_to_usd_min,
     parse_start_payload,
@@ -168,6 +170,39 @@ class GrowthUtilsTests(unittest.TestCase):
             enabled=False,
         )
         self.assertEqual(ch2, ["@main"])
+
+    def test_normalize_title_company(self):
+        job = {
+            "title": "Proxify AB: Senior Fullstack Developer (React)",
+            "company": "WWR Full-Stack",
+        }
+        normalize_job_title_company(job)
+        self.assertEqual(job["company"], "Proxify AB")
+        self.assertIn("Fullstack", job["title"])
+        # non-generic company kept
+        job2 = {"title": "Acme: Role Title Here", "company": "RealCorp"}
+        normalize_job_title_company(job2)
+        self.assertEqual(job2["company"], "RealCorp")
+
+    def test_publish_score_junior_bias(self):
+        junior = {
+            "level": "Junior",
+            "title": "Junior Python Developer",
+            "url": "https://example.com/j",
+            "salary": "$50k-$70k",
+            "description": "x" * 300,
+            "location": "Remote",
+            "tags": ["python", "django"],
+        }
+        seniorish = {
+            "level": "Middle",
+            "title": "Senior Staff Engineer",
+            "url": "",
+            "salary": "Не указана",
+            "description": "short",
+            "location": "Office",
+        }
+        self.assertGreater(compute_publish_score(junior), compute_publish_score(seniorish))
 
 
 if __name__ == "__main__":

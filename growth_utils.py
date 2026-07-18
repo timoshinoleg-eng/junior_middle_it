@@ -35,6 +35,96 @@ def job_fingerprint(job: Dict) -> str:
     return f"{title}::{company}"
 
 
+# Generic/source-like company names that should yield to "Company: Title" parse
+_GENERIC_COMPANY_MARKERS = (
+    "wwr",
+    "rss:",
+    "rss ",
+    "remoteok",
+    "we work remotely",
+    "himalayas",
+    "4dayweek",
+    "the muse",
+    "working nomads",
+    "job board",
+    "unknown",
+)
+
+
+def normalize_job_title_company(job: Dict) -> Dict:
+    """
+    Split 'Company: Role Title' patterns (common on WWR RSS / HN).
+    Only rewrites when company looks generic/source-like or matches left side.
+    """
+    title = str(job.get("title") or "").strip()
+    company = str(job.get("company") or "").strip()
+    if not title or ":" not in title:
+        return job
+    left, right = title.split(":", 1)
+    left, right = left.strip(), right.strip()
+    if len(left) < 2 or len(left) > 80 or len(right) < 8:
+        return job
+    # avoid time-like "10:00 Remote Engineer"
+    if left.isdigit() or re.fullmatch(r"\d{1,2}", left):
+        return job
+    company_l = company.lower()
+    generic = (
+        not company
+        or any(m in company_l for m in _GENERIC_COMPANY_MARKERS)
+        or company_l == left.lower()
+        or company_l.startswith("rss:")
+    )
+    if not generic:
+        return job
+    job["company"] = left
+    job["title"] = right
+    return job
+
+
+def compute_publish_score(job: Dict, salary_display: str = "") -> int:
+    """
+    Numeric quality score for channel selection (higher = better).
+    salary_display: pre-extracted display string; empty uses job['salary'].
+    """
+    score = 0
+    level = str(job.get("level") or "")
+    if level == "Junior":
+        score += 4
+    elif level == "Middle":
+        score += 3
+
+    title = str(job.get("title") or "").lower()
+    if any(x in title for x in ("junior", "jr.", "jr ", "entry", "intern", "graduate", "trainee", "associate")):
+        score += 2
+    if any(x in title for x in ("senior", "staff", "principal", "lead ", "head of", "director")):
+        score -= 2
+
+    sal = salary_display or str(job.get("salary") or "")
+    if sal and sal not in {"Не указана", "Not specified", "Договорная", ""}:
+        score += 3
+    if job.get("salary_min_usd"):
+        score += 1
+
+    if str(job.get("url") or "").startswith("http"):
+        score += 2
+
+    desc = str(job.get("description") or "")
+    if len(desc) >= 200:
+        score += 1
+    if len(desc) >= 500:
+        score += 1
+
+    tags = job.get("tags") or []
+    if isinstance(tags, list) and tags:
+        score += min(2, max(1, len(tags) // 3))
+
+    loc = str(job.get("location") or "").lower()
+    if "remote" in loc or "удал" in loc or "flexible" in loc:
+        score += 1
+
+    return score
+
+
 def fuzzy_is_near_duplicate(
     job: Dict,
     recent_fingerprints: List[str],

@@ -76,11 +76,13 @@ try:
         apply_premium_to_settings,
         build_referral_link,
         build_salary_magnet_report,
+        compute_publish_score,
         describe_channel_routes,
         enrich_job_salary_fields,
         fuzzy_is_near_duplicate,
         job_fingerprint,
         job_matches_profile,
+        normalize_job_title_company,
         parse_channel_routes,
         parse_start_payload,
         passes_channel_tracks,
@@ -153,6 +155,8 @@ class Config:
     ).split(',')
     ENABLE_EXTRA_SOURCES = os.getenv('ENABLE_EXTRA_SOURCES', 'true').lower() == 'true'
     ENABLE_RSS_SOURCES = os.getenv('ENABLE_RSS_SOURCES', 'true').lower() == 'true'
+    # v6.6: skip source after N consecutive hard failures (0 = never skip)
+    SOURCE_FAIL_SKIP = env_int('SOURCE_FAIL_SKIP', 3)
     TELEGRAM_API_ID = os.getenv('TELEGRAM_API_ID')
     TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
     TELEGRAM_SESSION_NAME = os.getenv('TELEGRAM_SESSION_NAME')
@@ -462,11 +466,16 @@ SOURCE_PUBLICATION_PRIORITY = {
     "HN Who is Hiring": 8,
     "SuperJob": 9,
     "We Work Remotely": 10,
+    "RSS boards": 10,
     "Jobicy": 11,
     "Himalayas": 12,
     "Arbeitnow": 13,
     "Remotive": 14,
     "RemoteOK": 15,
+    "RemoteOK Dev": 15,
+    "4dayweek": 12,
+    "The Muse": 14,
+    "Working Nomads": 13,
 }
 
 REMOTE_KEYWORDS = ["remote", "удаленно", "удалённо", "work from home", "дистанционно", "wfh"]
@@ -1333,13 +1342,20 @@ def parse_job_datetime(job: Dict) -> Optional[datetime]:
 
 
 def job_quality_score(job: Dict) -> tuple:
-    """Rank jobs inside each source by recency and useful metadata."""
+    """Rank jobs inside each source: quality score first, then recency."""
     published = parse_job_datetime(job)
     timestamp = published.timestamp() if published else 0
-    salary_bonus = 1 if extract_salary(job) != 'Не указана' else 0
-    url_bonus = 1 if str(job.get('url', '')).startswith('http') else 0
-    level_bonus = 1 if job.get('level') in {'Junior', 'Middle'} else 0
-    return (timestamp, salary_bonus, url_bonus, level_bonus)
+    if GROWTH_UTILS_AVAILABLE:
+        quality = compute_publish_score(job, salary_display=extract_salary(job))
+    else:
+        quality = 0
+        if extract_salary(job) != 'Не указана':
+            quality += 3
+        if str(job.get('url', '')).startswith('http'):
+            quality += 2
+        if job.get('level') in {'Junior', 'Middle'}:
+            quality += 3
+    return (quality, timestamp)
 
 
 def diversify_jobs_by_source(jobs: List[Dict], limit: int) -> List[Dict]:
@@ -1371,8 +1387,23 @@ def diversify_jobs_by_source(jobs: List[Dict], limit: int) -> List[Dict]:
     return selected
 
 
+def should_skip_source(source_name: str) -> bool:
+    """True if source is in auto-skip fail-streak cooldown (v6.6)."""
+    if not Config.SOURCE_FAIL_SKIP:
+        return False
+    if not EXTRA_SOURCES_AVAILABLE or SOURCE_HEALTH is None:
+        return False
+    return SOURCE_HEALTH.should_skip(source_name, Config.SOURCE_FAIL_SKIP)
+
+
 def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) -> List[Dict]:
     """Retry wrapper with exponential backoff + source health recording."""
+    if should_skip_source(source_name):
+        streak = SOURCE_HEALTH.fail_streak(source_name) if SOURCE_HEALTH else 0
+        logger.warning(
+            f"⏭️ Skip {source_name}: fail streak {streak}≥{Config.SOURCE_FAIL_SKIP}"
+        )
+        return []
     last_err = ""
     t0 = time.monotonic()
     for attempt in range(max_retries):
@@ -2767,6 +2798,8 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
 
         classified_jobs = []
         for job in all_jobs:
+            if GROWTH_UTILS_AVAILABLE:
+                normalize_job_title_company(job)
             if not is_suitable_job(job):
                 continue
             level = classify_job_level(job)
@@ -3164,7 +3197,8 @@ class JobBot:
             + "\n\n"
         )
         if EXTRA_SOURCES_AVAILABLE and SOURCE_HEALTH is not None:
-            body = SOURCE_HEALTH.format_report()
+            body = SOURCE_HEALTH.format_report(skip_threshold=Config.SOURCE_FAIL_SKIP)
+            body += f"\nSOURCE_FAIL_SKIP={Config.SOURCE_FAIL_SKIP} (0=off)"
         else:
             body = "Health registry offline (job_sources_extra missing)."
         text = (header + body)[:4000]
@@ -3727,6 +3761,7 @@ async def main():
     logger.info(f"🔍 Fuzzy dedup: {RAPIDFUZZ_AVAILABLE} (thr={Config.FUZZY_DEDUP_THRESHOLD})")
     logger.info(f"🗓️ Dedup retention days: {Config.DEDUP_RETENTION_DAYS}")
     logger.info(f"🔀 Source diversify: {Config.ENABLE_SOURCE_DIVERSIFY}")
+    logger.info(f"⏭️ Source fail-skip: {Config.SOURCE_FAIL_SKIP} (0=off)")
     logger.info(f"💵 Global min salary USD: {Config.GLOBAL_MIN_SALARY_USD}")
     logger.info(f"📂 Channel tracks filter: {Config.CHANNEL_TRACKS}")
     logger.info(f"🛤️ Multi-track: {Config.ENABLE_MULTI_TRACK} mirror_main={Config.MULTI_TRACK_MIRROR_MAIN}")
@@ -3894,6 +3929,8 @@ async def main():
             # Filter, classify and process
             classified_jobs = []
             for job in all_jobs:
+                if GROWTH_UTILS_AVAILABLE:
+                    normalize_job_title_company(job)
                 if not is_suitable_job(job):
                     continue
                 

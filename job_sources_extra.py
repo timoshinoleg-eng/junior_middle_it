@@ -491,44 +491,73 @@ def fetch_rss_jobs(feeds: Optional[List[Tuple[str, str, bool]]] = None, limit_pe
 # Source health registry
 # ---------------------------------------------------------------------------
 class SourceHealthRegistry:
-    """In-memory last-cycle health for admin /sources."""
+    """In-memory last-cycle health for admin /sources + fail-streak auto-skip."""
 
     def __init__(self):
         self._rows: Dict[str, Dict] = {}
+        self._fail_streak: Dict[str, int] = {}
 
     def record(self, name: str, fetched: int, error: str = "", elapsed_ms: int = 0) -> None:
+        err = (error or "").strip()
+        if err:
+            self._fail_streak[name] = self._fail_streak.get(name, 0) + 1
+        else:
+            self._fail_streak[name] = 0
         self._rows[name] = {
             "name": name,
             "fetched": int(fetched),
-            "error": error or "",
+            "error": err,
             "elapsed_ms": int(elapsed_ms),
             "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            "ok": not error and fetched >= 0,
+            "ok": not err,
+            "fail_streak": self._fail_streak.get(name, 0),
         }
+
+    def fail_streak(self, name: str) -> int:
+        return int(self._fail_streak.get(name, 0))
+
+    def should_skip(self, name: str, max_fails: int = 3) -> bool:
+        """Skip source after N consecutive hard failures (max_fails<=0 disables)."""
+        if not max_fails or max_fails <= 0:
+            return False
+        return self.fail_streak(name) >= int(max_fails)
 
     def snapshot(self) -> List[Dict]:
         return sorted(self._rows.values(), key=lambda r: r["name"].lower())
 
-    def format_report(self) -> str:
+    def format_report(self, skip_threshold: int = 0) -> str:
         rows = self.snapshot()
         if not rows:
             return "📡 Source health: пока нет данных (нужен полный crawl cycle)."
         lines = ["📡 Source health (last cycle)", ""]
         total = 0
         fails = 0
+        skipped = 0
         for r in rows:
             total += r["fetched"]
-            mark = "✅" if r["fetched"] > 0 and not r["error"] else ("⚠️" if not r["error"] else "❌")
+            streak = int(r.get("fail_streak") or self.fail_streak(r["name"]))
+            is_skip = bool(skip_threshold and streak >= skip_threshold)
+            if is_skip:
+                skipped += 1
+            mark = (
+                "⏭️" if is_skip
+                else ("✅" if r["fetched"] > 0 and not r["error"] else ("⚠️" if not r["error"] else "❌"))
+            )
             if r["error"]:
                 fails += 1
             line = f"{mark} {r['name']}: {r['fetched']}"
             if r["elapsed_ms"]:
                 line += f" ({r['elapsed_ms']}ms)"
+            if streak:
+                line += f" fail×{streak}"
             if r["error"]:
                 line += f" — {r['error'][:80]}"
             lines.append(line)
         lines.append("")
-        lines.append(f"Σ fetched={total} · sources={len(rows)} · errors={fails}")
+        lines.append(
+            f"Σ fetched={total} · sources={len(rows)} · errors={fails}"
+            + (f" · auto-skip≥{skip_threshold}: {skipped}" if skip_threshold else "")
+        )
         return "\n".join(lines)
 
 

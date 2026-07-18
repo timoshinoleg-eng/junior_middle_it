@@ -25,6 +25,19 @@ class SourceHealthTests(unittest.TestCase):
         report = SOURCE_HEALTH.format_report()
         self.assertIn("UnitTestSource", report)
 
+    def test_fail_streak_skip(self):
+        name = "UnitFailSource"
+        SOURCE_HEALTH.record(name, 0, error="boom")
+        SOURCE_HEALTH.record(name, 0, error="boom")
+        SOURCE_HEALTH.record(name, 0, error="boom")
+        self.assertEqual(SOURCE_HEALTH.fail_streak(name), 3)
+        self.assertTrue(SOURCE_HEALTH.should_skip(name, max_fails=3))
+        self.assertFalse(SOURCE_HEALTH.should_skip(name, max_fails=0))
+        # success resets
+        SOURCE_HEALTH.record(name, 2, error="")
+        self.assertEqual(SOURCE_HEALTH.fail_streak(name), 0)
+        self.assertFalse(SOURCE_HEALTH.should_skip(name, max_fails=3))
+
     def test_run_fetcher_records(self):
         def _ok():
             return [{"title": "x"}]
