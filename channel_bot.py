@@ -94,6 +94,18 @@ except ImportError:
     RAPIDFUZZ_AVAILABLE = False
     logging.warning("⚠️ growth_utils не найден, fuzzy/referral helpers отключены")
 
+try:
+    from job_sources_extra import (
+        SOURCE_HEALTH,
+        get_extra_fetchers,
+        run_fetcher,
+    )
+    EXTRA_SOURCES_AVAILABLE = True
+except ImportError:
+    EXTRA_SOURCES_AVAILABLE = False
+    SOURCE_HEALTH = None
+    logging.warning("⚠️ job_sources_extra не найден")
+
 # ==================== CONFIGURATION ====================
 class Config:
     """Application configuration with validation"""
@@ -122,15 +134,25 @@ class Config:
     DEDUP_MODE = os.getenv('DEDUP_MODE', 'sqlite')
     RECENT_TELEGRAM_MESSAGES = env_int('RECENT_TELEGRAM_MESSAGES', 800)
     TELEGRAM_HOURS_BACK = env_int('TELEGRAM_HOURS_BACK', 48)
-    GREENHOUSE_BOARDS = os.getenv('GREENHOUSE_BOARDS', 'gitlab,canonical,elastic').split(',')
+    # v6.5 expanded remote-first ATS boards (override via env)
+    GREENHOUSE_BOARDS = os.getenv(
+        'GREENHOUSE_BOARDS',
+        'gitlab,canonical,elastic,cloudflare,datadog,hashicorp,notion,figma,'
+        'vercel,posthog,sentry,stripe,discord,shopify,airbnb,coinbase,plaid,'
+        'duolingo,reddit,twilio,dropbox,asana,airtable'
+    ).split(',')
     LEVER_COMPANIES = os.getenv(
         'LEVER_COMPANIES',
-        'Instrumentl,2brains,360learning'
+        'Instrumentl,2brains,360learning,netflix,spotify,palantir,box,nubank,'
+        'wealthfront,affirm,rippling'
     ).split(',')
     ASHBY_COMPANIES = os.getenv(
         'ASHBY_COMPANIES',
-        'cursor,linear,supabase,openai'
+        'cursor,linear,supabase,openai,anthropic,retool,ramp,mercury,clerk,'
+        'resend,cal,planetscale,prisma,railway'
     ).split(',')
+    ENABLE_EXTRA_SOURCES = os.getenv('ENABLE_EXTRA_SOURCES', 'true').lower() == 'true'
+    ENABLE_RSS_SOURCES = os.getenv('ENABLE_RSS_SOURCES', 'true').lower() == 'true'
     TELEGRAM_API_ID = os.getenv('TELEGRAM_API_ID')
     TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
     TELEGRAM_SESSION_NAME = os.getenv('TELEGRAM_SESSION_NAME')
@@ -451,6 +473,7 @@ REMOTE_KEYWORDS = ["remote", "удаленно", "удалённо", "work from 
 REMOTE_ONLY_SOURCES = {
     "Remotive",
     "RemoteOK",
+    "RemoteOK Dev",
     "Himalayas",
     "We Work Remotely",
     "Jobicy",
@@ -458,6 +481,9 @@ REMOTE_ONLY_SOURCES = {
     "HN Who is Hiring",
     "CryptocurrencyJobs",
     "Wellfound",
+    "4dayweek",
+    "The Muse",
+    "Working Nomads",
 }
 
 TECH_STACK = [
@@ -1346,24 +1372,33 @@ def diversify_jobs_by_source(jobs: List[Dict], limit: int) -> List[Dict]:
 
 
 def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) -> List[Dict]:
-    """Retry wrapper with exponential backoff"""
+    """Retry wrapper with exponential backoff + source health recording."""
+    last_err = ""
+    t0 = time.monotonic()
     for attempt in range(max_retries):
         try:
             result = fetch_func()
             time.sleep(DELAYS['between_apis'] + random.uniform(0, DELAYS['random_jitter']))
+            elapsed = int((time.monotonic() - t0) * 1000)
+            if EXTRA_SOURCES_AVAILABLE and SOURCE_HEALTH is not None:
+                SOURCE_HEALTH.record(source_name, len(result or []), elapsed_ms=elapsed)
             return result
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
+            last_err = f"HTTP {getattr(e.response, 'status_code', '?')}"
+            if e.response is not None and e.response.status_code == 429:
                 wait = int(e.response.headers.get('Retry-After', 60))
                 logger.warning(f"⏳ {source_name} rate limited, waiting {wait}s (attempt {attempt+1}/{max_retries})")
                 time.sleep(wait)
             else:
-                logger.error(f"❌ {source_name} HTTP error {e.response.status_code}")
+                logger.error(f"❌ {source_name} HTTP error {getattr(e.response, 'status_code', e)}")
                 break
         except Exception as e:
+            last_err = str(e)
             logger.error(f"❌ {source_name} error (attempt {attempt+1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(DELAYS['after_error'] * (attempt + 1))
+    if EXTRA_SOURCES_AVAILABLE and SOURCE_HEALTH is not None:
+        SOURCE_HEALTH.record(source_name, 0, error=last_err or "failed", elapsed_ms=int((time.monotonic() - t0) * 1000))
     return []
 
 # ==================== JOB PROCESSING ====================
@@ -1481,12 +1516,18 @@ def is_suitable_job(job: Dict) -> bool:
     """Check if job matches criteria (remote + IT role)"""
     title = str(job.get('title', '')).lower()
     text = f"{job.get('title', '')} {job.get('description', '')} {job.get('location', '')}".lower()
-    source = job.get('source', '').split(':', 1)[0]
+    source_full = str(job.get('source', '') or '')
+    source = source_full.split(':', 1)[0]
     if is_resume_or_candidate_profile_text(text):
         return False
     if source == 'TG' and not str(job.get('url', '')).startswith('http'):
         return False
-    has_remote = source in REMOTE_ONLY_SOURCES or any(kw in text for kw in REMOTE_KEYWORDS)
+    has_remote = (
+        source_full in REMOTE_ONLY_SOURCES
+        or source in REMOTE_ONLY_SOURCES
+        or source_full.startswith('RSS:')
+        or any(kw in text for kw in REMOTE_KEYWORDS)
+    )
     if any(has_text_signal(title, signal) for signal in NON_IT_TITLE_EXCLUDES):
         return False
     has_it_role = any(has_text_signal(title, role) for role in TITLE_IT_SIGNALS)
@@ -2444,6 +2485,12 @@ def get_api_fetch_functions():
         (fetch_hackernews, "HN Who is Hiring"),
         (fetch_headhunter, "HeadHunter"),
     ]
+    # v6.5 free public extras (4dayweek, Muse, RemoteOK Dev, RSS)
+    if Config.ENABLE_EXTRA_SOURCES and EXTRA_SOURCES_AVAILABLE:
+        for fn, name in get_extra_fetchers():
+            if name == "RSS boards" and not Config.ENABLE_RSS_SOURCES:
+                continue
+            fetchers.append((fn, name))
     if Config.SUPERJOB_API_KEY:
         fetchers.append((fetch_superjob, "SuperJob"))
     if Config.ADZUNA_APP_ID and Config.ADZUNA_APP_KEY:
@@ -2923,9 +2970,9 @@ class JobBot:
             "*Команды:*\n"
             "/setup — онбординг профиля\n"
             "/digest on|off|now · /alerts on|off\n"
-            "/tracks — куда уходит какая категория\n"
+            "/tracks — multi-track маршруты\n"
             "/profile · /ref · /favorites · /categories\n"
-            "/stats_growth · /last · /status — admin"
+            "/sources · /stats_growth · /last · /status — admin"
             f"{setup_hint}"
             f"{ref_line}"
         )
@@ -3104,6 +3151,25 @@ class JobBot:
         else:
             text = f"Main only: {Config.CHANNEL_ID}"
         await update.message.reply_text(text)
+
+    async def cmd_sources(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin: last crawl source health + configured fetcher list."""
+        if not await self.check_admin(update):
+            return
+        names = [n for _, n in get_api_fetch_functions()]
+        header = (
+            f"Configured fetchers ({len(names)}):\n"
+            + ", ".join(names[:40])
+            + ("…" if len(names) > 40 else "")
+            + "\n\n"
+        )
+        if EXTRA_SOURCES_AVAILABLE and SOURCE_HEALTH is not None:
+            body = SOURCE_HEALTH.format_report()
+        else:
+            body = "Health registry offline (job_sources_extra missing)."
+        text = (header + body)[:4000]
+        await update.message.reply_text(text)
+        self.db.log_event(update.effective_user.id, 'sources_view', {'count': len(names)})
 
     def _effective_profile(self, user_id: int) -> Dict:
         """Profile + premium soft rewards applied."""
@@ -3650,7 +3716,7 @@ async def main():
     configure_webshare_proxy()
 
     logger.info("=" * 60)
-    logger.info("🚀 Job Bot Starting (v6.4 — multi-track)")
+    logger.info("🚀 Job Bot Starting (v6.5 — sources)")
     logger.info(f"📡 Main channel: {Config.CHANNEL_ID}")
     logger.info(f"⏱️ Check interval: {Config.CHECK_INTERVAL}s")
     logger.info(f"📊 Max posts per cycle: {Config.MAX_POSTS_PER_CYCLE}")
@@ -3664,6 +3730,13 @@ async def main():
     logger.info(f"💵 Global min salary USD: {Config.GLOBAL_MIN_SALARY_USD}")
     logger.info(f"📂 Channel tracks filter: {Config.CHANNEL_TRACKS}")
     logger.info(f"🛤️ Multi-track: {Config.ENABLE_MULTI_TRACK} mirror_main={Config.MULTI_TRACK_MIRROR_MAIN}")
+    logger.info(
+        f"📥 Extra sources: {Config.ENABLE_EXTRA_SOURCES} "
+        f"RSS={Config.ENABLE_RSS_SOURCES} module={EXTRA_SOURCES_AVAILABLE}"
+    )
+    logger.info(f"🏢 ATS boards: GH={len(non_empty_csv(Config.GREENHOUSE_BOARDS))} "
+                f"Lever={len(non_empty_csv(Config.LEVER_COMPANIES))} "
+                f"Ashby={len(non_empty_csv(Config.ASHBY_COMPANIES))}")
     if Config.ENABLE_MULTI_TRACK and GROWTH_UTILS_AVAILABLE:
         logger.info(
             "🛤️ Routes:\n"
@@ -3698,6 +3771,7 @@ async def main():
     application.add_handler(CommandHandler("alerts", job_bot.cmd_alerts))
     application.add_handler(CommandHandler("stats_growth", job_bot.cmd_stats_growth))
     application.add_handler(CommandHandler("tracks", job_bot.cmd_tracks))
+    application.add_handler(CommandHandler("sources", job_bot.cmd_sources))
     application.add_handler(CommandHandler("status", job_bot.cmd_status))
     application.add_handler(CommandHandler("last", job_bot.cmd_last))
     application.add_handler(CommandHandler("favorites", job_bot.cmd_favorites))
