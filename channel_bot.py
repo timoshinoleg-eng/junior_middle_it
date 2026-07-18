@@ -73,7 +73,9 @@ except ImportError:
 try:
     from growth_utils import (
         RAPIDFUZZ_AVAILABLE,
+        apply_premium_to_settings,
         build_referral_link,
+        build_salary_magnet_report,
         enrich_job_salary_fields,
         fuzzy_is_near_duplicate,
         job_fingerprint,
@@ -153,6 +155,16 @@ class Config:
     ENABLE_PERSONAL_DIGEST = os.getenv('ENABLE_PERSONAL_DIGEST', 'true').lower() == 'true'
     PERSONAL_DIGEST_MAX = env_int('PERSONAL_DIGEST_MAX', 5)
     PERSONAL_DIGEST_LOOKBACK_HOURS = env_int('PERSONAL_DIGEST_LOOKBACK_HOURS', 36)
+    # v6.3 growth ops
+    DEDUP_RETENTION_DAYS = env_int('DEDUP_RETENTION_DAYS', 28)
+    ENABLE_REALTIME_ALERTS = os.getenv('ENABLE_REALTIME_ALERTS', 'true').lower() == 'true'
+    REALTIME_ALERTS_MAX = env_int('REALTIME_ALERTS_MAX', 2)
+    REF_REWARD_THRESHOLD = env_int('REF_REWARD_THRESHOLD', 3)
+    REF_REWARD_DIGEST_BONUS = env_int('REF_REWARD_DIGEST_BONUS', 3)
+    ENABLE_WEEKLY_SALARY_REPORT = os.getenv('ENABLE_WEEKLY_SALARY_REPORT', 'true').lower() == 'true'
+    SALARY_REPORT_WEEKDAY = env_int('SALARY_REPORT_WEEKDAY', 0)  # 0=Mon … 6=Sun (APScheduler)
+    SALARY_REPORT_HOUR_UTC = env_int('SALARY_REPORT_HOUR_UTC', 10)
+    GROWTH_STATS_DAYS = env_int('GROWTH_STATS_DAYS', 7)
     
     @classmethod
     def validate(cls) -> bool:
@@ -542,6 +554,8 @@ class DatabaseConnection:
             ('skills', "TEXT DEFAULT ''"),
             ('digest_enabled', 'INTEGER DEFAULT 0'),
             ('onboarding_done', 'INTEGER DEFAULT 0'),
+            ('alerts_enabled', 'INTEGER DEFAULT 0'),
+            ('premium_unlocked', 'INTEGER DEFAULT 0'),
         ):
             try:
                 c.execute(f'SELECT {col} FROM user_settings LIMIT 1')
@@ -631,46 +645,54 @@ class DatabaseConnection:
             'skills': '',
             'digest_enabled': False,
             'onboarding_done': False,
+            'alerts_enabled': False,
+            'premium_unlocked': False,
         }
 
     def get_user_settings(self, user_id: int) -> Dict:
         """Get full user profile/settings (safe defaults)."""
+        defaults = self._default_settings()
         try:
+            result = self.fetchone(
+                'SELECT enabled_categories, hide_senior, min_salary_filter, '
+                'skills, digest_enabled, onboarding_done, alerts_enabled, premium_unlocked '
+                'FROM user_settings WHERE user_id = ?',
+                (user_id,)
+            )
+        except sqlite3.OperationalError:
             result = self.fetchone(
                 'SELECT enabled_categories, hide_senior, min_salary_filter, '
                 'skills, digest_enabled, onboarding_done '
                 'FROM user_settings WHERE user_id = ?',
                 (user_id,)
             )
-        except sqlite3.OperationalError:
-            result = self.fetchone(
-                'SELECT enabled_categories, hide_senior, min_salary_filter '
-                'FROM user_settings WHERE user_id = ?',
-                (user_id,)
-            )
-            if result:
-                return {
-                    'enabled_categories': (result[0] or '').split(',') if result[0] else list(CATEGORY_NAMES_RU.keys()),
-                    'hide_senior': bool(result[1]),
-                    'min_salary_filter': int(result[2] or 0),
-                    'skills': '',
-                    'digest_enabled': False,
-                    'onboarding_done': False,
-                }
-            return self._default_settings()
-
-        if result:
+            if not result:
+                return defaults
             cats = (result[0] or '').split(',') if result[0] else list(CATEGORY_NAMES_RU.keys())
-            cats = [c for c in cats if c]
             return {
-                'enabled_categories': cats or list(CATEGORY_NAMES_RU.keys()),
+                **defaults,
+                'enabled_categories': [c for c in cats if c] or list(CATEGORY_NAMES_RU.keys()),
                 'hide_senior': bool(result[1]) if result[1] is not None else True,
                 'min_salary_filter': int(result[2] or 0),
-                'skills': result[3] or '',
-                'digest_enabled': bool(result[4]),
-                'onboarding_done': bool(result[5]),
+                'skills': (result[3] if len(result) > 3 else '') or '',
+                'digest_enabled': bool(result[4]) if len(result) > 4 else False,
+                'onboarding_done': bool(result[5]) if len(result) > 5 else False,
             }
-        return self._default_settings()
+
+        if not result:
+            return defaults
+        cats = (result[0] or '').split(',') if result[0] else list(CATEGORY_NAMES_RU.keys())
+        cats = [c for c in cats if c]
+        return {
+            'enabled_categories': cats or list(CATEGORY_NAMES_RU.keys()),
+            'hide_senior': bool(result[1]) if result[1] is not None else True,
+            'min_salary_filter': int(result[2] or 0),
+            'skills': result[3] or '',
+            'digest_enabled': bool(result[4]),
+            'onboarding_done': bool(result[5]),
+            'alerts_enabled': bool(result[6]) if len(result) > 6 else False,
+            'premium_unlocked': bool(result[7]) if len(result) > 7 else False,
+        }
 
     def save_user_settings(self, user_id: int, settings: Dict) -> bool:
         """Upsert full profile without wiping unrelated fields."""
@@ -686,8 +708,9 @@ class DatabaseConnection:
                 """
                 INSERT INTO user_settings (
                     user_id, enabled_categories, hide_senior, min_salary_filter,
-                    skills, digest_enabled, onboarding_done, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    skills, digest_enabled, onboarding_done, alerts_enabled,
+                    premium_unlocked, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(user_id) DO UPDATE SET
                     enabled_categories=excluded.enabled_categories,
                     hide_senior=excluded.hide_senior,
@@ -695,6 +718,8 @@ class DatabaseConnection:
                     skills=excluded.skills,
                     digest_enabled=excluded.digest_enabled,
                     onboarding_done=excluded.onboarding_done,
+                    alerts_enabled=excluded.alerts_enabled,
+                    premium_unlocked=excluded.premium_unlocked,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (
@@ -705,6 +730,8 @@ class DatabaseConnection:
                     str(cur.get('skills') or ''),
                     1 if cur.get('digest_enabled') else 0,
                     1 if cur.get('onboarding_done') else 0,
+                    1 if cur.get('alerts_enabled') else 0,
+                    1 if cur.get('premium_unlocked') else 0,
                 ),
             )
             return True
@@ -751,6 +778,103 @@ class DatabaseConnection:
             'SELECT user_id FROM user_settings WHERE digest_enabled = 1'
         )
         return [int(r[0]) for r in rows if r and r[0]]
+
+    def list_alert_subscribers(self) -> List[int]:
+        try:
+            rows = self.fetchall(
+                'SELECT user_id FROM user_settings WHERE alerts_enabled = 1'
+            )
+        except sqlite3.OperationalError:
+            return []
+        return [int(r[0]) for r in rows if r and r[0]]
+
+    def growth_stats(self, days: int = 7) -> Dict:
+        """Aggregate events/referrals for admin /stats_growth."""
+        cutoff = datetime.now() - timedelta(days=days)
+        def _count(name: str) -> int:
+            row = self.fetchone(
+                'SELECT COUNT(*) FROM events WHERE name = ? AND ts >= ?',
+                (name, cutoff),
+            )
+            return int(row[0]) if row else 0
+
+        starts = _count('start')
+        saves = _count('save_job')
+        refs_attr = _count('referral_attributed')
+        digests = _count('personal_digest_sent')
+        digests_ch = _count('daily_digest_posted')
+        alerts = _count('realtime_alert_sent')
+        setup = _count('setup_done')
+        invites = _count('ref_view')
+
+        top_refs = self.fetchall(
+            'SELECT referrer_id, COUNT(*) AS c FROM referrals '
+            'WHERE created_at >= ? GROUP BY referrer_id ORDER BY c DESC LIMIT 10',
+            (cutoff,),
+        )
+        events_by_day = self.fetchall(
+            "SELECT date(ts) AS d, COUNT(*) FROM events "
+            "WHERE ts >= ? GROUP BY date(ts) ORDER BY d DESC LIMIT 14",
+            (cutoff,),
+        )
+        total_users = self.fetchone('SELECT COUNT(*) FROM user_settings')
+        digest_on = self.fetchone(
+            'SELECT COUNT(*) FROM user_settings WHERE digest_enabled = 1'
+        )
+        alerts_on = self.fetchone(
+            'SELECT COUNT(*) FROM user_settings WHERE alerts_enabled = 1'
+        )
+        premium = self.fetchone(
+            'SELECT COUNT(*) FROM user_settings WHERE premium_unlocked = 1'
+        )
+        return {
+            'days': days,
+            'starts': starts,
+            'saves': saves,
+            'referrals': refs_attr,
+            'personal_digests': digests,
+            'channel_digests': digests_ch,
+            'realtime_alerts': alerts,
+            'setup_done': setup,
+            'ref_views': invites,
+            'top_referrers': [(int(r[0]), int(r[1])) for r in top_refs],
+            'events_by_day': [(str(r[0]), int(r[1])) for r in events_by_day],
+            'users_total': int(total_users[0]) if total_users else 0,
+            'digest_subscribers': int(digest_on[0]) if digest_on else 0,
+            'alert_subscribers': int(alerts_on[0]) if alerts_on else 0,
+            'premium_users': int(premium[0]) if premium else 0,
+        }
+
+    def jobs_with_salary_for_report(self, days: int = 14, limit: int = 500) -> List[Dict]:
+        """Recent jobs enriched with salary_min_usd for weekly magnet."""
+        import json as _json
+        cutoff = datetime.now() - timedelta(days=days)
+        rows = self.fetchall(
+            'SELECT j.hash, j.title, j.company, j.level, j.category, j.url, p.payload '
+            'FROM posted_jobs j LEFT JOIN job_payloads p ON p.hash = j.hash '
+            'WHERE j.posted_at >= ? ORDER BY j.posted_at DESC LIMIT ?',
+            (cutoff, limit),
+        )
+        out = []
+        for row in rows:
+            job = {
+                'hash': row[0],
+                'title': row[1],
+                'company': row[2],
+                'level': row[3] or 'Junior',
+                'category': row[4] or 'other',
+                'url': row[5] or '',
+            }
+            if row[6]:
+                try:
+                    job.update(_json.loads(row[6]))
+                except Exception:
+                    pass
+            if GROWTH_UTILS_AVAILABLE:
+                enrich_job_salary_fields(job)
+            if job.get('salary_min_usd'):
+                out.append(job)
+        return out
 
     def recent_jobs_for_digest(self, hours: int = 36, limit: int = 80) -> List[Dict]:
         """Load recent posts joined with payload when available."""
@@ -817,6 +941,22 @@ class DatabaseConnection:
             logger.error(f"referral register failed: {e}")
             return False
 
+    def maybe_unlock_premium(self, user_id: int) -> bool:
+        """Soft reward: N successful invites → premium_unlocked (senior + bigger digests)."""
+        threshold = getattr(Config, 'REF_REWARD_THRESHOLD', 3) or 3
+        n = self.count_referrals(user_id)
+        if n < threshold:
+            return False
+        settings = self.get_user_settings(user_id)
+        if settings.get('premium_unlocked'):
+            return False
+        self.save_user_settings(user_id, {
+            'premium_unlocked': True,
+            'hide_senior': False,
+        })
+        self.log_event(user_id, 'premium_unlocked', {'referrals': n, 'threshold': threshold})
+        return True
+
     def count_referrals(self, referrer_id: int) -> int:
         row = self.fetchone(
             'SELECT COUNT(*) FROM referrals WHERE referrer_id = ?',
@@ -870,8 +1010,9 @@ def extract_urls_from_text(text: str) -> List[str]:
 
 def is_duplicate_job(job: Dict, db: DatabaseConnection, recent_fps: Optional[List[str]] = None) -> bool:
     """Exact URL-hash + fuzzy title/company dedup against recent posts."""
-    # Cleanup old records (>7 days)
-    cleanup_threshold = datetime.now() - timedelta(days=7)
+    # Cleanup old records (default 28 days — fewer reposts than 7d)
+    retention = getattr(Config, 'DEDUP_RETENTION_DAYS', 28) or 28
+    cleanup_threshold = datetime.now() - timedelta(days=retention)
     db.execute('DELETE FROM posted_jobs WHERE posted_at < ?', (cleanup_threshold,))
     
     job_hash = generate_job_hash(job)
@@ -2616,9 +2757,26 @@ class JobBot:
             if kind == 'ref' and referrer_id and user_id:
                 if self.db.register_referral(user_id, referrer_id):
                     logger.info(f"🎁 Referral: {user_id} <- {referrer_id}")
+                    # Soft reward for referrer
+                    if self.db.maybe_unlock_premium(referrer_id):
+                        try:
+                            await context.bot.send_message(
+                                chat_id=referrer_id,
+                                text=(
+                                    f"🏆 Premium разблокирован: {Config.REF_REWARD_THRESHOLD}+ "
+                                    f"приглашённых!\n"
+                                    f"• Senior-вакансии в match\n"
+                                    f"• +{Config.REF_REWARD_DIGEST_BONUS} слотов digests\n"
+                                    f"/profile"
+                                ),
+                            )
+                        except Exception:
+                            pass
 
         if user_id:
             self.db.log_event(user_id, 'start', {'payload': payload})
+            # re-check premium if already over threshold
+            self.db.maybe_unlock_premium(user_id)
 
         channel = Config.CHANNEL_ID
         channel_link = (
@@ -2651,18 +2809,18 @@ class JobBot:
         if user_id and not settings.get('onboarding_done'):
             setup_hint = "\n\n⚙️ *Настрой профиль:* /setup — категории, зарплата, стек, личный digest."
 
+        thr = Config.REF_REWARD_THRESHOLD
         welcome_text = (
             "👋 Привет! Я собираю *Junior/Middle remote IT*-вакансии.\n\n"
             f"📌 Канал (лента): {channel_link}\n"
-            f"📬 Личный digest: /digest on — подборка в ЛС по твоему профилю.\n\n"
+            f"📬 Личный digest: /digest on — подборка в ЛС по профилю.\n"
+            f"⚡ Мгновенные алерты: /alerts on — 1–2 топа за цикл.\n"
+            f"🏆 Premium: пригласи {thr}+ друзей (/ref) → Senior + больше digests.\n\n"
             "*Команды:*\n"
             "/setup — онбординг профиля\n"
-            "/digest on|off|now — личный дайджест\n"
-            "/profile — текущий профиль\n"
-            "/ref — реферальная ссылка\n"
-            "/favorites — сохранённые\n"
-            "/categories — категории\n"
-            "/last N · /status — admin"
+            "/digest on|off|now · /alerts on|off\n"
+            "/profile · /ref · /favorites · /categories\n"
+            "/stats_growth · /last · /status — admin"
             f"{setup_hint}"
             f"{ref_line}"
         )
@@ -2717,14 +2875,19 @@ class JobBot:
 
     async def cmd_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
+        self.db.maybe_unlock_premium(user_id)
         s = self.db.get_user_settings(user_id)
         cats = ", ".join(CATEGORY_NAMES_RU.get(c, c) for c in s['enabled_categories'][:12])
+        invited = self.db.count_referrals(user_id)
+        thr = Config.REF_REWARD_THRESHOLD
         await update.message.reply_text(
             "👤 Профиль\n"
             f"Категории: {cats or '—'}\n"
             f"Min salary (USD-ish): {s.get('min_salary_filter') or 0}\n"
             f"Стек: {s.get('skills') or '—'}\n"
             f"Digest: {'on' if s.get('digest_enabled') else 'off'}\n"
+            f"Alerts: {'on' if s.get('alerts_enabled') else 'off'}\n"
+            f"Premium: {'🏆 on' if s.get('premium_unlocked') else f'off ({invited}/{thr} refs)'}\n"
             f"Onboarding: {'done' if s.get('onboarding_done') else 'incomplete'}\n"
             f"Hide senior: {s.get('hide_senior')}"
         )
@@ -2759,9 +2922,85 @@ class JobBot:
             "Команды: /digest on | off | now"
         )
 
+    async def cmd_alerts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """ /alerts on|off — realtime match alerts after each crawl cycle """
+        user_id = update.effective_user.id
+        arg = (context.args[0].lower() if context.args else '').strip()
+        if arg in ('on', '1', 'true', 'yes', 'да'):
+            self.db.save_user_settings(user_id, {'alerts_enabled': True})
+            self.db.log_event(user_id, 'alerts_on', {})
+            await update.message.reply_text(
+                f"⚡ Алерты включены: до {Config.REALTIME_ALERTS_MAX} вакансий за цикл crawl, "
+                f"если match по /setup.\nВыкл: /alerts off"
+            )
+            return
+        if arg in ('off', '0', 'false', 'no', 'нет'):
+            self.db.save_user_settings(user_id, {'alerts_enabled': False})
+            self.db.log_event(user_id, 'alerts_off', {})
+            await update.message.reply_text("Алерты выключены.")
+            return
+        s = self.db.get_user_settings(user_id)
+        await update.message.reply_text(
+            f"Alerts: {'on' if s.get('alerts_enabled') else 'off'}\n"
+            "/alerts on | off"
+        )
+
+    async def cmd_stats_growth(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin growth funnel from events table."""
+        if not await self.check_admin(update):
+            return
+        days = Config.GROWTH_STATS_DAYS
+        if context.args:
+            try:
+                days = max(1, min(int(context.args[0]), 90))
+            except ValueError:
+                pass
+        stats = self.db.growth_stats(days=days)
+        lines = [
+            f"📈 Growth stats · {days}d",
+            f"Users: {stats['users_total']} · digest:{stats['digest_subscribers']} "
+            f"· alerts:{stats['alert_subscribers']} · premium:{stats['premium_users']}",
+            "",
+            f"starts: {stats['starts']}",
+            f"setup_done: {stats['setup_done']}",
+            f"save_job: {stats['saves']}",
+            f"referrals: {stats['referrals']} · ref_views: {stats['ref_views']}",
+            f"personal_digests: {stats['personal_digests']}",
+            f"channel_digests: {stats['channel_digests']}",
+            f"realtime_alerts: {stats['realtime_alerts']}",
+            "",
+            "Top referrers:",
+        ]
+        if stats['top_referrers']:
+            for uid, c in stats['top_referrers']:
+                lines.append(f"  {uid}: {c}")
+        else:
+            lines.append("  —")
+        lines.append("")
+        lines.append("Events/day:")
+        for d, c in stats['events_by_day'][:7]:
+            lines.append(f"  {d}: {c}")
+        await update.message.reply_text("\n".join(lines))
+        self.db.log_event(update.effective_user.id, 'stats_growth_view', {'days': days})
+
+    def _effective_profile(self, user_id: int) -> Dict:
+        """Profile + premium soft rewards applied."""
+        self.db.maybe_unlock_premium(user_id)
+        settings = self.db.get_user_settings(user_id)
+        if GROWTH_UTILS_AVAILABLE and settings.get('premium_unlocked'):
+            settings = apply_premium_to_settings(settings, True)
+        return settings
+
+    def _digest_limit(self, settings: Dict) -> int:
+        base = Config.PERSONAL_DIGEST_MAX
+        if settings.get('premium_unlocked'):
+            return base + Config.REF_REWARD_DIGEST_BONUS
+        return base
+
     async def send_personal_digest(self, user_id: int) -> int:
         """Send matched jobs to user DM. Returns count sent."""
-        settings = self.db.get_user_settings(user_id)
+        settings = self._effective_profile(user_id)
+        limit = self._digest_limit(settings)
         jobs = self.db.recent_jobs_for_digest(
             hours=Config.PERSONAL_DIGEST_LOOKBACK_HOURS,
             limit=80,
@@ -2773,13 +3012,14 @@ class JobBot:
                     matched.append(job)
             else:
                 matched.append(job)
-            if len(matched) >= Config.PERSONAL_DIGEST_MAX:
+            if len(matched) >= limit:
                 break
         if not matched:
             return 0
 
+        premium_tag = " · 🏆" if settings.get('premium_unlocked') else ""
         header = (
-            f"📬 Твой digest ({len(matched)}):\n"
+            f"📬 Твой digest ({len(matched)}){premium_tag}:\n"
             f"профиль: min${settings.get('min_salary_filter') or 0}, "
             f"skills={settings.get('skills') or '—'}\n"
         )
@@ -2818,6 +3058,78 @@ class JobBot:
                 logger.debug(f"digest job fail: {e}")
         self.db.log_event(user_id, 'personal_digest_sent', {'count': sent})
         return sent
+
+    async def push_realtime_alerts(self, new_jobs: List[Dict]) -> int:
+        """After crawl: DM matching jobs to alert subscribers. Returns total DMs."""
+        if not Config.ENABLE_REALTIME_ALERTS or not new_jobs:
+            return 0
+        total = 0
+        for uid in self.db.list_alert_subscribers():
+            settings = self._effective_profile(uid)
+            matched = []
+            for job in new_jobs:
+                if GROWTH_UTILS_AVAILABLE and not job_matches_profile(job, settings):
+                    continue
+                matched.append(job)
+                if len(matched) >= Config.REALTIME_ALERTS_MAX:
+                    break
+            if not matched:
+                continue
+            try:
+                await self.application.bot.send_message(
+                    chat_id=uid,
+                    text=f"⚡ {len(matched)} новых match за цикл:",
+                )
+            except Exception as e:
+                logger.debug(f"alert header fail {uid}: {e}")
+                continue
+            for job in matched:
+                try:
+                    if Config.ENABLE_MARKDOWN_V2 and self.formatter:
+                        formatted = self.formatter.format_job(
+                            job, view_mode='compact', bot_username=Config.BOT_USERNAME
+                        )
+                        await self.application.bot.send_message(
+                            chat_id=uid,
+                            text=formatted.text,
+                            parse_mode=ParseMode.MARKDOWN_V2,
+                            reply_markup=InlineKeyboardMarkup(
+                                formatted.reply_markup['inline_keyboard']
+                            ),
+                            disable_web_page_preview=True,
+                        )
+                    else:
+                        await self.application.bot.send_message(
+                            chat_id=uid,
+                            text=format_job_message_legacy(job),
+                            parse_mode='HTML',
+                            disable_web_page_preview=True,
+                        )
+                    total += 1
+                    await asyncio.sleep(0.35)
+                except Exception as e:
+                    logger.debug(f"alert job fail: {e}")
+            self.db.log_event(uid, 'realtime_alert_sent', {'count': len(matched)})
+        return total
+
+    async def post_weekly_salary_magnet(self) -> bool:
+        """Channel content magnet: salary medians by category."""
+        if not GROWTH_UTILS_AVAILABLE:
+            return False
+        jobs = self.db.jobs_with_salary_for_report(days=14, limit=500)
+        text = build_salary_magnet_report(jobs, category_names=CATEGORY_NAMES_RU)
+        if Config.BOT_USERNAME:
+            text += f"\n\nБот: https://t.me/{Config.BOT_USERNAME}?start=invite"
+        try:
+            await self.application.bot.send_message(
+                chat_id=Config.CHANNEL_ID,
+                text=text[:4000],
+            )
+            self.db.log_event(None, 'salary_magnet_posted', {'jobs': len(jobs)})
+            return True
+        except Exception as e:
+            logger.error(f"salary magnet failed: {e}")
+            return False
 
     async def handle_setup_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle free-text steps of /setup wizard."""
@@ -3183,7 +3495,7 @@ async def main():
     configure_webshare_proxy()
 
     logger.info("=" * 60)
-    logger.info("🚀 Job Bot Starting (v6.2 — P1 personalization)")
+    logger.info("🚀 Job Bot Starting (v6.3 — growth ops)")
     logger.info(f"📡 Channel: {Config.CHANNEL_ID}")
     logger.info(f"⏱️ Check interval: {Config.CHECK_INTERVAL}s")
     logger.info(f"📊 Max posts per cycle: {Config.MAX_POSTS_PER_CYCLE}")
@@ -3192,10 +3504,14 @@ async def main():
     logger.info(f"🧠 Classifier: {CLASSIFIER_AVAILABLE}")
     logger.info(f"🎨 Formatter: {FORMATTER_AVAILABLE}")
     logger.info(f"🔍 Fuzzy dedup: {RAPIDFUZZ_AVAILABLE} (thr={Config.FUZZY_DEDUP_THRESHOLD})")
+    logger.info(f"🗓️ Dedup retention days: {Config.DEDUP_RETENTION_DAYS}")
     logger.info(f"🔀 Source diversify: {Config.ENABLE_SOURCE_DIVERSIFY}")
     logger.info(f"💵 Global min salary USD: {Config.GLOBAL_MIN_SALARY_USD}")
     logger.info(f"📂 Channel tracks: {Config.CHANNEL_TRACKS}")
     logger.info(f"📬 Personal digest: {Config.ENABLE_PERSONAL_DIGEST}")
+    logger.info(f"⚡ Realtime alerts: {Config.ENABLE_REALTIME_ALERTS}")
+    logger.info(f"🏆 Ref premium threshold: {Config.REF_REWARD_THRESHOLD}")
+    logger.info(f"📊 Weekly salary report: {Config.ENABLE_WEEKLY_SALARY_REPORT}")
     if Config.ADMIN_USER_ID:
         logger.info(f"👤 Admin user ID: {Config.ADMIN_USER_ID}")
     logger.info("=" * 60)
@@ -3218,6 +3534,8 @@ async def main():
     application.add_handler(CommandHandler("setup", job_bot.cmd_setup))
     application.add_handler(CommandHandler("profile", job_bot.cmd_profile))
     application.add_handler(CommandHandler("digest", job_bot.cmd_digest))
+    application.add_handler(CommandHandler("alerts", job_bot.cmd_alerts))
+    application.add_handler(CommandHandler("stats_growth", job_bot.cmd_stats_growth))
     application.add_handler(CommandHandler("status", job_bot.cmd_status))
     application.add_handler(CommandHandler("last", job_bot.cmd_last))
     application.add_handler(CommandHandler("favorites", job_bot.cmd_favorites))
@@ -3282,6 +3600,23 @@ async def main():
                 name='daily_job_digest',
             )
             logger.info(f"📬 Digests scheduled at {Config.DIGEST_HOUR_UTC}:00 UTC")
+
+            if Config.ENABLE_WEEKLY_SALARY_REPORT:
+                async def weekly_salary_job(context: ContextTypes.DEFAULT_TYPE):
+                    ok = await job_bot.post_weekly_salary_magnet()
+                    logger.info(f"📊 Weekly salary magnet: {'ok' if ok else 'fail'}")
+
+                # day_of_week: 0=Mon … 6=Sun in APScheduler 3.x used by PTB JobQueue
+                application.job_queue.run_daily(
+                    weekly_salary_job,
+                    time=dt_time(hour=Config.SALARY_REPORT_HOUR_UTC, minute=15),
+                    days=(Config.SALARY_REPORT_WEEKDAY,),
+                    name='weekly_salary_magnet',
+                )
+                logger.info(
+                    f"📊 Salary magnet: weekday={Config.SALARY_REPORT_WEEKDAY} "
+                    f"{Config.SALARY_REPORT_HOUR_UTC}:15 UTC"
+                )
         except Exception as e:
             logger.warning(f"JobQueue digest not scheduled: {e}")
     
@@ -3376,6 +3711,7 @@ async def main():
             # Post all suitable jobs with rate-limiting
             posted_count = 0
             failed_count = 0
+            posted_jobs: List[Dict] = []
             for i, job in enumerate(selected_jobs):
                 # Telegram flood control: ~20 msg/min per chat safety pause
                 if i > 0 and i % 20 == 0:
@@ -3384,6 +3720,7 @@ async def main():
                 if await job_bot.post_job(job):
                     register_posted_job(job, db)
                     posted_count += 1
+                    posted_jobs.append(job)
                     await asyncio.sleep(DELAYS['between_posts'])
                 else:
                     failed_count += 1
@@ -3392,6 +3729,16 @@ async def main():
                 f"✅ Posted {posted_count} new jobs to channel "
                 f"(duplicates skipped: {duplicate_count}, failed: {failed_count})"
             )
+
+            # Realtime DM alerts for matching subscribers
+            if posted_jobs and Config.ENABLE_REALTIME_ALERTS:
+                try:
+                    n_alerts = await job_bot.push_realtime_alerts(posted_jobs)
+                    if n_alerts:
+                        logger.info(f"⚡ Realtime alert DMs sent: {n_alerts}")
+                except Exception as e:
+                    logger.warning(f"Realtime alerts failed: {e}")
+
             logger.info(f"⏳ Waiting {Config.CHECK_INTERVAL//60} minutes before next cycle...")
             await asyncio.sleep(Config.CHECK_INTERVAL)
             

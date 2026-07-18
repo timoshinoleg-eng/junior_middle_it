@@ -1,9 +1,11 @@
 """
-Growth utilities v6.1 — fuzzy dedup, salary normalize, referral helpers.
+Growth utilities v6.1+ — fuzzy dedup, salary normalize, referral, salary magnet.
 """
 from __future__ import annotations
 
 import re
+import statistics
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -218,6 +220,76 @@ def passes_channel_tracks(job: Dict, allowed: List[str]) -> bool:
         return True
     cat = str(job.get("category") or "other").lower()
     return cat in allowed_norm
+
+
+def apply_premium_to_settings(settings: Dict, premium: bool) -> Dict:
+    """Soft ref reward: premium users see senior + larger digests (caller sets max)."""
+    s = dict(settings or {})
+    if premium:
+        s['premium_unlocked'] = True
+        s['hide_senior'] = False
+    return s
+
+
+def build_salary_magnet_report(
+    jobs: List[Dict],
+    category_names: Optional[Dict[str, str]] = None,
+    top_n: int = 8,
+) -> str:
+    """
+    Weekly content-magnet text: salary medians by category×level.
+    Uses salary_min_usd when present.
+    """
+    category_names = category_names or {}
+    buckets: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+    for job in jobs:
+        amount = job.get('salary_min_usd')
+        if amount is None:
+            continue
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            continue
+        if amount <= 0:
+            continue
+        cat = str(job.get('category') or 'other')
+        level = str(job.get('level') or 'Junior')
+        buckets[(cat, level)].append(amount)
+
+    if not buckets:
+        return (
+            "📊 Недельный salary-дайджест\n\n"
+            "Пока мало вакансий с распознанной вилкой. "
+            "Подпишись на канал — обновим через неделю."
+        )
+
+    ranked = sorted(
+        buckets.items(),
+        key=lambda kv: statistics.median(kv[1]),
+        reverse=True,
+    )[:top_n]
+
+    lines = [
+        "📊 Недельный salary-магнит · Junior/Middle remote IT",
+        f"Выборка: {sum(len(v) for v in buckets.values())} вакансий с вилкой",
+        "",
+        "Медиана min (USD-ish / год-эквивалент):",
+    ]
+    for (cat, level), amounts in ranked:
+        cat_ru = category_names.get(cat, cat)
+        med = int(statistics.median(amounts))
+        lo, hi = min(amounts), max(amounts)
+        lines.append(
+            f"• {cat_ru} · {level}: ~${med:,}  "
+            f"(n={len(amounts)}, ${lo:,}–${hi:,})"
+        )
+
+    lines.extend([
+        "",
+        "⚠️ Ориентир, не оффер: разные валюты/месяц-год сведены эвристикой.",
+        "Настрой профиль: /setup · личный digest: /digest on",
+    ])
+    return "\n".join(lines)
 
 
 def serialize_job_payload(job: Dict) -> Dict:

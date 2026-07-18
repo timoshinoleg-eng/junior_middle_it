@@ -3,7 +3,9 @@ import unittest
 
 from growth_utils import (
     RAPIDFUZZ_AVAILABLE,
+    apply_premium_to_settings,
     build_referral_link,
+    build_salary_magnet_report,
     enrich_job_salary_fields,
     fuzzy_is_near_duplicate,
     job_fingerprint,
@@ -100,6 +102,23 @@ class GrowthUtilsTests(unittest.TestCase):
         p = serialize_job_payload({"title": "T", "tags": ["a"], "description": "x" * 2000})
         self.assertEqual(p["title"], "T")
         self.assertLessEqual(len(p["description"]), 800)
+
+    def test_salary_magnet_report(self):
+        jobs = [
+            {"category": "development", "level": "Junior", "salary_min_usd": 30000},
+            {"category": "development", "level": "Junior", "salary_min_usd": 40000},
+            {"category": "qa", "level": "Middle", "salary_min_usd": 50000},
+        ]
+        text = build_salary_magnet_report(jobs, category_names={"development": "Разработка", "qa": "QA"})
+        self.assertIn("salary", text.lower())
+        self.assertIn("Junior", text)
+        empty = build_salary_magnet_report([])
+        self.assertIn("мало", empty.lower())
+
+    def test_premium_settings(self):
+        s = apply_premium_to_settings({"hide_senior": True}, True)
+        self.assertFalse(s["hide_senior"])
+        self.assertTrue(s["premium_unlocked"])
 
 
 if __name__ == "__main__":
