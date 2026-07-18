@@ -1,49 +1,37 @@
-# Junior/Middle IT Job Vacancy Bot v6.0
+# Junior/Middle IT Job Vacancy Bot v6.6
 
-Telegram-бот для автоматического сбора качественных вакансий для Junior и Middle IT-специалистов с поддержкой 7+ категорий, MarkdownV2 форматирования и inline-кнопок.
+Telegram-бот для сбора Junior/Middle remote IT-вакансий: API + ATS + Telegram-каналы, персональные дайджесты, multi-track каналы, source health.
 
 ## 🚀 Возможности
 
-### Новые функции v6.0:
-- 📱 **40+ Telegram-каналов** в качестве источников (через Telethon)
-- 🧠 **Автоматическая классификация** по категориям (разработка, QA, DevOps, данные, маркетинг, продажи, PM)
-- 🎨 **MarkdownV2 форматирование** с эмодзи-категориями
-- 🔘 **Inline-кнопки** (Сохранить, Поделиться, Скрыть категорию)
-- 💾 **Система избранного** для пользователей
-- ⚙️ **Настройка категорий** по предпочтениям
+### v6.1–v6.6 (growth stack)
+- **v6.1** — fuzzy dedup (RapidFuzz), referrals, FloodWait, events
+- **v6.2** — `/setup` профиль, personal digest, invite CTA
+- **v6.3** — `/stats_growth`, salary magnet, premium refs, realtime alerts
+- **v6.4** — multi-track `CHANNEL_ROUTES` (specialty channels by category)
+- **v6.5** — free sources: 4dayweek, The Muse, RemoteOK multi-cat, Working Nomads, WWR/Himalayas RSS; `/sources`
+- **v6.6** — publish quality score, source auto-skip (`SOURCE_FAIL_SKIP`), title/company normalize
 
-### Основные возможности:
-- 🔍 **до 60+ источников вакансий** (API/ATS + Telegram-каналы)
-- 📊 **SQLite база данных** с улучшенной дедупликацией
-- 🗑️ **Чёрный список спама** (автоматическая фильтрация)
-- 💬 **Публикация в Telegram** с красивым форматированием
-- 🔄 **Автообновление** каждые 30 минут
-- 👨‍💼 **Админ-команды**: `/status`, `/last N`, `/pause`, `/resume`
-- 📝 **Структурированное логирование** (консоль + файл)
+### База v6.0
+- 📱 **40+ Telegram-каналов** (Telethon)
+- 🧠 **Классификация** по категориям (dev, QA, DevOps, data, design, PM, …)
+- 🎨 **MarkdownV2** + inline-кнопки (сохранить / поделиться / скрыть)
+- 💾 **Избранное** + настройки категорий
+- 🔍 **60+ источников** (API/ATS + TG)
+- 📊 **SQLite** dedup + retention
 
 ## 📦 Источники вакансий
 
-### API источники (до 20):
-1. **Remotive** - качественные англоязычные remote вакансии
-2. **RemoteOK** - проверенные компании, только удалёнка
-3. **Arbeitnow** - европейские вакансии, без лимитов
-4. **Himalayas** - вакансии с зарплатами
-5. **We Work Remotely** - высочайшее качество (RSS)
-6. **Jobicy** - remote вакансии
-7. **DevITJobs UK** - специализированный IT XML feed
-8. **HN Who is Hiring** - свежие вакансии из Hacker News
-9. **HeadHunter** - настроенный User-Agent, опционально OAuth token
-10. **SuperJob** - требуется бесплатный партнёрский ключ
-11. **Adzuna** - требуется бесплатный ключ
-12. **Reed** - требуется API key
-13. **Jooble** - требуется API key
-14. **FindWork.dev** - требуется token
-15. **USAJobs** - требуется API key и User-Agent
-16. **Greenhouse** - публичные ATS boards
-17. **Lever** - публичные ATS postings
-18. **Ashby** - публичные ATS boards
-19. **CryptocurrencyJobs** - через Apify token
-20. **Wellfound** - через Apify token
+### Free API / boards (без ключа)
+1. **Remotive**, **RemoteOK** (+ multi-cat Dev), **Arbeitnow**, **Himalayas**, **Jobicy**
+2. **We Work Remotely** + RSS (programming/design/devops/product)
+3. **4dayweek.io**, **The Muse**, **Working Nomads**
+4. **DevITJobs UK**, **HN Who is Hiring**
+5. **Greenhouse / Lever / Ashby** public boards (defaults expanded in code)
+
+### Keyed / optional
+- HeadHunter, SuperJob, Adzuna, Reed, Jooble, FindWork, USAJobs
+- Apify actors (USAJobs, All Jobs; paid: CryptocurrencyJobs, Wellfound)
 
 ### Telegram-каналы:
 1. **remote_developers** - 100% remote, EN/RU
@@ -159,30 +147,51 @@ python channel_bot.py
 
 ## 📚 Команды бота
 
-### Публичные команды:
-- `/start` - Приветственное сообщение
-- `/favorites` - Показать сохраненные вакансии
-- `/categories` - Настройка категорий
+### Публичные
+- `/start` — онбординг + referral deep-link
+- `/setup` / `/profile` — профиль (категории, skills, min salary)
+- `/digest` — персональный дайджест
+- `/alerts` — realtime alerts on/off
+- `/ref` — реферальная ссылка
+- `/favorites` / `/categories`
 
-### Админские команды:
-- `/status` - Статистика бота
-- `/last N` - Последние N вакансий
-- `/pause` - Приостановить публикацию
-- `/resume` - Возобновить публикацию
+### Админ
+- `/status` `/last N` `/pause` `/resume`
+- `/sources` — health + fail streaks + configured fetchers
+- `/tracks` — multi-track routes
+- `/stats_growth` — growth metrics
+
+## Ключевые env (полный список — `.env.example.txt`)
+
+```env
+TELEGRAM_BOT_TOKEN=
+CHANNEL_ID=
+# multi-track (v6.4)
+CHANNEL_ROUTES=development,qa,devops:@dev;data:@data;*:@main
+MULTI_TRACK_ENABLED=true
+# free extras (v6.5)
+ENABLE_EXTRA_SOURCES=true
+ENABLE_RSS_SOURCES=true
+# quality ops (v6.6)
+SOURCE_FAIL_SKIP=3
+ENABLE_SOURCE_DIVERSIFY=true
+MAX_POSTS_PER_CYCLE=40
+```
 
 ## 🗂️ Структура проекта
 
 ```
 junior_middle_it/
-├── channel_bot.py           # Основной файл бота
-├── job_classifier.py        # Модуль классификации вакансий
-├── telegram_job_parser.py   # Парсер Telegram-каналов
-├── message_formatter.py     # Форматирование сообщений
-├── migrate_db.py            # Скрипт миграции БД
-├── telegram_auth.py         # Утилита авторизации Telegram
-├── requirements.txt         # Зависимости
-├── .env.example.txt         # Пример конфигурации
-└── README.md                # Документация
+├── channel_bot.py           # pipeline + bot commands
+├── growth_utils.py          # fuzzy, salary, multi-track, scores
+├── job_sources_extra.py     # free APIs / RSS / source health
+├── job_classifier.py
+├── telegram_job_parser.py
+├── message_formatter.py
+├── CHANGELOG_v6.1.md … v6.6.md
+├── requirements.txt
+├── .env.example.txt
+└── README.md
 ```
 
 ## 🎯 Категории вакансий

@@ -202,85 +202,68 @@ class JobMessageFormatter:
         
         return '\n'.join(lines)
     
-    def create_inline_keyboard(self, job: Dict, view_mode: str = 'compact') -> Dict:
+    def create_inline_keyboard(
+        self,
+        job: Dict,
+        view_mode: str = 'compact',
+        bot_username: str = '',
+    ) -> Dict:
         """
-        Создание inline-клавиатуры для сообщения.
-        
-        Args:
-            job: Данные вакансии
-            view_mode: 'compact' или 'full'
-        
-        Returns:
-            Inline keyboard в формате dict
+        Inline keyboard: open/save/share, expand, hide category, invite CTA.
         """
         job_id = job.get('hash') or job.get('content_hash') or 'unknown'
+        # callback_data max 64 bytes — keep hash short (we use 16-char hashes)
+        job_id = str(job_id)[:40]
         url = job.get('url', '')
         category = job.get('category', 'other')
-        title = job.get('title', '')[:30]  # Для share query
+        title = job.get('title', '')[:30]
         
         keyboard = []
         
-        # Первая строка: основные действия
         row1 = []
-        
         if url:
-            row1.append({
-                'text': '🔗 Открыть',
-                'url': url
-            })
-        
-        row1.append({
-            'text': '💾 Сохранить',
-            'callback_data': f"save:{job_id}"
-        })
-        
+            row1.append({'text': '🔗 Открыть', 'url': url})
+        row1.append({'text': '💾 Сохранить', 'callback_data': f"save:{job_id}"})
         row1.append({
             'text': '📤 Поделиться',
             'switch_inline_query': f"{title} - вакансия для {job.get('level', 'Junior')}"
         })
-        
         keyboard.append(row1)
         
-        # Вторая строка: управление отображением
         row2 = []
-        
         if view_mode == 'compact':
-            row2.append({
-                'text': '⬇️ Подробнее',
-                'callback_data': f"expand:{job_id}"
-            })
+            row2.append({'text': '⬇️ Подробнее', 'callback_data': f"expand:{job_id}"})
         else:
-            row2.append({
-                'text': '⬆️ Свернуть',
-                'callback_data': f"compact:{job_id}"
-            })
-        
+            row2.append({'text': '⬆️ Свернуть', 'callback_data': f"compact:{job_id}"})
         row2.append({
-            'text': f'🚫 Скрыть {CATEGORY_NAMES_RU.get(category, category)}',
+            'text': f'🚫 {CATEGORY_NAMES_RU.get(category, category)}',
             'callback_data': f"hide_cat:{category}"
         })
-        
         keyboard.append(row2)
+
+        # Growth CTA: open bot with invite payload → user gets personal /ref
+        uname = (bot_username or '').lstrip('@')
+        if uname:
+            keyboard.append([{
+                'text': '🎁 Пригласить друзей',
+                'url': f'https://t.me/{uname}?start=invite',
+            }])
         
         return {'inline_keyboard': keyboard}
     
-    def format_job(self, job: Dict, view_mode: str = 'compact') -> FormattedMessage:
-        """
-        Форматирование вакансии для отправки.
-        
-        Args:
-            job: Данные вакансии
-            view_mode: 'compact' или 'full'
-        
-        Returns:
-            FormattedMessage с текстом и клавиатурой
-        """
+    def format_job(
+        self,
+        job: Dict,
+        view_mode: str = 'compact',
+        bot_username: str = '',
+    ) -> FormattedMessage:
+        """Format job message; bot_username enables invite deep-link button."""
         if view_mode == 'compact':
             text = self._format_compact(job)
         else:
             text = self._format_full(job)
         
-        keyboard = self.create_inline_keyboard(job, view_mode)
+        keyboard = self.create_inline_keyboard(job, view_mode, bot_username=bot_username)
         
         return FormattedMessage(
             text=text,
