@@ -168,3 +168,74 @@ def parse_start_payload(args: Optional[List[str]]) -> Tuple[Optional[str], Optio
         except ValueError:
             return "ref", None
     return payload, None
+
+
+def job_matches_profile(job: Dict, settings: Dict) -> bool:
+    """
+    Match job against user profile from /setup.
+    settings keys: enabled_categories, min_salary_filter, skills (comma str), hide_senior
+    """
+    if not settings:
+        return True
+
+    cats = settings.get("enabled_categories") or []
+    if cats and cats != [""]:
+        cat = job.get("category") or "other"
+        if cat not in cats:
+            return False
+
+    if settings.get("hide_senior", True):
+        level = str(job.get("level") or "").lower()
+        if level == "senior":
+            return False
+
+    min_sal = int(settings.get("min_salary_filter") or 0)
+    if min_sal > 0 and not passes_min_salary(job, min_sal):
+        return False
+
+    skills_raw = settings.get("skills") or ""
+    skills = [s.strip().lower() for s in str(skills_raw).split(",") if s.strip()]
+    if skills:
+        blob = " ".join(
+            [
+                str(job.get("title") or ""),
+                str(job.get("description") or ""),
+                " ".join(job.get("tags") or []) if isinstance(job.get("tags"), list) else str(job.get("tags") or ""),
+            ]
+        ).lower()
+        if not any(s in blob for s in skills):
+            return False
+
+    return True
+
+
+def passes_channel_tracks(job: Dict, allowed: List[str]) -> bool:
+    """Channel publication track filter. allowed=['all'] disables filter."""
+    if not allowed:
+        return True
+    allowed_norm = [a.strip().lower() for a in allowed if a and a.strip()]
+    if not allowed_norm or "all" in allowed_norm:
+        return True
+    cat = str(job.get("category") or "other").lower()
+    return cat in allowed_norm
+
+
+def serialize_job_payload(job: Dict) -> Dict:
+    """Compact job dict for expand/compact cache (JSON-safe)."""
+    tags = job.get("tags") or []
+    if not isinstance(tags, list):
+        tags = [str(tags)]
+    return {
+        "hash": job.get("hash") or job.get("content_hash") or "",
+        "title": job.get("title") or "",
+        "company": job.get("company") or "",
+        "level": job.get("level") or "Junior",
+        "category": job.get("category") or "other",
+        "salary": job.get("salary") or "Не указана",
+        "location": job.get("location") or "Remote",
+        "description": str(job.get("description") or "")[:800],
+        "url": job.get("url") or "",
+        "source": job.get("source") or "",
+        "tags": tags[:12],
+        "salary_min_usd": job.get("salary_min_usd"),
+    }

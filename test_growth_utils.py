@@ -7,9 +7,12 @@ from growth_utils import (
     enrich_job_salary_fields,
     fuzzy_is_near_duplicate,
     job_fingerprint,
+    job_matches_profile,
     parse_salary_to_usd_min,
     parse_start_payload,
+    passes_channel_tracks,
     passes_min_salary,
+    serialize_job_payload,
 )
 
 
@@ -62,6 +65,41 @@ class GrowthUtilsTests(unittest.TestCase):
         self.assertEqual(rid, 99)
         kind, rid = parse_start_payload([])
         self.assertIsNone(kind)
+
+    def test_profile_match_category(self):
+        job = {"title": "Python Dev", "category": "development", "level": "Junior", "tags": ["python"]}
+        settings = {
+            "enabled_categories": ["qa"],
+            "min_salary_filter": 0,
+            "skills": "",
+            "hide_senior": True,
+        }
+        self.assertFalse(job_matches_profile(job, settings))
+        settings["enabled_categories"] = ["development"]
+        self.assertTrue(job_matches_profile(job, settings))
+
+    def test_profile_match_skills(self):
+        job = {"title": "Backend", "category": "development", "description": "Go microservices", "tags": []}
+        settings = {
+            "enabled_categories": ["development"],
+            "skills": "python, django",
+            "min_salary_filter": 0,
+            "hide_senior": True,
+        }
+        self.assertFalse(job_matches_profile(job, settings))
+        job["description"] = "Python FastAPI"
+        self.assertTrue(job_matches_profile(job, settings))
+
+    def test_channel_tracks(self):
+        job = {"category": "marketing"}
+        self.assertFalse(passes_channel_tracks(job, ["development", "qa"]))
+        self.assertTrue(passes_channel_tracks(job, ["all"]))
+        self.assertTrue(passes_channel_tracks({"category": "qa"}, ["development", "qa"]))
+
+    def test_serialize_payload(self):
+        p = serialize_job_payload({"title": "T", "tags": ["a"], "description": "x" * 2000})
+        self.assertEqual(p["title"], "T")
+        self.assertLessEqual(len(p["description"]), 800)
 
 
 if __name__ == "__main__":

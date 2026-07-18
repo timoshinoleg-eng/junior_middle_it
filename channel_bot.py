@@ -77,8 +77,11 @@ try:
         enrich_job_salary_fields,
         fuzzy_is_near_duplicate,
         job_fingerprint,
+        job_matches_profile,
         parse_start_payload,
+        passes_channel_tracks,
         passes_min_salary,
+        serialize_job_payload,
     )
     GROWTH_UTILS_AVAILABLE = True
 except ImportError:
@@ -139,6 +142,17 @@ class Config:
     ENABLE_DAILY_DIGEST = os.getenv('ENABLE_DAILY_DIGEST', 'true').lower() == 'true'
     DIGEST_HOUR_UTC = env_int('DIGEST_HOUR_UTC', 9)
     DIGEST_MAX_JOBS = env_int('DIGEST_MAX_JOBS', 7)
+    # Channel track filter: categories allowed in public channel (comma). "all" = no filter
+    CHANNEL_TRACKS = [
+        x.strip() for x in os.getenv(
+            'CHANNEL_TRACKS',
+            'development,qa,devops,data,design,pm,security'
+        ).split(',')
+        if x.strip()
+    ]
+    ENABLE_PERSONAL_DIGEST = os.getenv('ENABLE_PERSONAL_DIGEST', 'true').lower() == 'true'
+    PERSONAL_DIGEST_MAX = env_int('PERSONAL_DIGEST_MAX', 5)
+    PERSONAL_DIGEST_LOOKBACK_HOURS = env_int('PERSONAL_DIGEST_LOOKBACK_HOURS', 36)
     
     @classmethod
     def validate(cls) -> bool:
@@ -439,13 +453,16 @@ class DatabaseConnection:
             )
         """)
         
-        # User settings
+        # User settings / profile
         c.execute("""
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id INTEGER PRIMARY KEY,
                 enabled_categories TEXT DEFAULT 'development,qa,devops,data,marketing,sales,pm,design,other',
                 hide_senior BOOLEAN DEFAULT 1,
                 min_salary_filter INTEGER DEFAULT 0,
+                skills TEXT DEFAULT '',
+                digest_enabled INTEGER DEFAULT 0,
+                onboarding_done INTEGER DEFAULT 0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -478,6 +495,15 @@ class DatabaseConnection:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Full job JSON for expand/compact callbacks
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS job_payloads (
+                hash TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         
         # Indexes
         c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_category ON posted_jobs(category)")
@@ -487,6 +513,7 @@ class DatabaseConnection:
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_name_ts ON events(name, ts)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_job_payloads_created ON job_payloads(created_at)")
         
         # Meta table for one-shot migrations and flags
         c.execute("""
@@ -509,6 +536,17 @@ class DatabaseConnection:
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE posted_jobs ADD COLUMN fingerprint TEXT DEFAULT ''")
             c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_fingerprint ON posted_jobs(fingerprint)")
+
+        # Migration: profile columns on user_settings
+        for col, decl in (
+            ('skills', "TEXT DEFAULT ''"),
+            ('digest_enabled', 'INTEGER DEFAULT 0'),
+            ('onboarding_done', 'INTEGER DEFAULT 0'),
+        ):
+            try:
+                c.execute(f'SELECT {col} FROM user_settings LIMIT 1')
+            except sqlite3.OperationalError:
+                c.execute(f'ALTER TABLE user_settings ADD COLUMN {col} {decl}')
         
         self.conn.commit()
         logger.info("✅ Database initialized")
@@ -584,45 +622,170 @@ class DatabaseConnection:
             for row in results
         ]
     
-    # User settings methods
-    def get_user_settings(self, user_id: int) -> Dict:
-        """Get user settings"""
-        result = self.fetchone(
-            'SELECT enabled_categories, hide_senior, min_salary_filter FROM user_settings WHERE user_id = ?',
-            (user_id,)
-        )
-        
-        if result:
-            return {
-                'enabled_categories': result[0].split(','),
-                'hide_senior': bool(result[1]),
-                'min_salary_filter': result[2],
-            }
-        
-        # Default settings
+    # User settings / profile methods
+    def _default_settings(self) -> Dict:
         return {
             'enabled_categories': list(CATEGORY_NAMES_RU.keys()),
             'hide_senior': True,
             'min_salary_filter': 0,
+            'skills': '',
+            'digest_enabled': False,
+            'onboarding_done': False,
         }
-    
-    def update_user_categories(self, user_id: int, categories: List[str]) -> bool:
-        """Update user's enabled categories"""
+
+    def get_user_settings(self, user_id: int) -> Dict:
+        """Get full user profile/settings (safe defaults)."""
         try:
-            self.execute("""
-                INSERT OR REPLACE INTO user_settings (user_id, enabled_categories, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-            """, (user_id, ','.join(categories)))
+            result = self.fetchone(
+                'SELECT enabled_categories, hide_senior, min_salary_filter, '
+                'skills, digest_enabled, onboarding_done '
+                'FROM user_settings WHERE user_id = ?',
+                (user_id,)
+            )
+        except sqlite3.OperationalError:
+            result = self.fetchone(
+                'SELECT enabled_categories, hide_senior, min_salary_filter '
+                'FROM user_settings WHERE user_id = ?',
+                (user_id,)
+            )
+            if result:
+                return {
+                    'enabled_categories': (result[0] or '').split(',') if result[0] else list(CATEGORY_NAMES_RU.keys()),
+                    'hide_senior': bool(result[1]),
+                    'min_salary_filter': int(result[2] or 0),
+                    'skills': '',
+                    'digest_enabled': False,
+                    'onboarding_done': False,
+                }
+            return self._default_settings()
+
+        if result:
+            cats = (result[0] or '').split(',') if result[0] else list(CATEGORY_NAMES_RU.keys())
+            cats = [c for c in cats if c]
+            return {
+                'enabled_categories': cats or list(CATEGORY_NAMES_RU.keys()),
+                'hide_senior': bool(result[1]) if result[1] is not None else True,
+                'min_salary_filter': int(result[2] or 0),
+                'skills': result[3] or '',
+                'digest_enabled': bool(result[4]),
+                'onboarding_done': bool(result[5]),
+            }
+        return self._default_settings()
+
+    def save_user_settings(self, user_id: int, settings: Dict) -> bool:
+        """Upsert full profile without wiping unrelated fields."""
+        cur = self.get_user_settings(user_id)
+        cur.update({k: v for k, v in settings.items() if v is not None})
+        cats = cur.get('enabled_categories') or list(CATEGORY_NAMES_RU.keys())
+        if isinstance(cats, str):
+            cats_str = cats
+        else:
+            cats_str = ','.join([c for c in cats if c])
+        try:
+            self.execute(
+                """
+                INSERT INTO user_settings (
+                    user_id, enabled_categories, hide_senior, min_salary_filter,
+                    skills, digest_enabled, onboarding_done, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    enabled_categories=excluded.enabled_categories,
+                    hide_senior=excluded.hide_senior,
+                    min_salary_filter=excluded.min_salary_filter,
+                    skills=excluded.skills,
+                    digest_enabled=excluded.digest_enabled,
+                    onboarding_done=excluded.onboarding_done,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    user_id,
+                    cats_str,
+                    1 if cur.get('hide_senior', True) else 0,
+                    int(cur.get('min_salary_filter') or 0),
+                    str(cur.get('skills') or ''),
+                    1 if cur.get('digest_enabled') else 0,
+                    1 if cur.get('onboarding_done') else 0,
+                ),
+            )
             return True
         except Exception as e:
-            logger.error(f"Error updating categories: {e}")
+            logger.error(f"Error saving user settings: {e}")
             return False
+
+    def update_user_categories(self, user_id: int, categories: List[str]) -> bool:
+        return self.save_user_settings(user_id, {'enabled_categories': categories})
     
     def hide_category_for_user(self, user_id: int, category: str) -> bool:
-        """Hide category for user"""
         settings = self.get_user_settings(user_id)
         enabled = [c for c in settings['enabled_categories'] if c != category]
         return self.update_user_categories(user_id, enabled)
+
+    def save_job_payload(self, job_hash: str, job: Dict) -> None:
+        import json as _json
+        if not job_hash:
+            return
+        try:
+            payload = serialize_job_payload(job) if GROWTH_UTILS_AVAILABLE else job
+            self.execute(
+                'INSERT OR REPLACE INTO job_payloads (hash, payload, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)',
+                (job_hash, _json.dumps(payload, ensure_ascii=False)),
+            )
+            # prune old payloads (>14 days)
+            cutoff = datetime.now() - timedelta(days=14)
+            self.execute('DELETE FROM job_payloads WHERE created_at < ?', (cutoff,))
+        except Exception as e:
+            logger.debug(f"save_job_payload failed: {e}")
+
+    def get_job_payload(self, job_hash: str) -> Optional[Dict]:
+        import json as _json
+        row = self.fetchone('SELECT payload FROM job_payloads WHERE hash = ?', (job_hash,))
+        if not row:
+            return None
+        try:
+            return _json.loads(row[0])
+        except Exception:
+            return None
+
+    def list_digest_subscribers(self) -> List[int]:
+        rows = self.fetchall(
+            'SELECT user_id FROM user_settings WHERE digest_enabled = 1'
+        )
+        return [int(r[0]) for r in rows if r and r[0]]
+
+    def recent_jobs_for_digest(self, hours: int = 36, limit: int = 80) -> List[Dict]:
+        """Load recent posts joined with payload when available."""
+        import json as _json
+        cutoff = datetime.now() - timedelta(hours=hours)
+        rows = self.fetchall(
+            'SELECT j.hash, j.title, j.company, j.level, j.category, j.url, j.source, p.payload '
+            'FROM posted_jobs j '
+            'LEFT JOIN job_payloads p ON p.hash = j.hash '
+            'WHERE j.posted_at >= ? '
+            'ORDER BY j.posted_at DESC LIMIT ?',
+            (cutoff, limit),
+        )
+        jobs = []
+        for row in rows:
+            job = {
+                'hash': row[0],
+                'title': row[1],
+                'company': row[2],
+                'level': row[3],
+                'category': row[4] or 'other',
+                'url': row[5] or '',
+                'source': row[6] or '',
+                'salary': 'Не указана',
+                'location': 'Remote',
+                'description': '',
+                'tags': [],
+            }
+            if row[7]:
+                try:
+                    job.update(_json.loads(row[7]))
+                except Exception:
+                    pass
+            jobs.append(job)
+        return jobs
 
     def log_event(self, user_id: Optional[int], name: str, props: Optional[Dict] = None) -> None:
         """Append product analytics event (local SQLite, no third-party required)."""
@@ -2170,12 +2333,18 @@ async def get_recent_channel_job_hashes(limit: Optional[int] = None) -> set:
         return set()
 
 
-async def post_job_with_bot(bot: Bot, job: Dict) -> bool:
+async def post_job_with_bot(bot: Bot, job: Dict, db: Optional[DatabaseConnection] = None) -> bool:
     """Post a job using a bare Bot instance, suitable for cron/serverless."""
     try:
+        job_hash = job.get('hash') or generate_job_hash(job)
+        job['hash'] = job_hash
+        if db:
+            db.save_job_payload(job_hash, job)
         if Config.ENABLE_MARKDOWN_V2 and FORMATTER_AVAILABLE:
             formatter = JobMessageFormatter()
-            formatted = formatter.format_job(job, view_mode='compact')
+            formatted = formatter.format_job(
+                job, view_mode='compact', bot_username=Config.BOT_USERNAME
+            )
             await bot.send_message(
                 chat_id=Config.CHANNEL_ID,
                 text=formatted.text,
@@ -2195,7 +2364,7 @@ async def post_job_with_bot(bot: Bot, job: Dict) -> bool:
     except RetryAfter as e:
         logger.warning(f"⏳ Telegram flood control: retry after {e.retry_after}s")
         await asyncio.sleep(e.retry_after)
-        return await post_job_with_bot(bot, job)
+        return await post_job_with_bot(bot, job, db=db)
     except Exception as e:
         logger.error(f"❌ Failed to post job: {e}")
         return False
@@ -2345,6 +2514,8 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
                 enrich_job_salary_fields(job)
                 if not passes_min_salary(job, Config.GLOBAL_MIN_SALARY_USD):
                     continue
+                if not passes_channel_tracks(job, Config.CHANNEL_TRACKS):
+                    continue
             if job.get('hash') in recent_hashes:
                 duplicate_count += 1
                 continue
@@ -2379,12 +2550,13 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
         posted_count = 0
         for job in selected_jobs:
             if bot:
-                posted = await post_job_with_bot(bot, job)
+                posted = await post_job_with_bot(bot, job, db=db)
             else:
                 posted = await post_job_with_telethon(job)
             if posted:
                 if db:
                     register_posted_job(job, db)
+                    db.save_job_payload(job.get('hash') or generate_job_hash(job), job)
                 recent_hashes.add(job.get('hash'))
                 posted_count += 1
                 await asyncio.sleep(DELAYS['between_posts'])
@@ -2417,6 +2589,8 @@ class JobBot:
         self.is_paused = False
         self.formatter = JobMessageFormatter() if FORMATTER_AVAILABLE else None
         self.classifier = JobClassifier() if CLASSIFIER_AVAILABLE else None
+        # /setup conversation: user_id -> step
+        self.setup_steps: Dict[int, str] = {}
     
     async def check_admin(self, update: Update) -> bool:
         """Check if user is admin"""
@@ -2431,9 +2605,10 @@ class JobBot:
         return True
     
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start (+ deep-link ref_USERID) and growth CTA."""
+        """Handle /start (+ deep-link ref_USERID / invite) and growth CTA."""
         user = update.effective_user
         user_id = user.id if user else None
+        payload = context.args[0] if context.args else None
 
         # Deep-link referral attribution
         if GROWTH_UTILS_AVAILABLE and context.args:
@@ -2443,9 +2618,7 @@ class JobBot:
                     logger.info(f"🎁 Referral: {user_id} <- {referrer_id}")
 
         if user_id:
-            self.db.log_event(user_id, 'start', {
-                'payload': (context.args[0] if context.args else None)
-            })
+            self.db.log_event(user_id, 'start', {'payload': payload})
 
         channel = Config.CHANNEL_ID
         channel_link = (
@@ -2462,16 +2635,35 @@ class JobBot:
                     f"Друг жмёт ссылку → /start — ты в счётчике."
                 )
 
+        # Invite CTA from channel keyboard button
+        if payload == 'invite' and user_id and GROWTH_UTILS_AVAILABLE and Config.BOT_USERNAME:
+            link = build_referral_link(Config.BOT_USERNAME, user_id)
+            invited = self.db.count_referrals(user_id)
+            await update.message.reply_text(
+                f"🎁 Твоя персональная ссылка:\n{link}\n\n"
+                f"Приглашено: {invited}\n"
+                f"Кидай друзьям — они жмут /start, ты в статистике."
+            )
+            return
+
+        settings = self.db.get_user_settings(user_id) if user_id else {}
+        setup_hint = ""
+        if user_id and not settings.get('onboarding_done'):
+            setup_hint = "\n\n⚙️ *Настрой профиль:* /setup — категории, зарплата, стек, личный digest."
+
         welcome_text = (
             "👋 Привет! Я собираю *Junior/Middle remote IT*-вакансии.\n\n"
-            f"📌 Главное: подпишись на канал — свежие вакансии каждые ~{Config.CHECK_INTERVAL // 60} мин:\n"
-            f"{channel_link}\n\n"
+            f"📌 Канал (лента): {channel_link}\n"
+            f"📬 Личный digest: /digest on — подборка в ЛС по твоему профилю.\n\n"
             "*Команды:*\n"
-            "/ref — твоя реферальная ссылка\n"
-            "/favorites — сохранённые вакансии\n"
+            "/setup — онбординг профиля\n"
+            "/digest on|off|now — личный дайджест\n"
+            "/profile — текущий профиль\n"
+            "/ref — реферальная ссылка\n"
+            "/favorites — сохранённые\n"
             "/categories — категории\n"
-            "/last N — последние N (admin)\n"
-            "/status — статистика (admin)"
+            "/last N · /status — admin"
+            f"{setup_hint}"
             f"{ref_line}"
         )
 
@@ -2496,6 +2688,179 @@ class JobBot:
         await update.message.reply_text(
             f"🎁 Твоя ссылка:\n{link}\n\nПриглашено: {invited}",
         )
+
+    async def cmd_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start profile onboarding wizard."""
+        user_id = update.effective_user.id
+        self.setup_steps[user_id] = 'categories'
+        self.db.log_event(user_id, 'setup_start', {})
+        settings = self.db.get_user_settings(user_id)
+        enabled = settings['enabled_categories']
+        if self.formatter:
+            keyboard = self.formatter.create_category_settings_keyboard(enabled)
+            # Add Done button for setup flow
+            rows = keyboard['inline_keyboard']
+            rows = [r for r in rows if not (len(r) == 1 and r[0].get('callback_data') == 'close_settings')]
+            rows.append([{'text': '✅ Далее: зарплата', 'callback_data': 'setup_next_salary'}])
+            await update.message.reply_text(
+                "⚙️ *Онбординг 1/4 — категории*\n"
+                "Отметь нужные (✅/❌), затем «Далее».",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+        else:
+            await update.message.reply_text(
+                "Настрой категории: /categories\n"
+                "Потом пришли min salary числом (USD, 0 = без фильтра)."
+            )
+            self.setup_steps[user_id] = 'salary'
+
+    async def cmd_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        s = self.db.get_user_settings(user_id)
+        cats = ", ".join(CATEGORY_NAMES_RU.get(c, c) for c in s['enabled_categories'][:12])
+        await update.message.reply_text(
+            "👤 Профиль\n"
+            f"Категории: {cats or '—'}\n"
+            f"Min salary (USD-ish): {s.get('min_salary_filter') or 0}\n"
+            f"Стек: {s.get('skills') or '—'}\n"
+            f"Digest: {'on' if s.get('digest_enabled') else 'off'}\n"
+            f"Onboarding: {'done' if s.get('onboarding_done') else 'incomplete'}\n"
+            f"Hide senior: {s.get('hide_senior')}"
+        )
+
+    async def cmd_digest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """ /digest on|off|now """
+        user_id = update.effective_user.id
+        arg = (context.args[0].lower() if context.args else '').strip()
+        if arg in ('on', '1', 'true', 'yes', 'да'):
+            self.db.save_user_settings(user_id, {'digest_enabled': True})
+            self.db.log_event(user_id, 'digest_on', {})
+            await update.message.reply_text(
+                "📬 Личный digest включён. Раз в сутки пришлю подборку в ЛС по профилю.\n"
+                "Сейчас: /digest now"
+            )
+            return
+        if arg in ('off', '0', 'false', 'no', 'нет'):
+            self.db.save_user_settings(user_id, {'digest_enabled': False})
+            self.db.log_event(user_id, 'digest_off', {})
+            await update.message.reply_text("📭 Личный digest выключен.")
+            return
+        if arg in ('now', 'сейчас'):
+            n = await self.send_personal_digest(user_id)
+            await update.message.reply_text(
+                f"📬 Отправлено вакансий: {n}" if n else
+                "Пока нет свежих вакансий под твой профиль. /setup"
+            )
+            return
+        s = self.db.get_user_settings(user_id)
+        await update.message.reply_text(
+            f"Digest сейчас: {'on' if s.get('digest_enabled') else 'off'}\n"
+            "Команды: /digest on | off | now"
+        )
+
+    async def send_personal_digest(self, user_id: int) -> int:
+        """Send matched jobs to user DM. Returns count sent."""
+        settings = self.db.get_user_settings(user_id)
+        jobs = self.db.recent_jobs_for_digest(
+            hours=Config.PERSONAL_DIGEST_LOOKBACK_HOURS,
+            limit=80,
+        )
+        matched = []
+        for job in jobs:
+            if GROWTH_UTILS_AVAILABLE:
+                if job_matches_profile(job, settings):
+                    matched.append(job)
+            else:
+                matched.append(job)
+            if len(matched) >= Config.PERSONAL_DIGEST_MAX:
+                break
+        if not matched:
+            return 0
+
+        header = (
+            f"📬 Твой digest ({len(matched)}):\n"
+            f"профиль: min${settings.get('min_salary_filter') or 0}, "
+            f"skills={settings.get('skills') or '—'}\n"
+        )
+        try:
+            await self.application.bot.send_message(chat_id=user_id, text=header)
+        except Exception as e:
+            logger.warning(f"digest header fail user={user_id}: {e}")
+            return 0
+
+        sent = 0
+        for job in matched:
+            try:
+                if Config.ENABLE_MARKDOWN_V2 and self.formatter:
+                    formatted = self.formatter.format_job(
+                        job, view_mode='compact', bot_username=Config.BOT_USERNAME
+                    )
+                    await self.application.bot.send_message(
+                        chat_id=user_id,
+                        text=formatted.text,
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup(
+                            formatted.reply_markup['inline_keyboard']
+                        ),
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    await self.application.bot.send_message(
+                        chat_id=user_id,
+                        text=format_job_message_legacy(job),
+                        parse_mode='HTML',
+                        disable_web_page_preview=True,
+                    )
+                sent += 1
+                await asyncio.sleep(0.4)
+            except Exception as e:
+                logger.debug(f"digest job fail: {e}")
+        self.db.log_event(user_id, 'personal_digest_sent', {'count': sent})
+        return sent
+
+    async def handle_setup_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle free-text steps of /setup wizard."""
+        user_id = update.effective_user.id if update.effective_user else None
+        if not user_id or user_id not in self.setup_steps:
+            return
+        step = self.setup_steps.get(user_id)
+        text = (update.message.text or '').strip()
+
+        if step == 'salary':
+            try:
+                # allow "1500", "$1500", "0"
+                num = int(re.sub(r'[^\d]', '', text) or '0')
+            except ValueError:
+                await update.message.reply_text("Число, например 0 или 2000 (USD-ish min).")
+                return
+            self.db.save_user_settings(user_id, {'min_salary_filter': num})
+            self.setup_steps[user_id] = 'skills'
+            await update.message.reply_text(
+                "⚙️ *Онбординг 3/4 — стек*\n"
+                "Пришли навыки через запятую, например:\n"
+                "`python, django, postgres`\n"
+                "Или `-` чтобы пропустить.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        if step == 'skills':
+            skills = '' if text in ('-', '—', 'skip', 'нет') else text[:200]
+            self.db.save_user_settings(user_id, {'skills': skills})
+            self.setup_steps[user_id] = 'digest'
+            await update.message.reply_text(
+                "⚙️ *Онбординг 4/4 — личный digest*\n"
+                "Присылать подборку в ЛС раз в сутки?",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        {'text': '✅ Да, /digest on', 'callback_data': 'setup_digest_on'},
+                        {'text': '❌ Нет', 'callback_data': 'setup_digest_off'},
+                    ]
+                ]),
+            )
+            return
     
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command"""
@@ -2642,44 +3007,99 @@ class JobBot:
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline keyboard callbacks"""
         query = update.callback_query
-        await query.answer()
-        
-        data = query.data
+        data = query.data or ''
         user_id = update.effective_user.id
+
+        # --- setup wizard ---
+        if data == 'setup_next_salary':
+            await query.answer()
+            self.setup_steps[user_id] = 'salary'
+            await query.edit_message_text(
+                "⚙️ Онбординг 2/4 — min salary\n"
+                "Пришли число в USD (годовой/ориентир), например 0 или 2500.\n"
+                "0 = без фильтра по зарплате."
+            )
+            return
+        if data == 'setup_digest_on':
+            await query.answer("Digest on")
+            self.db.save_user_settings(user_id, {
+                'digest_enabled': True,
+                'onboarding_done': True,
+            })
+            self.setup_steps.pop(user_id, None)
+            self.db.log_event(user_id, 'setup_done', {'digest': True})
+            await query.edit_message_text(
+                "✅ Профиль готов. Digest включён.\n/digest now — пробная подборка."
+            )
+            return
+        if data == 'setup_digest_off':
+            await query.answer("Digest off")
+            self.db.save_user_settings(user_id, {
+                'digest_enabled': False,
+                'onboarding_done': True,
+            })
+            self.setup_steps.pop(user_id, None)
+            self.db.log_event(user_id, 'setup_done', {'digest': False})
+            await query.edit_message_text("✅ Профиль готов. Digest выключен. /digest on — включить.")
+            return
+
+        await query.answer()
         
         if data.startswith('save:'):
             job_hash = data.split(':', 1)[1]
             self.db.add_favorite(user_id, job_hash)
             self.db.log_event(user_id, 'save_job', {'hash': job_hash})
-            await query.edit_message_text(
-                query.message.text + "\n\n💾 *Сохранено в избранное*",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=None
-            )
+            # Do not re-edit MarkdownV2 body (breaks on re-parse). DM confirm only.
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="💾 Вакансия в /favorites",
+                )
+            except Exception:
+                pass
+            return
+
+        if data.startswith('expand:') or data.startswith('compact:'):
+            mode = 'full' if data.startswith('expand:') else 'compact'
+            job_hash = data.split(':', 1)[1]
+            job = self.db.get_job_payload(job_hash)
+            if not job:
+                await query.answer("Вакансия устарела в кэше", show_alert=True)
+                return
+            job['hash'] = job_hash
+            if not self.formatter:
+                await query.answer("Formatter offline", show_alert=True)
+                return
+            try:
+                formatted = self.formatter.format_job(
+                    job, view_mode=mode, bot_username=Config.BOT_USERNAME
+                )
+                await query.edit_message_text(
+                    text=formatted.text,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=InlineKeyboardMarkup(
+                        formatted.reply_markup['inline_keyboard']
+                    ),
+                    disable_web_page_preview=True,
+                )
+                self.db.log_event(user_id, f'job_{mode}', {'hash': job_hash})
+            except Exception as e:
+                logger.error(f"expand/compact failed: {e}")
+                await query.answer("Не удалось переключить вид", show_alert=True)
+            return
         
-        elif data.startswith('expand:'):
-            # Получаем полную информацию о вакансии и показываем развернутый вид
-            await query.answer("Разворачиваю... (в разработке)")
-        
-        elif data.startswith('compact:'):
-            await query.answer("Сворачиваю... (в разработке)")
-        
-        elif data.startswith('hide_cat:'):
+        if data.startswith('hide_cat:'):
             category = data.split(':', 1)[1]
             self.db.hide_category_for_user(user_id, category)
             self.db.log_event(user_id, 'hide_category', {'category': category})
             cat_name = CATEGORY_NAMES_RU.get(category, category)
-            await query.answer(f"Категория {cat_name} скрыта")
-            await query.edit_message_text(
-                query.message.text + f"\n\n🚫 Категория '{cat_name}' скрыта",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=None
-            )
+            await query.answer(f"Скрыто: {cat_name}", show_alert=False)
+            return
         
-        elif data.startswith('toggle_cat:'):
+        if data.startswith('toggle_cat:'):
             category = data.split(':', 1)[1]
             settings = self.db.get_user_settings(user_id)
-            enabled = settings['enabled_categories']
+            enabled = list(settings['enabled_categories'])
             
             if category in enabled:
                 enabled.remove(category)
@@ -2688,26 +3108,43 @@ class JobBot:
             
             self.db.update_user_categories(user_id, enabled)
             
-            # Обновляем клавиатуру
             if self.formatter:
                 keyboard = self.formatter.create_category_settings_keyboard(enabled)
+                rows = keyboard['inline_keyboard']
+                # Keep setup "next" if user is in wizard
+                if self.setup_steps.get(user_id) == 'categories':
+                    rows = [r for r in rows if not (
+                        len(r) == 1 and r[0].get('callback_data') == 'close_settings'
+                    )]
+                    rows.append([{'text': '✅ Далее: зарплата', 'callback_data': 'setup_next_salary'}])
                 await query.edit_message_reply_markup(
-                    reply_markup=InlineKeyboardMarkup(keyboard['inline_keyboard'])
+                    reply_markup=InlineKeyboardMarkup(rows)
                 )
+            return
         
-        elif data == 'close_settings':
-            await query.delete_message()
+        if data == 'close_settings':
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
     
     async def post_job(self, job: Dict) -> bool:
         """Post job to channel with enhanced formatting"""
         if self.is_paused:
             logger.info("⏸️ Skipped posting (bot is paused)")
             return False
+
+        # Ensure hash + payload cache for expand/compact
+        job_hash = job.get('hash') or generate_job_hash(job)
+        job['hash'] = job_hash
+        self.db.save_job_payload(job_hash, job)
         
         try:
-            # Используем новый форматтер если доступен
             if Config.ENABLE_MARKDOWN_V2 and self.formatter:
-                formatted = self.formatter.format_job(job, view_mode='compact')
+                formatted = self.formatter.format_job(
+                    job, view_mode='compact', bot_username=Config.BOT_USERNAME
+                )
                 await self.application.bot.send_message(
                     chat_id=Config.CHANNEL_ID,
                     text=formatted.text,
@@ -2716,7 +3153,6 @@ class JobBot:
                     disable_web_page_preview=formatted.disable_web_page_preview
                 )
             else:
-                # Fallback на legacy HTML форматирование
                 message = format_job_message_legacy(job)
                 await self.application.bot.send_message(
                     chat_id=Config.CHANNEL_ID,
@@ -2747,7 +3183,7 @@ async def main():
     configure_webshare_proxy()
 
     logger.info("=" * 60)
-    logger.info("🚀 Job Bot Starting (v6.1 — growth P0)")
+    logger.info("🚀 Job Bot Starting (v6.2 — P1 personalization)")
     logger.info(f"📡 Channel: {Config.CHANNEL_ID}")
     logger.info(f"⏱️ Check interval: {Config.CHECK_INTERVAL}s")
     logger.info(f"📊 Max posts per cycle: {Config.MAX_POSTS_PER_CYCLE}")
@@ -2758,6 +3194,8 @@ async def main():
     logger.info(f"🔍 Fuzzy dedup: {RAPIDFUZZ_AVAILABLE} (thr={Config.FUZZY_DEDUP_THRESHOLD})")
     logger.info(f"🔀 Source diversify: {Config.ENABLE_SOURCE_DIVERSIFY}")
     logger.info(f"💵 Global min salary USD: {Config.GLOBAL_MIN_SALARY_USD}")
+    logger.info(f"📂 Channel tracks: {Config.CHANNEL_TRACKS}")
+    logger.info(f"📬 Personal digest: {Config.ENABLE_PERSONAL_DIGEST}")
     if Config.ADMIN_USER_ID:
         logger.info(f"👤 Admin user ID: {Config.ADMIN_USER_ID}")
     logger.info("=" * 60)
@@ -2777,6 +3215,9 @@ async def main():
     # Register command handlers
     application.add_handler(CommandHandler("start", job_bot.cmd_start))
     application.add_handler(CommandHandler("ref", job_bot.cmd_ref))
+    application.add_handler(CommandHandler("setup", job_bot.cmd_setup))
+    application.add_handler(CommandHandler("profile", job_bot.cmd_profile))
+    application.add_handler(CommandHandler("digest", job_bot.cmd_digest))
     application.add_handler(CommandHandler("status", job_bot.cmd_status))
     application.add_handler(CommandHandler("last", job_bot.cmd_last))
     application.add_handler(CommandHandler("favorites", job_bot.cmd_favorites))
@@ -2784,13 +3225,21 @@ async def main():
     application.add_handler(CommandHandler("pause", job_bot.cmd_pause))
     application.add_handler(CommandHandler("resume", job_bot.cmd_resume))
     application.add_handler(CallbackQueryHandler(job_bot.handle_callback))
+    # /setup free-text steps (salary, skills)
+    from telegram.ext import MessageHandler, filters as tg_filters
+    application.add_handler(
+        MessageHandler(
+            tg_filters.TEXT & ~tg_filters.COMMAND,
+            job_bot.handle_setup_text,
+        )
+    )
     
     # Start bot
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
 
-    # Daily channel digest (needs long-running process; no-op if JobQueue missing)
+    # Daily channel digest + personal DM digests
     if Config.ENABLE_DAILY_DIGEST and getattr(application, 'job_queue', None):
         async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE):
             try:
@@ -2799,21 +3248,31 @@ async def main():
                     'ORDER BY posted_at DESC LIMIT ?',
                     (Config.DIGEST_MAX_JOBS,)
                 )
-                if not rows:
-                    return
-                lines = [f"📬 Дайджест Junior/Middle ({len(rows)} шт.):\n"]
-                for i, row in enumerate(rows, 1):
-                    title, company, level, category, url, source = row
-                    lines.append(f"{i}. [{level}] {title} @ {company}")
-                    if url:
-                        lines.append(f"   {url}")
-                if Config.BOT_USERNAME:
-                    lines.append(f"\nБот: https://t.me/{Config.BOT_USERNAME}")
-                text = "\n".join(lines)[:4000]
-                await context.bot.send_message(chat_id=Config.CHANNEL_ID, text=text)
-                db.log_event(None, 'daily_digest_posted', {'count': len(rows)})
+                if rows:
+                    lines = [f"📬 Дайджест канала Junior/Middle ({len(rows)} шт.):\n"]
+                    for i, row in enumerate(rows, 1):
+                        title, company, level, category, url, source = row
+                        lines.append(f"{i}. [{level}] {title} @ {company}")
+                        if url:
+                            lines.append(f"   {url}")
+                    if Config.BOT_USERNAME:
+                        lines.append(f"\nБот: https://t.me/{Config.BOT_USERNAME}?start=invite")
+                    text = "\n".join(lines)[:4000]
+                    await context.bot.send_message(chat_id=Config.CHANNEL_ID, text=text)
+                    db.log_event(None, 'daily_digest_posted', {'count': len(rows)})
             except Exception as e:
-                logger.error(f"Daily digest failed: {e}")
+                logger.error(f"Daily channel digest failed: {e}")
+
+            # Personal digests
+            if Config.ENABLE_PERSONAL_DIGEST:
+                for uid in db.list_digest_subscribers():
+                    try:
+                        n = await job_bot.send_personal_digest(uid)
+                        if n:
+                            logger.info(f"📬 Personal digest → {uid}: {n} jobs")
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        logger.warning(f"Personal digest fail user={uid}: {e}")
 
         try:
             from datetime import time as dt_time
@@ -2822,7 +3281,7 @@ async def main():
                 time=dt_time(hour=Config.DIGEST_HOUR_UTC, minute=0),
                 name='daily_job_digest',
             )
-            logger.info(f"📬 Daily digest scheduled at {Config.DIGEST_HOUR_UTC}:00 UTC")
+            logger.info(f"📬 Digests scheduled at {Config.DIGEST_HOUR_UTC}:00 UTC")
         except Exception as e:
             logger.warning(f"JobQueue digest not scheduled: {e}")
     
@@ -2881,6 +3340,8 @@ async def main():
                 if GROWTH_UTILS_AVAILABLE:
                     enrich_job_salary_fields(job)
                     if not passes_min_salary(job, Config.GLOBAL_MIN_SALARY_USD):
+                        continue
+                    if not passes_channel_tracks(job, Config.CHANNEL_TRACKS):
                         continue
                 
                 classified_jobs.append(job)
