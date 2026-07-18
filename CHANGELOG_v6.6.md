@@ -3,9 +3,11 @@
 ## Source auto-skip
 
 - `SourceHealthRegistry` tracks **fail streak** on hard errors
-- After `SOURCE_FAIL_SKIP` consecutive failures (default **3**), source is skipped next cycles until a success
-- Admin `/sources` shows fail×N and ⏭️ skip markers
+- After `SOURCE_FAIL_SKIP` consecutive failures (default **3**), source is skipped for N cycles, then **probed once** (no permanent skip)
+- Success clears streak + cooldown
+- Admin `/sources` shows fail×N, cooldown, ⏭️ markers
 - Set `SOURCE_FAIL_SKIP=0` to disable
+- Windows: signal handlers wrapped (no crash on ProactorEventLoop)
 
 ## Publish ranking
 

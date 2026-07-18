@@ -3893,10 +3893,13 @@ async def main():
     
     logger.info("✅ Telegram bot started with admin commands")
     
-    # Setup graceful shutdown
+    # Setup graceful shutdown (Unix only — Windows ProactorEventLoop has no add_signal_handler)
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s, application, db)))
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s, application, db)))
+    except (NotImplementedError, RuntimeError) as e:
+        logger.warning(f"Signal handlers not available on this platform: {e}")
     
     # Main collection loop
     api_fetch_functions = get_api_fetch_functions()

@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
@@ -496,6 +496,8 @@ class SourceHealthRegistry:
     def __init__(self):
         self._rows: Dict[str, Dict] = {}
         self._fail_streak: Dict[str, int] = {}
+        # After threshold, skip this many cycles then probe once (avoids permanent skip).
+        self._cooldown_left: Dict[str, int] = {}
 
     def record(self, name: str, fetched: int, error: str = "", elapsed_ms: int = 0) -> None:
         err = (error or "").strip()
@@ -503,24 +505,40 @@ class SourceHealthRegistry:
             self._fail_streak[name] = self._fail_streak.get(name, 0) + 1
         else:
             self._fail_streak[name] = 0
+            self._cooldown_left[name] = 0
         self._rows[name] = {
             "name": name,
             "fetched": int(fetched),
             "error": err,
             "elapsed_ms": int(elapsed_ms),
-            "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "ok": not err,
             "fail_streak": self._fail_streak.get(name, 0),
+            "cooldown_left": self._cooldown_left.get(name, 0),
         }
 
     def fail_streak(self, name: str) -> int:
         return int(self._fail_streak.get(name, 0))
 
     def should_skip(self, name: str, max_fails: int = 3) -> bool:
-        """Skip source after N consecutive hard failures (max_fails<=0 disables)."""
+        """
+        After N consecutive hard failures, skip for N cycles, then probe once.
+        max_fails<=0 disables. Success in record() clears streak + cooldown.
+        """
         if not max_fails or max_fails <= 0:
             return False
-        return self.fail_streak(name) >= int(max_fails)
+        if self.fail_streak(name) < int(max_fails):
+            return False
+        left = int(self._cooldown_left.get(name, 0))
+        if left <= 0:
+            # Enter / re-enter cooldown window, skip this cycle
+            self._cooldown_left[name] = int(max_fails)
+            return True
+        self._cooldown_left[name] = left - 1
+        if self._cooldown_left[name] <= 0:
+            # Cooldown exhausted → allow one probe this cycle
+            return False
+        return True
 
     def snapshot(self) -> List[Dict]:
         return sorted(self._rows.values(), key=lambda r: r["name"].lower())
@@ -550,6 +568,9 @@ class SourceHealthRegistry:
                 line += f" ({r['elapsed_ms']}ms)"
             if streak:
                 line += f" fail×{streak}"
+            cd = int(r.get("cooldown_left") or 0)
+            if cd:
+                line += f" cd={cd}"
             if r["error"]:
                 line += f" — {r['error'][:80]}"
             lines.append(line)

@@ -31,8 +31,13 @@ class SourceHealthTests(unittest.TestCase):
         SOURCE_HEALTH.record(name, 0, error="boom")
         SOURCE_HEALTH.record(name, 0, error="boom")
         self.assertEqual(SOURCE_HEALTH.fail_streak(name), 3)
+        # first call after threshold → skip and arm cooldown
         self.assertTrue(SOURCE_HEALTH.should_skip(name, max_fails=3))
         self.assertFalse(SOURCE_HEALTH.should_skip(name, max_fails=0))
+        # burn cooldown (max_fails-1 more skips), then probe allowed
+        for _ in range(2):
+            self.assertTrue(SOURCE_HEALTH.should_skip(name, max_fails=3))
+        self.assertFalse(SOURCE_HEALTH.should_skip(name, max_fails=3))  # probe
         # success resets
         SOURCE_HEALTH.record(name, 2, error="")
         self.assertEqual(SOURCE_HEALTH.fail_streak(name), 0)
