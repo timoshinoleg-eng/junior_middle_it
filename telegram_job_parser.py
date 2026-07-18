@@ -32,9 +32,12 @@ try:
     from telethon import TelegramClient
     from telethon.sessions import StringSession
     from telethon.tl.types import Message
+    from telethon.errors import FloodWaitError, RPCError
     TELETHON_AVAILABLE = True
 except ImportError:
     TELETHON_AVAILABLE = False
+    FloodWaitError = None  # type: ignore
+    RPCError = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -894,32 +897,49 @@ class TelegramJobParser:
         
         jobs = []
         
-        try:
-            # Получаем entity канала
-            entity = await self.client.get_entity(channel_config['username'])
-            
-            # Вычисляем время, с которого начинать
-            since_time = datetime.now() - timedelta(hours=hours_back)
-            
-            # Получаем сообщения
-            message_count = 0
-            async for message in self.client.iter_messages(entity, limit=50):
-                message_count += 1
+        import asyncio
+
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Получаем entity канала
+                entity = await self.client.get_entity(channel_config['username'])
                 
-                # Пропускаем старые сообщения
-                if message.date and message.date.replace(tzinfo=None) < since_time:
-                    break
+                # Вычисляем время, с которого начинать
+                since_time = datetime.now() - timedelta(hours=hours_back)
                 
-                # Парсим сообщение
-                job = self._parse_message(message, channel_config)
-                if job:
-                    jobs.append(job)
-            
-            logger.info(f"📥 Получено {len(jobs)} вакансий из {channel_config['name']} "
-                       f"(проверено {message_count} сообщений)")
-        
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения сообщений из {channel_key}: {e}")
+                # Получаем сообщения
+                message_count = 0
+                async for message in self.client.iter_messages(entity, limit=50):
+                    message_count += 1
+                    
+                    # Пропускаем старые сообщения
+                    if message.date and message.date.replace(tzinfo=None) < since_time:
+                        break
+                    
+                    # Парсим сообщение
+                    job = self._parse_message(message, channel_config)
+                    if job:
+                        jobs.append(job)
+                
+                logger.info(
+                    f"📥 Получено {len(jobs)} вакансий из {channel_config['name']} "
+                    f"(проверено {message_count} сообщений)"
+                )
+                break
+
+            except Exception as e:
+                # FloodWait: sleep and retry
+                if FloodWaitError and isinstance(e, FloodWaitError):
+                    wait = int(getattr(e, 'seconds', 30)) + 1
+                    logger.warning(
+                        f"⏳ FloodWait на {channel_key}: sleep {wait}s "
+                        f"(attempt {attempt}/{max_attempts})"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error(f"❌ Ошибка получения сообщений из {channel_key}: {e}")
+                break
         
         return jobs
     
@@ -946,6 +966,9 @@ class TelegramJobParser:
                 key=lambda x: x[1].get('priority', 2)
             )
             
+            import asyncio
+            base_delay = float(os.getenv('TELEGRAM_CHANNEL_DELAY', '1.5'))
+
             for channel_key, config in sorted_channels:
                 try:
                     jobs = await self.fetch_channel_jobs(channel_key, hours_back)
@@ -959,11 +982,15 @@ class TelegramJobParser:
                             # Для агрегаторов пропускаем дубли
                             logger.debug(f"⏭️ Дубликат пропущен: {job.title}")
                     
-                    # Небольшая задержка между каналами
-                    import asyncio
-                    await asyncio.sleep(1)
+                    # Jitter between channels — reduces FloodWait probability
+                    await asyncio.sleep(base_delay + (hash(channel_key) % 10) * 0.1)
                 
                 except Exception as e:
+                    if FloodWaitError and isinstance(e, FloodWaitError):
+                        wait = int(getattr(e, 'seconds', 30)) + 1
+                        logger.warning(f"⏳ FloodWait between channels: sleep {wait}s")
+                        await asyncio.sleep(wait)
+                        continue
                     logger.error(f"❌ Ошибка обработки канала {channel_key}: {e}")
                     continue
         

@@ -1,7 +1,10 @@
 # Core dependencies
-python-telegram-bot==20.6
+python-telegram-bot[job-queue]==20.6
 python-dotenv==1.0.0
 requests==2.31.0
+
+# Growth P0: fuzzy cross-source dedup
+rapidfuzz>=3.6.0
 
 # Telegram channel parsing (optional)
 # Установите для работы с Telegram-каналами:

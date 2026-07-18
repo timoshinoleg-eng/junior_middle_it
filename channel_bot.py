@@ -70,11 +70,28 @@ except ImportError:
     FORMATTER_AVAILABLE = False
     logging.warning("⚠️ message_formatter не найден, используется стандартное форматирование")
 
+try:
+    from growth_utils import (
+        RAPIDFUZZ_AVAILABLE,
+        build_referral_link,
+        enrich_job_salary_fields,
+        fuzzy_is_near_duplicate,
+        job_fingerprint,
+        parse_start_payload,
+        passes_min_salary,
+    )
+    GROWTH_UTILS_AVAILABLE = True
+except ImportError:
+    GROWTH_UTILS_AVAILABLE = False
+    RAPIDFUZZ_AVAILABLE = False
+    logging.warning("⚠️ growth_utils не найден, fuzzy/referral helpers отключены")
+
 # ==================== CONFIGURATION ====================
 class Config:
     """Application configuration with validation"""
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
     CHANNEL_ID = os.getenv('CHANNEL_ID', '')
+    BOT_USERNAME = os.getenv('BOT_USERNAME', '').lstrip('@')
     WEBSHARE_API_KEY = os.getenv('WEBSHARE_API_KEY') or os.getenv('WEBSHARE_TOKEN')
     WEBSHARE_COUNTRIES = os.getenv('WEBSHARE_COUNTRIES', '')
     SUPERJOB_API_KEY = os.getenv('SUPERJOB_API_KEY')
@@ -114,6 +131,14 @@ class Config:
     ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
     ENABLE_TELEGRAM_CHANNELS = os.getenv('ENABLE_TELEGRAM_CHANNELS', 'true').lower() == 'true'
     ENABLE_MARKDOWN_V2 = os.getenv('ENABLE_MARKDOWN_V2', 'true').lower() == 'true'
+    # Growth / quality (v6.1)
+    FUZZY_DEDUP_THRESHOLD = env_int('FUZZY_DEDUP_THRESHOLD', 90)
+    FUZZY_DEDUP_LOOKBACK = env_int('FUZZY_DEDUP_LOOKBACK', 250)
+    GLOBAL_MIN_SALARY_USD = env_int('GLOBAL_MIN_SALARY_USD', 0)
+    ENABLE_SOURCE_DIVERSIFY = os.getenv('ENABLE_SOURCE_DIVERSIFY', 'true').lower() == 'true'
+    ENABLE_DAILY_DIGEST = os.getenv('ENABLE_DAILY_DIGEST', 'true').lower() == 'true'
+    DIGEST_HOUR_UTC = env_int('DIGEST_HOUR_UTC', 9)
+    DIGEST_MAX_JOBS = env_int('DIGEST_MAX_JOBS', 7)
     
     @classmethod
     def validate(cls) -> bool:
@@ -433,12 +458,35 @@ class DatabaseConnection:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Product analytics events (start, save, share, referral)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                user_id INTEGER,
+                name TEXT NOT NULL,
+                props TEXT DEFAULT '{}'
+            )
+        """)
+
+        # Referral graph: invitee -> referrer (first touch wins)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS referrals (
+                user_id INTEGER PRIMARY KEY,
+                referrer_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         
         # Indexes
         c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_category ON posted_jobs(category)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_posted_at ON posted_jobs(posted_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_favorites_user ON user_favorites(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tg_hashes_created ON telegram_content_hashes(created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_events_name_ts ON events(name, ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
         
         # Meta table for one-shot migrations and flags
         c.execute("""
@@ -454,6 +502,13 @@ class DatabaseConnection:
             c.execute("SELECT category FROM posted_jobs LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE posted_jobs ADD COLUMN category TEXT DEFAULT 'other'")
+
+        # Migration: fingerprint for fuzzy dedup
+        try:
+            c.execute("SELECT fingerprint FROM posted_jobs LIMIT 1")
+        except sqlite3.OperationalError:
+            c.execute("ALTER TABLE posted_jobs ADD COLUMN fingerprint TEXT DEFAULT ''")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_fingerprint ON posted_jobs(fingerprint)")
         
         self.conn.commit()
         logger.info("✅ Database initialized")
@@ -569,6 +624,52 @@ class DatabaseConnection:
         enabled = [c for c in settings['enabled_categories'] if c != category]
         return self.update_user_categories(user_id, enabled)
 
+    def log_event(self, user_id: Optional[int], name: str, props: Optional[Dict] = None) -> None:
+        """Append product analytics event (local SQLite, no third-party required)."""
+        import json as _json
+        try:
+            self.execute(
+                'INSERT INTO events (user_id, name, props) VALUES (?, ?, ?)',
+                (user_id, name, _json.dumps(props or {}, ensure_ascii=False))
+            )
+        except Exception as e:
+            logger.debug(f"event log failed: {e}")
+
+    def register_referral(self, user_id: int, referrer_id: int) -> bool:
+        """First-touch referral attribution. Ignores self-ref and duplicates."""
+        if not user_id or not referrer_id or user_id == referrer_id:
+            return False
+        try:
+            existing = self.fetchone('SELECT 1 FROM referrals WHERE user_id = ?', (user_id,))
+            if existing:
+                return False
+            self.execute(
+                'INSERT INTO referrals (user_id, referrer_id) VALUES (?, ?)',
+                (user_id, referrer_id)
+            )
+            self.log_event(user_id, 'referral_attributed', {'referrer_id': referrer_id})
+            self.log_event(referrer_id, 'referral_invite_accepted', {'invitee_id': user_id})
+            return True
+        except Exception as e:
+            logger.error(f"referral register failed: {e}")
+            return False
+
+    def count_referrals(self, referrer_id: int) -> int:
+        row = self.fetchone(
+            'SELECT COUNT(*) FROM referrals WHERE referrer_id = ?',
+            (referrer_id,)
+        )
+        return int(row[0]) if row else 0
+
+    def recent_fingerprints(self, limit: int = 250) -> List[str]:
+        rows = self.fetchall(
+            'SELECT fingerprint FROM posted_jobs '
+            'WHERE fingerprint IS NOT NULL AND fingerprint != "" '
+            'ORDER BY posted_at DESC LIMIT ?',
+            (limit,)
+        )
+        return [r[0] for r in rows if r and r[0]]
+
 
 def init_database() -> DatabaseConnection:
     """Initialize and return database connection"""
@@ -604,8 +705,8 @@ def extract_urls_from_text(text: str) -> List[str]:
     return [url.rstrip(').,]>\'"') for url in re.findall(r'https?://[^\s\])>]+', text)]
 
 
-def is_duplicate_job(job: Dict, db: DatabaseConnection) -> bool:
-    """Check job deduplication with cleanup."""
+def is_duplicate_job(job: Dict, db: DatabaseConnection, recent_fps: Optional[List[str]] = None) -> bool:
+    """Exact URL-hash + fuzzy title/company dedup against recent posts."""
     # Cleanup old records (>7 days)
     cleanup_threshold = datetime.now() - timedelta(days=7)
     db.execute('DELETE FROM posted_jobs WHERE posted_at < ?', (cleanup_threshold,))
@@ -619,6 +720,13 @@ def is_duplicate_job(job: Dict, db: DatabaseConnection) -> bool:
         logger.debug(f"⏭️ Duplicate skipped: {job.get('title', 'N/A')}")
         return True
 
+    # Fuzzy near-duplicate (cross-source same role, different URL)
+    if GROWTH_UTILS_AVAILABLE:
+        fps = recent_fps if recent_fps is not None else db.recent_fingerprints(Config.FUZZY_DEDUP_LOOKBACK)
+        if fuzzy_is_near_duplicate(job, fps, threshold=Config.FUZZY_DEDUP_THRESHOLD):
+            logger.debug(f"⏭️ Fuzzy duplicate skipped: {job.get('title', 'N/A')}")
+            return True
+
     return False
 
 
@@ -626,18 +734,39 @@ def register_posted_job(job: Dict, db: DatabaseConnection) -> None:
     """Register a job after it has been successfully posted."""
     job_hash = job.get('hash') or generate_job_hash(job)
     job['hash'] = job_hash
-    db.execute(
-        'INSERT OR IGNORE INTO posted_jobs (hash, title, company, level, url, source, category) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        (
-            job_hash,
-            job.get('title', ''),
-            job.get('company', ''),
-            job.get('level', 'Junior'),
-            job.get('url', ''),
-            job.get('source', ''),
-            job.get('category', 'other')
+    fp = ''
+    if GROWTH_UTILS_AVAILABLE:
+        fp = job_fingerprint(job)
+        job['fingerprint'] = fp
+    try:
+        db.execute(
+            'INSERT OR IGNORE INTO posted_jobs (hash, title, company, level, url, source, category, fingerprint) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                job_hash,
+                job.get('title', ''),
+                job.get('company', ''),
+                job.get('level', 'Junior'),
+                job.get('url', ''),
+                job.get('source', ''),
+                job.get('category', 'other'),
+                fp,
+            )
         )
-    )
+    except sqlite3.OperationalError:
+        # Pre-migration DBs without fingerprint column
+        db.execute(
+            'INSERT OR IGNORE INTO posted_jobs (hash, title, company, level, url, source, category) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (
+                job_hash,
+                job.get('title', ''),
+                job.get('company', ''),
+                job.get('level', 'Junior'),
+                job.get('url', ''),
+                job.get('source', ''),
+                job.get('category', 'other')
+            )
+        )
     logger.debug(f"💾 Saved new job: {job.get('title', 'N/A')}")
 
 
@@ -907,7 +1036,10 @@ def auto_classify_category(job: Dict) -> str:
 
 
 def extract_salary(job: Dict) -> str:
-    """Extract and format salary"""
+    """Extract and format salary; side-effect: attach salary_min_usd when possible."""
+    if GROWTH_UTILS_AVAILABLE:
+        enrich_job_salary_fields(job)
+
     salary_raw = job.get('salary', '')
     if salary_raw and salary_raw not in ['', 'Not specified', 'Не указана']:
         return salary_raw
@@ -2207,27 +2339,37 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
 
         publish_candidates = []
         duplicate_count = failed_count = 0
+        recent_fps = db.recent_fingerprints(Config.FUZZY_DEDUP_LOOKBACK) if db else []
         for job in classified_jobs:
+            if GROWTH_UTILS_AVAILABLE:
+                enrich_job_salary_fields(job)
+                if not passes_min_salary(job, Config.GLOBAL_MIN_SALARY_USD):
+                    continue
             if job.get('hash') in recent_hashes:
                 duplicate_count += 1
                 continue
-            if db and is_duplicate_job(job, db):
+            if db and is_duplicate_job(job, db, recent_fps=recent_fps):
                 duplicate_count += 1
                 continue
             publish_candidates.append(job)
+            if GROWTH_UTILS_AVAILABLE:
+                recent_fps.insert(0, job_fingerprint(job))
 
-        selected_jobs = publish_candidates
-        selected_jobs.sort(key=job_quality_score, reverse=True)
-
-        # Soft cap: publish top N best jobs per cycle to protect serverless timeouts
-        total_selected = len(selected_jobs)
-        if total_selected > Config.MAX_POSTS_PER_CYCLE:
-            logger.info(f"🎯 Отобрано {total_selected} вакансий для публикации (лимит {Config.MAX_POSTS_PER_CYCLE})")
-            if Config.MAX_POSTS_PER_CYCLE > 40:
-                logger.warning(f"⚠️ Лимит публикации ({Config.MAX_POSTS_PER_CYCLE}) превышает 40 — риск таймаута в serverless-окружении")
-            selected_jobs = selected_jobs[:Config.MAX_POSTS_PER_CYCLE]
+        # Soft cap with round-robin by source (quality-preserving diversify)
+        total_selected = len(publish_candidates)
+        if Config.ENABLE_SOURCE_DIVERSIFY:
+            selected_jobs = diversify_jobs_by_source(publish_candidates, Config.MAX_POSTS_PER_CYCLE)
         else:
-            logger.info(f"🎯 Отобрано {total_selected} вакансий для публикации (лимит {Config.MAX_POSTS_PER_CYCLE})")
+            publish_candidates.sort(key=job_quality_score, reverse=True)
+            selected_jobs = publish_candidates[:Config.MAX_POSTS_PER_CYCLE]
+        logger.info(
+            f"🎯 Отобрано {len(selected_jobs)}/{total_selected} вакансий "
+            f"(лимит {Config.MAX_POSTS_PER_CYCLE}, diversify={Config.ENABLE_SOURCE_DIVERSIFY})"
+        )
+        if Config.MAX_POSTS_PER_CYCLE > 40:
+            logger.warning(
+                f"⚠️ Лимит публикации ({Config.MAX_POSTS_PER_CYCLE}) превышает 40 — риск таймаута в serverless"
+            )
 
         selected_sources = {}
         for job in selected_jobs:
@@ -2289,21 +2431,70 @@ class JobBot:
         return True
     
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        welcome_text = (
-            "👋 Привет! Я бот для сбора IT-вакансий Junior/Middle уровня.\n\n"
-            "*Доступные команды:*\n"
-            "/status - Статистика бота\n"
-            "/last N - Последние N вакансий\n"
-            "/favorites - Мои сохраненные вакансии\n"
-            "/categories - Настройка категорий\n"
-            "/pause - Приостановить публикацию (admin)\n"
-            "/resume - Возобновить публикацию (admin)"
+        """Handle /start (+ deep-link ref_USERID) and growth CTA."""
+        user = update.effective_user
+        user_id = user.id if user else None
+
+        # Deep-link referral attribution
+        if GROWTH_UTILS_AVAILABLE and context.args:
+            kind, referrer_id = parse_start_payload(context.args)
+            if kind == 'ref' and referrer_id and user_id:
+                if self.db.register_referral(user_id, referrer_id):
+                    logger.info(f"🎁 Referral: {user_id} <- {referrer_id}")
+
+        if user_id:
+            self.db.log_event(user_id, 'start', {
+                'payload': (context.args[0] if context.args else None)
+            })
+
+        channel = Config.CHANNEL_ID
+        channel_link = (
+            f"https://t.me/{channel.lstrip('@')}"
+            if channel.startswith('@') else channel
         )
-        
+        ref_line = ''
+        if GROWTH_UTILS_AVAILABLE and Config.BOT_USERNAME and user_id:
+            link = build_referral_link(Config.BOT_USERNAME, user_id)
+            if link:
+                invited = self.db.count_referrals(user_id)
+                ref_line = (
+                    f"\n\n🎁 *Твоя рефералка* (приглашено: {invited}):\n`{link}`\n"
+                    f"Друг жмёт ссылку → /start — ты в счётчике."
+                )
+
+        welcome_text = (
+            "👋 Привет! Я собираю *Junior/Middle remote IT*-вакансии.\n\n"
+            f"📌 Главное: подпишись на канал — свежие вакансии каждые ~{Config.CHECK_INTERVAL // 60} мин:\n"
+            f"{channel_link}\n\n"
+            "*Команды:*\n"
+            "/ref — твоя реферальная ссылка\n"
+            "/favorites — сохранённые вакансии\n"
+            "/categories — категории\n"
+            "/last N — последние N (admin)\n"
+            "/status — статистика (admin)"
+            f"{ref_line}"
+        )
+
+        await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
+
+    async def cmd_ref(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show personal referral deep-link."""
+        user_id = update.effective_user.id if update.effective_user else None
+        if not user_id:
+            return
+        self.db.log_event(user_id, 'ref_view', {})
+        if not Config.BOT_USERNAME:
+            await update.message.reply_text(
+                "Задайте BOT_USERNAME в .env (без @), чтобы рефералка заработала."
+            )
+            return
+        if not GROWTH_UTILS_AVAILABLE:
+            await update.message.reply_text("growth_utils недоступен.")
+            return
+        link = build_referral_link(Config.BOT_USERNAME, user_id)
+        invited = self.db.count_referrals(user_id)
         await update.message.reply_text(
-            welcome_text,
-            parse_mode=ParseMode.MARKDOWN
+            f"🎁 Твоя ссылка:\n{link}\n\nПриглашено: {invited}",
         )
     
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2459,6 +2650,7 @@ class JobBot:
         if data.startswith('save:'):
             job_hash = data.split(':', 1)[1]
             self.db.add_favorite(user_id, job_hash)
+            self.db.log_event(user_id, 'save_job', {'hash': job_hash})
             await query.edit_message_text(
                 query.message.text + "\n\n💾 *Сохранено в избранное*",
                 parse_mode=ParseMode.MARKDOWN,
@@ -2475,6 +2667,7 @@ class JobBot:
         elif data.startswith('hide_cat:'):
             category = data.split(':', 1)[1]
             self.db.hide_category_for_user(user_id, category)
+            self.db.log_event(user_id, 'hide_category', {'category': category})
             cat_name = CATEGORY_NAMES_RU.get(category, category)
             await query.answer(f"Категория {cat_name} скрыта")
             await query.edit_message_text(
@@ -2554,7 +2747,7 @@ async def main():
     configure_webshare_proxy()
 
     logger.info("=" * 60)
-    logger.info("🚀 Job Bot Starting (v6.0 - Enhanced Edition)")
+    logger.info("🚀 Job Bot Starting (v6.1 — growth P0)")
     logger.info(f"📡 Channel: {Config.CHANNEL_ID}")
     logger.info(f"⏱️ Check interval: {Config.CHECK_INTERVAL}s")
     logger.info(f"📊 Max posts per cycle: {Config.MAX_POSTS_PER_CYCLE}")
@@ -2562,6 +2755,9 @@ async def main():
     logger.info(f"📱 Telegram channels: {Config.ENABLE_TELEGRAM_CHANNELS}")
     logger.info(f"🧠 Classifier: {CLASSIFIER_AVAILABLE}")
     logger.info(f"🎨 Formatter: {FORMATTER_AVAILABLE}")
+    logger.info(f"🔍 Fuzzy dedup: {RAPIDFUZZ_AVAILABLE} (thr={Config.FUZZY_DEDUP_THRESHOLD})")
+    logger.info(f"🔀 Source diversify: {Config.ENABLE_SOURCE_DIVERSIFY}")
+    logger.info(f"💵 Global min salary USD: {Config.GLOBAL_MIN_SALARY_USD}")
     if Config.ADMIN_USER_ID:
         logger.info(f"👤 Admin user ID: {Config.ADMIN_USER_ID}")
     logger.info("=" * 60)
@@ -2570,12 +2766,17 @@ async def main():
     db = init_database()
     run_hash_migration(db)
     
-    # Setup Telegram bot
-    application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
+    # Setup Telegram bot (job-queue optional for digests)
+    builder = Application.builder().token(Config.TELEGRAM_BOT_TOKEN)
+    try:
+        application = builder.build()
+    except Exception:
+        application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
     job_bot = JobBot(application, db)
     
     # Register command handlers
     application.add_handler(CommandHandler("start", job_bot.cmd_start))
+    application.add_handler(CommandHandler("ref", job_bot.cmd_ref))
     application.add_handler(CommandHandler("status", job_bot.cmd_status))
     application.add_handler(CommandHandler("last", job_bot.cmd_last))
     application.add_handler(CommandHandler("favorites", job_bot.cmd_favorites))
@@ -2588,6 +2789,42 @@ async def main():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
+
+    # Daily channel digest (needs long-running process; no-op if JobQueue missing)
+    if Config.ENABLE_DAILY_DIGEST and getattr(application, 'job_queue', None):
+        async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE):
+            try:
+                rows = db.fetchall(
+                    'SELECT title, company, level, category, url, source FROM posted_jobs '
+                    'ORDER BY posted_at DESC LIMIT ?',
+                    (Config.DIGEST_MAX_JOBS,)
+                )
+                if not rows:
+                    return
+                lines = [f"📬 Дайджест Junior/Middle ({len(rows)} шт.):\n"]
+                for i, row in enumerate(rows, 1):
+                    title, company, level, category, url, source = row
+                    lines.append(f"{i}. [{level}] {title} @ {company}")
+                    if url:
+                        lines.append(f"   {url}")
+                if Config.BOT_USERNAME:
+                    lines.append(f"\nБот: https://t.me/{Config.BOT_USERNAME}")
+                text = "\n".join(lines)[:4000]
+                await context.bot.send_message(chat_id=Config.CHANNEL_ID, text=text)
+                db.log_event(None, 'daily_digest_posted', {'count': len(rows)})
+            except Exception as e:
+                logger.error(f"Daily digest failed: {e}")
+
+        try:
+            from datetime import time as dt_time
+            application.job_queue.run_daily(
+                daily_digest_job,
+                time=dt_time(hour=Config.DIGEST_HOUR_UTC, minute=0),
+                name='daily_job_digest',
+            )
+            logger.info(f"📬 Daily digest scheduled at {Config.DIGEST_HOUR_UTC}:00 UTC")
+        except Exception as e:
+            logger.warning(f"JobQueue digest not scheduled: {e}")
     
     logger.info("✅ Telegram bot started with admin commands")
     
@@ -2640,32 +2877,40 @@ async def main():
                 # Auto-classify category
                 category = auto_classify_category(job)
                 job['category'] = category
+
+                if GROWTH_UTILS_AVAILABLE:
+                    enrich_job_salary_fields(job)
+                    if not passes_min_salary(job, Config.GLOBAL_MIN_SALARY_USD):
+                        continue
                 
                 classified_jobs.append(job)
             
             logger.info(f"🎯 Suitable Junior/Middle jobs: {len(classified_jobs)}")
             
-            # Deduplicate and sort by quality before posting
+            # Deduplicate (exact + fuzzy) then diversify by source
             publish_candidates = []
             duplicate_count = 0
+            recent_fps = db.recent_fingerprints(Config.FUZZY_DEDUP_LOOKBACK)
             for job in classified_jobs:
-                if is_duplicate_job(job, db):
+                if is_duplicate_job(job, db, recent_fps=recent_fps):
                     duplicate_count += 1
                     continue
                 publish_candidates.append(job)
+                if GROWTH_UTILS_AVAILABLE:
+                    recent_fps.insert(0, job_fingerprint(job))
 
-            publish_candidates.sort(key=job_quality_score, reverse=True)
-
-            # Soft cap: publish top N best jobs per cycle
-            total_selected = len(publish_candidates)
-            if total_selected > Config.MAX_POSTS_PER_CYCLE:
-                logger.info(f"🎯 Отобрано {total_selected} вакансий для публикации (лимит {Config.MAX_POSTS_PER_CYCLE})")
-                if Config.MAX_POSTS_PER_CYCLE > 40:
-                    logger.warning(f"⚠️ Лимит публикации ({Config.MAX_POSTS_PER_CYCLE}) превышает 40 — риск таймаута в serverless-окружении")
-                selected_jobs = publish_candidates[:Config.MAX_POSTS_PER_CYCLE]
+            if Config.ENABLE_SOURCE_DIVERSIFY:
+                selected_jobs = diversify_jobs_by_source(
+                    publish_candidates, Config.MAX_POSTS_PER_CYCLE
+                )
             else:
-                logger.info(f"🎯 Отобрано {total_selected} вакансий для публикации (лимит {Config.MAX_POSTS_PER_CYCLE})")
-                selected_jobs = publish_candidates
+                publish_candidates.sort(key=job_quality_score, reverse=True)
+                selected_jobs = publish_candidates[:Config.MAX_POSTS_PER_CYCLE]
+
+            logger.info(
+                f"🎯 Отобрано {len(selected_jobs)}/{len(publish_candidates)} "
+                f"(лимит {Config.MAX_POSTS_PER_CYCLE}, diversify={Config.ENABLE_SOURCE_DIVERSIFY})"
+            )
 
             # Post all suitable jobs with rate-limiting
             posted_count = 0
