@@ -4064,6 +4064,7 @@ async def main():
             CYCLE_TELEMETRY["posted_total"] += posted_count
             CYCLE_TELEMETRY["fetched_total"] = len(all_jobs)
             CYCLE_TELEMETRY["cycles_done"] += 1
+            CYCLE_TELEMETRY["failed_posts"] = failed_count
 
             # Realtime DM alerts for matching subscribers
             if posted_jobs and Config.ENABLE_REALTIME_ALERTS:
