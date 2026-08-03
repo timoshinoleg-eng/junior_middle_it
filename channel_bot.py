@@ -3765,6 +3765,19 @@ class JobBot:
         return any_ok
 
 # ==================== MAIN LOOP ====================
+# Lightweight telemetry for external monitoring (render_main /health)
+CYCLE_TELEMETRY = {
+    "cycles_done": 0,
+    "cycle_started_at": None,
+    "last_source": None,
+    "sources_done": 0,
+    "sources_total": 0,
+    "fetched_total": 0,
+    "posted_last_cycle": 0,
+    "posted_total": 0,
+}
+
+
 async def main():
     """Main application loop"""
     if not Config.validate():
@@ -3925,7 +3938,8 @@ async def main():
     
     # Main collection loop
     api_fetch_functions = get_api_fetch_functions()
-    
+    CYCLE_TELEMETRY["sources_total"] = len(api_fetch_functions)
+
     while True:
         try:
             if job_bot.is_paused:
@@ -3934,6 +3948,8 @@ async def main():
                 continue
             
             logger.info("🔄 Starting job collection cycle...")
+            CYCLE_TELEMETRY["cycle_started_at"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+            CYCLE_TELEMETRY["sources_done"] = 0
             all_jobs = []
             
             # Fetch from API sources
@@ -3942,6 +3958,8 @@ async def main():
                     None, safe_fetch_with_retry, fetch_func, source_name
                 )
                 all_jobs.extend(jobs)
+                CYCLE_TELEMETRY["last_source"] = source_name
+                CYCLE_TELEMETRY["sources_done"] += 1
                 logger.info(f"📥 Fetched {len(jobs)} jobs from {source_name}")
             
             # Fetch from Telegram channels
@@ -4027,6 +4045,10 @@ async def main():
                 f"✅ Posted {posted_count} new jobs to channel "
                 f"(duplicates skipped: {duplicate_count}, failed: {failed_count})"
             )
+            CYCLE_TELEMETRY["posted_last_cycle"] = posted_count
+            CYCLE_TELEMETRY["posted_total"] += posted_count
+            CYCLE_TELEMETRY["fetched_total"] = len(all_jobs)
+            CYCLE_TELEMETRY["cycles_done"] += 1
 
             # Realtime DM alerts for matching subscribers
             if posted_jobs and Config.ENABLE_REALTIME_ALERTS:

@@ -70,7 +70,15 @@ class HealthHandler(BaseHTTPRequestHandler):
                     ),
                     "error": STATE["error"],
                     "config": config_summary(),
+                    "cycle": None,
                 }
+            # pull live cycle telemetry from channel_bot if imported
+            try:
+                import channel_bot as _cb
+                if getattr(_cb, "CYCLE_TELEMETRY", None):
+                    payload["cycle"] = dict(_cb.CYCLE_TELEMETRY)
+            except Exception:
+                pass
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
