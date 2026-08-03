@@ -25,6 +25,7 @@ import asyncio
 import re
 import requests
 import xml.etree.ElementTree as ET
+from html import unescape as html_unescape
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, Bot
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, 
@@ -1280,10 +1281,22 @@ def escape_html(text: str) -> str:
 
 
 def strip_html(text: str) -> str:
-    """Remove HTML tags and normalize whitespace."""
+    """Remove HTML tags and normalize whitespace.
+
+    Handles entity-encoded HTML too: some boards (e.g. Twilio's Greenhouse
+    feed) deliver content as &lt;div&gt; entities, so tags are invisible to a
+    plain tag regex and leak into Telegram posts as literal text.
+    """
     if not text:
         return ''
-    text = re.sub(r'<[^>]+>', ' ', str(text))
+    text = str(text)
+    # Decode entities until real tags appear (max 2 passes for double-encoding).
+    for _ in range(2):
+        if '<' in text or '&' not in text:
+            break
+        text = html_unescape(text)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = html_unescape(text)  # decode leftovers like &nbsp; / &amp;
     return ' '.join(text.split())
 
 
@@ -1519,7 +1532,7 @@ def extract_posted_date(job: Dict) -> str:
 
 
 def extract_employment_type(job: Dict) -> str:
-    """Extract employment type"""
+    """Extract employment type; empty string when unknown (caller hides the field)."""
     emp = job.get('employment_type', '') or job.get('type', '') or job.get('job_type', '') or job.get('contract_type', '')
     emp_lower = str(emp).lower()
     if 'full' in emp_lower or 'полная' in emp_lower:
@@ -1530,17 +1543,15 @@ def extract_employment_type(job: Dict) -> str:
         return "📝 Контракт"
     elif emp:
         return f"⏰ {emp}"
-    return "⏰ Не указана"
+    return ""
 
 
 def extract_description(job: Dict, max_length: int = 350) -> str:
-    """Extract and sanitize description"""
-    desc = job.get('description', '')
-    desc = re.sub(r'<[^>]+>', '', desc)
-    desc = ' '.join(desc.split())
+    """Extract and sanitize description. Returns '' when there is nothing useful."""
+    desc = strip_html(job.get('description', ''))
     if len(desc) > max_length:
         desc = desc[:max_length].rsplit(' ', 1)[0] + '...'
-    return desc or "Описание не указано"
+    return desc
 
 
 def is_suitable_job(job: Dict) -> bool:
@@ -1566,7 +1577,11 @@ def is_suitable_job(job: Dict) -> bool:
 
 
 def format_job_message_legacy(job: Dict) -> str:
-    """Legacy HTML formatter (fallback)"""
+    """Legacy HTML formatter (fallback).
+
+    Fields without data are hidden instead of showing placeholders like
+    "Не указана"/"Недавно" — noise lines were eating half of every post.
+    """
     level = job.get('level', 'Junior')
     emoji = "🟢" if level == "Junior" else "🟡" if level == "Middle" else "🔵"
     salary = extract_salary(job)
@@ -1592,21 +1607,28 @@ def format_job_message_legacy(job: Dict) -> str:
         "",
         f"🏢 <b>Компания:</b> {company}",
         f"📍 <b>Локация:</b> {location}",
-        f"💵 <b>Зарплата:</b> {salary}",
-        f"🎯 <b>Уровень:</b> {level}",
-        f"📅 <b>Дата:</b> {posted_date} | {employment}",
-        "",
-        f"📋 <b>Описание:</b>",
-        description,
-        "",
-        "<b>🛠 Навыки:</b>"
     ]
-    
+
+    if salary and salary != 'Не указана':
+        parts.append(f"💵 <b>Зарплата:</b> {escape_html(salary)}")
+
+    parts.append(f"🎯 <b>Уровень:</b> {escape_html(level)}")
+
+    meta_bits = []
+    if posted_date and posted_date != "Недавно":
+        meta_bits.append(f"📅 {posted_date}")
+    if employment:
+        meta_bits.append(employment)
+    if meta_bits:
+        parts.append(" | ".join(meta_bits))
+
+    if description:
+        parts.extend(["", "📋 <b>Описание:</b>", escape_html(description)])
+
     if skills:
+        parts.extend(["", "<b>🛠 Навыки:</b>"])
         for skill in skills:
             parts.append(f"  • {escape_html(skill)}")
-    else:
-        parts.append("  Не указаны")
     
     parts.extend([
         "",
