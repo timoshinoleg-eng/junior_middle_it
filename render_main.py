@@ -26,6 +26,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # on spin-down anyway and waste I/O).
 os.environ.setdefault("DISABLE_FILE_LOG", "true")
 
+def config_summary() -> dict:
+    """Presence flags for key env vars — safe to expose (no values)."""
+    def present(*names):
+        return any(os.getenv(n) for n in names)
+
+    return {
+        "TELEGRAM_BOT_TOKEN": present("TELEGRAM_BOT_TOKEN"),
+        "CHANNEL_ID": present("CHANNEL_ID"),
+        "APIFY_API_TOKEN": present("APIFY_API_TOKEN"),
+        "TELEGRAM_API_ID": present("TELEGRAM_API_ID"),
+        "TELEGRAM_API_HASH": present("TELEGRAM_API_HASH"),
+        "SUPERJOB_API_KEY": present("SUPERJOB_API_KEY"),
+        "ADZUNA_APP_ID": present("ADZUNA_APP_ID"),
+        "GREENHOUSE_BOARDS": present("GREENHOUSE_BOARDS"),
+        "DEDUP_MODE": os.getenv("DEDUP_MODE", "sqlite"),
+        "CHECK_INTERVAL": os.getenv("CHECK_INTERVAL", "1800"),
+    }
+
+
 STATE = {
     "started_at": time.time(),
     "bot_thread_started": False,
@@ -50,6 +69,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                         else "starting"
                     ),
                     "error": STATE["error"],
+                    "config": config_summary(),
                 }
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
