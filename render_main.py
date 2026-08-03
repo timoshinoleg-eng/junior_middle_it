@@ -33,7 +33,9 @@ def config_summary() -> dict:
 
     return {
         "TELEGRAM_BOT_TOKEN": present("TELEGRAM_BOT_TOKEN"),
+        "TELEGRAM_BOT_ID": (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").split(":")[0] if present("TELEGRAM_BOT_TOKEN") else "",
         "CHANNEL_ID": present("CHANNEL_ID"),
+        "CHANNEL_ID_VAL": os.getenv("CHANNEL_ID", "")[:30] if present("CHANNEL_ID") else "",
         "APIFY_API_TOKEN": present("APIFY_API_TOKEN"),
         "TELEGRAM_API_ID": present("TELEGRAM_API_ID"),
         "TELEGRAM_API_HASH": present("TELEGRAM_API_HASH"),
