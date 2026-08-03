@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: junior-middle-it-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: python render_main.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # --- copy these from Vercel project settings (olegs-projects) ---
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false          # set manually in Render dashboard
+      - key: CHANNEL_ID
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: APIFY_API_TOKEN
+        sync: false
+      # --- static config ---
+      - key: DEDUP_MODE
+        value: telegram_history
+      - key: ENABLE_TELEGRAM_CHANNELS
+        value: "false"       # Telethon session expired; don't touch
+      - key: DISABLE_FILE_LOG
+        value: "true"
+      - key: CHECK_INTERVAL
+        value: "1800"
+      - key: MAX_POSTS_PER_CYCLE
+        value: "40"
+      - key: BOT_USERNAME
+        value: junior_jobs_channel_bot
