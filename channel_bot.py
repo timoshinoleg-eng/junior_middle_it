@@ -3971,10 +3971,12 @@ async def main():
             
             # Filter, classify and process
             classified_jobs = []
+            _f = {"not_suitable": 0, "no_level": 0, "salary": 0, "tracks": 0}
             for job in all_jobs:
                 if GROWTH_UTILS_AVAILABLE:
                     normalize_job_title_company(job)
                 if not is_suitable_job(job):
+                    _f["not_suitable"] += 1
                     continue
                 
                 # Classify level
@@ -3982,6 +3984,7 @@ async def main():
                 if level:
                     job['level'] = level
                 else:
+                    _f["no_level"] += 1
                     continue
                 
                 # Auto-classify category
@@ -3991,13 +3994,23 @@ async def main():
                 if GROWTH_UTILS_AVAILABLE:
                     enrich_job_salary_fields(job)
                     if not passes_min_salary(job, Config.GLOBAL_MIN_SALARY_USD):
+                        _f["salary"] += 1
                         continue
                     if not passes_channel_tracks(job, Config.CHANNEL_TRACKS):
+                        _f["tracks"] += 1
                         continue
                 
                 classified_jobs.append(job)
             
             logger.info(f"🎯 Suitable Junior/Middle jobs: {len(classified_jobs)}")
+            CYCLE_TELEMETRY["funnel"] = {
+                "fetched": len(all_jobs),
+                "not_suitable": _f["not_suitable"],
+                "no_level": _f["no_level"],
+                "salary_filter": _f["salary"],
+                "tracks_filter": _f["tracks"],
+                "classified": len(classified_jobs),
+            }
             
             # Deduplicate (exact + fuzzy) then diversify by source
             publish_candidates = []
@@ -4045,6 +4058,8 @@ async def main():
                 f"✅ Posted {posted_count} new jobs to channel "
                 f"(duplicates skipped: {duplicate_count}, failed: {failed_count})"
             )
+            CYCLE_TELEMETRY["funnel"]["duplicates"] = duplicate_count
+            CYCLE_TELEMETRY["funnel"]["publish_candidates"] = len(publish_candidates)
             CYCLE_TELEMETRY["posted_last_cycle"] = posted_count
             CYCLE_TELEMETRY["posted_total"] += posted_count
             CYCLE_TELEMETRY["fetched_total"] = len(all_jobs)
