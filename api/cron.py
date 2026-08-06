@@ -8,6 +8,10 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from channel_bot import Config, collect_and_post_once
+from sentry_setup import init_sentry
+
+# Initialize Sentry once per serverless instance (import-time).
+init_sentry()
 
 
 class handler(BaseHTTPRequestHandler):
@@ -32,12 +36,23 @@ class handler(BaseHTTPRequestHandler):
                 self._send_json(401, {"ok": False, "error": "unauthorized"})
                 return
 
-        result = asyncio.run(
-            collect_and_post_once(
-                use_sqlite=False,
-                source_budget_seconds=int(os.getenv("SOURCE_BUDGET_SECONDS", "480")),
+        try:
+            result = asyncio.run(
+                collect_and_post_once(
+                    use_sqlite=False,
+                    source_budget_seconds=int(os.getenv("SOURCE_BUDGET_SECONDS", "480")),
+                )
             )
-        )
+        except Exception:
+            import traceback
+            exc = traceback.format_exc()
+            try:
+                import sentry_sdk
+                sentry_sdk.capture_exception()
+            except Exception:
+                pass
+            self._send_json(500, {"ok": False, "error": exc[:2000]})
+            return
         self._send_json(200 if result.get("ok") else 500, result)
 
     def do_POST(self):

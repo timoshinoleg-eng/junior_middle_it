@@ -35,6 +35,13 @@ from telegram.error import InvalidToken, RetryAfter, TelegramError, TimedOut
 from telegram.constants import ParseMode
 from dotenv import load_dotenv
 
+try:
+    from sentry_setup import init_sentry
+    SENTRY_SETUP_AVAILABLE = True
+except ImportError:
+    SENTRY_SETUP_AVAILABLE = False
+    init_sentry = None
+
 # Load environment variables
 load_dotenv()
 
@@ -3783,6 +3790,7 @@ async def main():
     if not Config.validate():
         sys.exit(1)
     configure_webshare_proxy()
+    init_sentry()
 
     logger.info("=" * 60)
     logger.info("🚀 Job Bot Starting (v6.5 — sources)")
