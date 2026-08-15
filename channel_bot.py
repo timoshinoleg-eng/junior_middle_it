@@ -417,7 +417,7 @@ JUNIOR_SIGNALS = [
 ]
 
 MIDDLE_SIGNALS = [
-    "middle", "mid-level", "mid level", "intermediate",
+    "middle", "mid-level", "mid level", "intermediate", "regular",
     "2-3 years", "2-4 years", "3-5 years", "2+ years", "3+ years"
 ]
 
@@ -1525,8 +1525,8 @@ def classify_job_level(job_data: Dict) -> Optional[str]:
         return "Junior"
     if any(has_text_signal(full_text, signal) for signal in MIDDLE_SIGNALS):
         return "Middle"
-    if any(has_text_signal(title_text, role) for role in TITLE_IT_SIGNALS):
-        return "Junior"
+    # A technical title alone is not evidence of Junior/Middle seniority.
+    # Keep unknown levels out of the public queue instead of labelling them Junior.
     return None
 
 
