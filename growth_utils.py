@@ -107,8 +107,8 @@ _GEO_RESTRICTION_SIGNALS = (
     "india", "usa", "united states", "canada", "uk", "united kingdom",
     "europe", "european union", "eu ", "latam", "latin america",
     "north america", "americas", "emea", "russia", "росси", "снг", "cнg",
-    "germany", "france", "spain", "poland", "japan", "australia", "israel",
-    "brazil", "mexico",
+    "germany", "france", "spain", "poland", "japan", "israel",
+    "brazil", "mexico", "malaysia", "new zealand", "kuala lumpur", "london",
 )
 _GEO_DISPLAY_LABELS = (
     ("canada", "Canada"), ("australia", "Australia"),
@@ -119,8 +119,10 @@ _GEO_DISPLAY_LABELS = (
     ("european union", "European Union"), ("europe", "Europe"),
     ("india", "India"), ("germany", "Germany"), ("france", "France"),
     ("spain", "Spain"), ("poland", "Poland"), ("japan", "Japan"),
-    ("israel", "Israel"), ("mexico", "Mexico"), ("united kingdom", "United Kingdom"),
-    ("uk", "United Kingdom"),
+    ("israel", "Israel"), ("mexico", "Mexico"), ("malaysia", "Malaysia"),
+    ("new zealand", "New Zealand"), ("kuala lumpur", "Malaysia"),
+    ("united kingdom", "United Kingdom"), ("uk", "United Kingdom"),
+    ("london", "United Kingdom"),
 )
 _SENIORITY_CONFLICT_SIGNALS = (
     "senior", "staff", "principal", "lead", "head of", "director",
@@ -165,10 +167,18 @@ def classify_thematic_track(job: Dict) -> str:
         "ai builder", "ai-assisted", "ai assisted", "agentic", "ai agent",
         "prompt engineer", "rapid prototyping",
     )
+    data_signals = (
+        "machine learning", "data scientist", "data engineer", "data analyst",
+        "data analysis", "data platform", "analytics", "analytics engineer",
+        "llm engineer",
+    )
+    # Data/AI is the primary track for explicit data roles even when the
+    # description also mentions AI or automation. Builders remain Vibe coding
+    # only when the role is not explicitly a data/analytics position.
+    if category == "data" or _contains_any(text, data_signals):
+        return "data_ai"
     if _contains_any(text, vibe_signals):
         return "vibe_coding"
-    if category == "data" or _contains_any(text, ("machine learning", "data scientist", "data engineer", "analytics", "llm engineer")):
-        return "data_ai"
     if category == "qa" or _contains_any(text, ("quality assurance", "software tester", "test automation", "qa engineer")):
         return "qa"
     if category == "devops" or _contains_any(text, ("site reliability", "sre", "platform engineer", "cloud engineer", "devops")):
