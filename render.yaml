@@ -30,7 +30,7 @@ services:
         value: "true"
       - key: CHECK_INTERVAL
         value: "1800"
-      - key: MAX_POSTS_PER_CYCLE
-        value: "40"
+      - key: EMERGENCY_MAX_POSTS_PER_CYCLE
+        value: "0"        # 0 = no product cap; use only during an operational incident
       - key: BOT_USERNAME
         value: junior_jobs_channel_bot
