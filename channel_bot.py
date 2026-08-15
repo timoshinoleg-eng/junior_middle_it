@@ -19,7 +19,7 @@ import sys
 from collections import OrderedDict
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 import signal
 import asyncio
 import re
@@ -1137,6 +1137,29 @@ def is_duplicate_job(job: Dict, db: DatabaseConnection, recent_fps: Optional[Lis
     return False
 
 
+def is_duplicate_in_batch(
+    job: Dict,
+    seen_hashes: Set[str],
+    seen_fingerprints: Optional[List[str]] = None,
+) -> bool:
+    """Deduplicate candidates within the active run before public ordering."""
+    job_hash = job.get('hash') or generate_job_hash(job)
+    job['hash'] = job_hash
+    if job_hash in seen_hashes:
+        return True
+
+    if GROWTH_UTILS_AVAILABLE and seen_fingerprints is not None:
+        fingerprint = job_fingerprint(job)
+        if fuzzy_is_near_duplicate(
+            job, seen_fingerprints, threshold=Config.FUZZY_DEDUP_THRESHOLD
+        ):
+            return True
+        seen_fingerprints.insert(0, fingerprint)
+
+    seen_hashes.add(job_hash)
+    return False
+
+
 def register_posted_job(job: Dict, db: DatabaseConnection) -> None:
     """Register a job after it has been successfully posted."""
     job_hash = job.get('hash') or generate_job_hash(job)
@@ -1694,6 +1717,10 @@ def format_job_message_legacy(job: Dict) -> str:
         parts.append(
             f"🏷 <b>Поток:</b> {escape_html(track_labels.get(primary_track, primary_track))}"
         )
+
+    geo_restriction = str(job.get('geo_restriction') or '').strip()
+    if geo_restriction:
+        parts.append(f"🌍 <b>Доступность:</b> {escape_html(geo_restriction)}")
 
     meta_bits = []
     if posted_date and posted_date != "Недавно":
@@ -2934,6 +2961,8 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
         publish_candidates = []
         duplicate_count = failed_count = 0
         recent_fps = db.recent_fingerprints(Config.FUZZY_DEDUP_LOOKBACK) if db else []
+        batch_hashes: Set[str] = set()
+        batch_fps: List[str] = []
         for job in classified_jobs:
             if GROWTH_UTILS_AVAILABLE:
                 enrich_job_salary_fields(job)
@@ -2945,6 +2974,9 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
                 duplicate_count += 1
                 continue
             if db and is_duplicate_job(job, db, recent_fps=recent_fps):
+                duplicate_count += 1
+                continue
+            if is_duplicate_in_batch(job, batch_hashes, batch_fps):
                 duplicate_count += 1
                 continue
             publish_candidates.append(job)
@@ -4109,12 +4141,17 @@ async def main():
                 "classified": len(classified_jobs),
             }
             
-            # Deduplicate (exact + fuzzy) then diversify by source
+            # Deduplicate against history and within this active batch before routing.
             publish_candidates = []
             duplicate_count = 0
             recent_fps = db.recent_fingerprints(Config.FUZZY_DEDUP_LOOKBACK)
+            batch_hashes: Set[str] = set()
+            batch_fps: List[str] = []
             for job in classified_jobs:
                 if is_duplicate_job(job, db, recent_fps=recent_fps):
+                    duplicate_count += 1
+                    continue
+                if is_duplicate_in_batch(job, batch_hashes, batch_fps):
                     duplicate_count += 1
                     continue
                 publish_candidates.append(job)
