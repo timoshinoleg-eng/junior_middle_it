@@ -30,6 +30,23 @@ LEVEL_EMOJIS = {
 }
 
 # Названия категорий на русском
+THEMATIC_TRACK_NAMES_RU = {
+    'development': 'Разработка',
+    'data_ai': 'Data / AI',
+    'vibe_coding': 'Vibe coding / Builders',
+    'qa': 'QA',
+    'devops_infra': 'DevOps / Infra',
+    'design_product': 'Design / Product',
+    'support_other': 'Other IT',
+}
+
+REMOTE_SCOPE_NAMES_RU = {
+    'worldwide': 'worldwide',
+    'country_restricted': 'есть ограничение по стране',
+    'timezone_restricted': 'есть ограничение по часовому поясу',
+    'scope_unconfirmed': 'условия найма требуют уточнения',
+}
+
 CATEGORY_NAMES_RU = {
     'development': 'Разработка',
     'qa': 'QA',
@@ -63,7 +80,7 @@ class JobMessageFormatter:
         self.parse_mode = 'MarkdownV2'
     
     def _escape_markdown_v2(self, text: str) -> str:
-        """
+        r"""
         Экранирование специальных символов для MarkdownV2.
         Символы: \ _ * [ ] ( ) ~ ` > # + - = | { } . !
         """
@@ -76,7 +93,7 @@ class JobMessageFormatter:
         return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
     
     def _escape_url(self, url: str) -> str:
-        """Экранирование URL для MarkdownV2"""
+        r"""Экранирование URL для MarkdownV2"""
         if not url:
             return ''
         # В URL экранируем ) \ и | (зарезервирован в MarkdownV2)
@@ -128,6 +145,27 @@ class JobMessageFormatter:
     def _get_category_emoji(self, category: str) -> str:
         """Получение эмодзи для категории"""
         return CATEGORY_EMOJIS.get(category, '📌')
+
+    def _format_track(self, job: Dict) -> str:
+        """Render a stable topical stream label when routing metadata is available."""
+        track = str(job.get('primary_track') or '').strip()
+        if not track:
+            return ''
+        name = THEMATIC_TRACK_NAMES_RU.get(track, track.replace('_', ' ').title())
+        return f"🏷 _{self._escape_markdown_v2(name)}_"
+
+    def _format_quality_note(self, job: Dict) -> str:
+        """Expose only decision-relevant restrictions, never a false verification claim."""
+        parts = []
+        scope = REMOTE_SCOPE_NAMES_RU.get(str(job.get('remote_scope') or ''))
+        if scope:
+            parts.append(scope)
+        level_source = str(job.get('level_source') or '')
+        if level_source == 'inferred':
+            parts.append('уровень определён по описанию')
+        if not parts:
+            return ''
+        return f"ℹ️ _{self._escape_markdown_v2('; '.join(parts))}_"
     
     def _format_compact(self, job: Dict) -> str:
         """Компактный формат сообщения"""
@@ -136,8 +174,10 @@ class JobMessageFormatter:
         level = job.get('level', 'Junior')
         category = job.get('category', 'other')
         salary = job.get('salary', 'Не указана')
-        location = job.get('location', 'Remote')
+        location = job.get('location_restriction') or job.get('location', 'Remote')
         url = job.get('url', '')
+        track_line = self._format_track(job)
+        quality_note = self._format_quality_note(job)
         
         cat_emoji = self._get_category_emoji(category)
         level_emoji = LEVEL_EMOJIS.get(level, '⚪')
@@ -149,6 +189,10 @@ class JobMessageFormatter:
             f"{self._format_location(location)}  \\|  {level_emoji} {self._escape_markdown_v2(level)}",
             f"{self._format_salary(salary)}",
         ]
+        if track_line:
+            lines.append(track_line)
+        if quality_note:
+            lines.append(quality_note)
         
         if url:
             lines.append(f"")
@@ -164,7 +208,7 @@ class JobMessageFormatter:
         category = job.get('category', 'other')
         category_name = CATEGORY_NAMES_RU.get(category, category)
         salary = job.get('salary', 'Не указана')
-        location = job.get('location', 'Remote')
+        location = job.get('location_restriction') or job.get('location', 'Remote')
         description = job.get('description', '')
         skills = job.get('tags', [])
         source = job.get('source', 'Unknown')
@@ -172,6 +216,8 @@ class JobMessageFormatter:
         
         cat_emoji = self._get_category_emoji(category)
         level_emoji = LEVEL_EMOJIS.get(level, '⚪')
+        track_line = self._format_track(job)
+        quality_note = self._format_quality_note(job)
         
         # Ограничиваем описание
         if description:
@@ -186,6 +232,12 @@ class JobMessageFormatter:
             f"📂 Категория: {self._escape_markdown_v2(category_name)}",
             f"{self._format_location(location)}  \\|  {level_emoji} {self._escape_markdown_v2(level)}",
             f"{self._format_salary(salary)}",
+        ]
+        if track_line:
+            lines.append(track_line)
+        if quality_note:
+            lines.append(quality_note)
+        lines.extend([
             f"",
             f"📋 _Описание:_",
             f"{self._escape_markdown_v2(desc_text)}",
@@ -194,7 +246,7 @@ class JobMessageFormatter:
             f"{self._format_skills(skills)}",
             f"",
             f"📡 _Источник:_ {self._escape_markdown_v2(source)}",
-        ]
+        ])
         
         if url:
             lines.append(f"")
@@ -298,7 +350,7 @@ class JobMessageFormatter:
             level_emoji = LEVEL_EMOJIS.get(level, '⚪')
             
             lines.append(
-                f"{i}\. {cat_emoji} *{self._escape_markdown_v2(title)}*\n"
+                f"{i}\\. {cat_emoji} *{self._escape_markdown_v2(title)}*\n"
                 f"   🏢 _{self._escape_markdown_v2(company)}_  \\|  {level_emoji} {self._escape_markdown_v2(level)}\n"
             )
         
@@ -363,12 +415,12 @@ class JobMessageFormatter:
             cat_emoji = self._get_category_emoji(category)
             
             lines.append(
-                f"{i}\. {cat_emoji} *{self._escape_markdown_v2(title)}*\n"
+                f"{i}\\. {cat_emoji} *{self._escape_markdown_v2(title)}*\n"
                 f"   🏢 _{self._escape_markdown_v2(company)}_\n"
             )
         
         if len(jobs) > 20:
-            lines.append(f"\n_\.\.\. и еще {len(jobs) - 20} вакансий_")
+            lines.append(f"\n_\\.\\.\\. и еще {len(jobs) - 20} вакансий_")
         
         return '\n'.join(lines)
     
