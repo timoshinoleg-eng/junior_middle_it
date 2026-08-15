@@ -3,9 +3,12 @@ import unittest
 
 from growth_utils import (
     RAPIDFUZZ_AVAILABLE,
+    apply_editorial_quality_gate,
     apply_premium_to_settings,
     build_referral_link,
     build_salary_magnet_report,
+    build_specialization_tags,
+    classify_thematic_track,
     compute_publish_score,
     enrich_job_salary_fields,
     fuzzy_is_near_duplicate,
@@ -183,6 +186,82 @@ class GrowthUtilsTests(unittest.TestCase):
         job2 = {"title": "Acme: Role Title Here", "company": "RealCorp"}
         normalize_job_title_company(job2)
         self.assertEqual(job2["company"], "RealCorp")
+
+    def test_thematic_track_and_specialization(self):
+        job = {
+            "title": "Junior Backend Developer",
+            "category": "development",
+            "location": "Remote Worldwide",
+            "description": "Build APIs with Python and FastAPI.",
+        }
+        self.assertEqual(classify_thematic_track(job), "development")
+        self.assertIn("backend", build_specialization_tags(job))
+
+        vibe_job = {
+            "title": "Junior AI Builder",
+            "category": "development",
+            "location": "Remote",
+            "description": "Build agentic workflows with no-code tools.",
+        }
+        self.assertEqual(classify_thematic_track(vibe_job), "vibe_coding")
+
+    def test_editorial_gate_passes_explicit_worldwide_role(self):
+        job = {
+            "title": "Junior Backend Developer",
+            "category": "development",
+            "location": "Remote Worldwide",
+            "description": "A remote role open to candidates from anywhere.",
+        }
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["quality_gate_status"], "passed")
+        self.assertEqual(job["remote_scope"], "worldwide")
+        self.assertEqual(job["level_source"], "explicit_title")
+        self.assertEqual(job["primary_track"], "development")
+
+    def test_editorial_gate_keeps_geo_restriction_visible(self):
+        job = {
+            "title": "Junior QA Engineer",
+            "category": "qa",
+            "location": "Remote - India",
+            "description": "API testing for a distributed team.",
+        }
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["quality_gate_status"], "passed")
+        self.assertEqual(job["remote_scope"], "country_restricted")
+        self.assertEqual(job["location_restriction"], "Remote - India")
+
+    def test_editorial_gate_quarantines_missing_remote_evidence(self):
+        job = {
+            "title": "Junior Product Designer",
+            "category": "design",
+            "location": "Berlin",
+            "description": "Design product flows with the team.",
+        }
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["quality_gate_status"], "quarantine")
+        self.assertIn("missing_remote_evidence", job["quarantine_reasons"])
+
+    def test_editorial_gate_excludes_hybrid_and_senior_conflicts(self):
+        hybrid = {
+            "title": "Junior QA Engineer",
+            "category": "qa",
+            "location": "Remote hybrid Warsaw",
+            "description": "QA for a distributed product.",
+        }
+        apply_editorial_quality_gate(hybrid)
+        self.assertEqual(hybrid["quality_gate_status"], "excluded")
+        self.assertIn("hybrid_or_onsite_signal", hybrid["quarantine_reasons"])
+
+        senior = {
+            "title": "Senior Backend Engineer",
+            "category": "development",
+            "location": "Remote",
+            "description": "Remote role for a senior engineer.",
+            "level": "Junior",
+        }
+        apply_editorial_quality_gate(senior)
+        self.assertEqual(senior["quality_gate_status"], "excluded")
+        self.assertIn("seniority_conflict", senior["quarantine_reasons"])
 
     def test_publish_score_junior_bias(self):
         junior = {
