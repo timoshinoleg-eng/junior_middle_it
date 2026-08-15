@@ -81,6 +81,7 @@ except ImportError:
 try:
     from growth_utils import (
         RAPIDFUZZ_AVAILABLE,
+        apply_editorial_quality_gate,
         apply_premium_to_settings,
         build_referral_link,
         build_salary_magnet_report,
@@ -2836,6 +2837,16 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
                 continue
             job['level'] = level
             job['category'] = auto_classify_category(job)
+            if GROWTH_UTILS_AVAILABLE:
+                apply_editorial_quality_gate(job, remote_only_sources=tuple(REMOTE_ONLY_SOURCES))
+                if job.get('quality_gate_status') != 'passed':
+                    logger.debug(
+                        "⏭️ Editorial gate %s: %s (%s)",
+                        job.get('quality_gate_status'),
+                        job.get('title', 'N/A'),
+                        ', '.join(job.get('quarantine_reasons') or []),
+                    )
+                    continue
             job['hash'] = generate_job_hash(job)
             classified_jobs.append(job)
 
@@ -3979,7 +3990,7 @@ async def main():
             
             # Filter, classify and process
             classified_jobs = []
-            _f = {"not_suitable": 0, "no_level": 0, "salary": 0, "tracks": 0}
+            _f = {"not_suitable": 0, "no_level": 0, "quality_gate": 0, "salary": 0, "tracks": 0}
             for job in all_jobs:
                 if GROWTH_UTILS_AVAILABLE:
                     normalize_job_title_company(job)
@@ -4000,6 +4011,16 @@ async def main():
                 job['category'] = category
 
                 if GROWTH_UTILS_AVAILABLE:
+                    apply_editorial_quality_gate(job, remote_only_sources=tuple(REMOTE_ONLY_SOURCES))
+                    if job.get('quality_gate_status') != 'passed':
+                        _f["quality_gate"] += 1
+                        logger.debug(
+                            "⏭️ Editorial gate %s: %s (%s)",
+                            job.get('quality_gate_status'),
+                            job.get('title', 'N/A'),
+                            ', '.join(job.get('quarantine_reasons') or []),
+                        )
+                        continue
                     enrich_job_salary_fields(job)
                     if not passes_min_salary(job, Config.GLOBAL_MIN_SALARY_USD):
                         _f["salary"] += 1
