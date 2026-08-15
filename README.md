@@ -175,7 +175,8 @@ ENABLE_RSS_SOURCES=true
 # quality ops (v6.6)
 SOURCE_FAIL_SKIP=3
 ENABLE_SOURCE_DIVERSIFY=true
-MAX_POSTS_PER_CYCLE=40
+# 0 = публиковать все вакансии, прошедшие quality gate; включать только при инциденте
+EMERGENCY_MAX_POSTS_PER_CYCLE=0
 ```
 
 ## 🗂️ Структура проекта
