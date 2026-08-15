@@ -157,9 +157,13 @@ class JobMessageFormatter:
     def _format_quality_note(self, job: Dict) -> str:
         """Expose only decision-relevant restrictions, never a false verification claim."""
         parts = []
-        scope = REMOTE_SCOPE_NAMES_RU.get(str(job.get('remote_scope') or ''))
-        if scope:
-            parts.append(scope)
+        geo_restriction = str(job.get('geo_restriction') or '').strip()
+        if geo_restriction:
+            parts.append(f"доступность: {geo_restriction}")
+        else:
+            scope = REMOTE_SCOPE_NAMES_RU.get(str(job.get('remote_scope') or ''))
+            if scope:
+                parts.append(scope)
         level_source = str(job.get('level_source') or '')
         if level_source == 'inferred':
             parts.append('уровень определён по описанию')
