@@ -106,8 +106,21 @@ _WORLDWIDE_SIGNALS = (
 _GEO_RESTRICTION_SIGNALS = (
     "india", "usa", "united states", "canada", "uk", "united kingdom",
     "europe", "european union", "eu ", "latam", "latin america",
-    "russia", "росси", "снг", "cнg", "germany", "france", "spain",
-    "poland", "japan", "australia", "israel", "brazil", "mexico",
+    "north america", "americas", "emea", "russia", "росси", "снг", "cнg",
+    "germany", "france", "spain", "poland", "japan", "australia", "israel",
+    "brazil", "mexico",
+)
+_GEO_DISPLAY_LABELS = (
+    ("canada", "Canada"), ("australia", "Australia"),
+    ("new zealand", "New Zealand"), ("brazil", "Brazil"),
+    ("latin america", "Latin America"), ("latam", "Latin America"),
+    ("north america", "North America"), ("united states", "United States"),
+    ("usa", "United States"), ("emea", "EMEA"), ("americas", "Americas"),
+    ("european union", "European Union"), ("europe", "Europe"),
+    ("india", "India"), ("germany", "Germany"), ("france", "France"),
+    ("spain", "Spain"), ("poland", "Poland"), ("japan", "Japan"),
+    ("israel", "Israel"), ("mexico", "Mexico"), ("united kingdom", "United Kingdom"),
+    ("uk", "United Kingdom"),
 )
 _SENIORITY_CONFLICT_SIGNALS = (
     "senior", "staff", "principal", "lead", "head of", "director",
@@ -201,6 +214,22 @@ def build_specialization_tags(job: Dict, track: Optional[str] = None) -> List[st
     return tags[:4]
 
 
+def _extract_geo_restriction(location: str, text: str, scope: str) -> str:
+    """Return a concise audience-facing region label only for restricted remote roles."""
+    if scope not in {"country_restricted", "timezone_restricted"}:
+        return ""
+    context = f"{location} {text}".lower()
+    labels = []
+    for signal, label in _GEO_DISPLAY_LABELS:
+        if signal in context and label not in labels:
+            labels.append(label)
+    if scope == "timezone_restricted" and not labels:
+        match = re.search(r"\b(?:utc|gmt)\s*([+\-−]?\s*\d{1,2})", context)
+        if match:
+            return f"UTC{match.group(1).replace(' ', '')}"
+    return " / ".join(labels[:2])
+
+
 def assess_remote_eligibility(job: Dict, remote_only_sources: Tuple[str, ...] = ()) -> Dict[str, Any]:
     """Assess remote evidence without presenting inferred conditions as verified facts."""
     text = _job_text(job)
@@ -215,6 +244,7 @@ def assess_remote_eligibility(job: Dict, remote_only_sources: Tuple[str, ...] = 
             "remote_evidence": "",
             "remote_scope": "not_remote_only",
             "location_restriction": location,
+            "geo_restriction": "",
             "remote_confidence": 0,
             "remote_status": "rejected",
             "remote_reason": "hybrid_or_onsite_signal",
@@ -239,6 +269,7 @@ def assess_remote_eligibility(job: Dict, remote_only_sources: Tuple[str, ...] = 
             "remote_evidence": "",
             "remote_scope": "unconfirmed",
             "location_restriction": location,
+            "geo_restriction": "",
             "remote_confidence": 0,
             "remote_status": "quarantine",
             "remote_reason": reason,
@@ -254,10 +285,12 @@ def assess_remote_eligibility(job: Dict, remote_only_sources: Tuple[str, ...] = 
         scope = "scope_unconfirmed"
 
     confidence = 95 if evidence.startswith("location:") else 80
+    geo_restriction = _extract_geo_restriction(location, text, scope)
     return {
         "remote_evidence": evidence,
         "remote_scope": scope,
         "location_restriction": location,
+        "geo_restriction": geo_restriction,
         "remote_confidence": confidence,
         "remote_status": "passed",
         "remote_reason": "",
