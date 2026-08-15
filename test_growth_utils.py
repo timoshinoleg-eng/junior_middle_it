@@ -241,6 +241,43 @@ class GrowthUtilsTests(unittest.TestCase):
         self.assertEqual(job["quality_gate_status"], "quarantine")
         self.assertIn("missing_remote_evidence", job["quarantine_reasons"])
 
+    def test_editorial_gate_quarantines_source_policy_without_role_evidence(self):
+        job = {
+            "title": "Junior Backend Engineer",
+            "category": "development",
+            "location": "Berlin",
+            "description": "Build internal platform services.",
+            "source": "RemoteOK",
+        }
+        apply_editorial_quality_gate(job, remote_only_sources=("RemoteOK",))
+        self.assertEqual(job["quality_gate_status"], "quarantine")
+        self.assertIn(
+            "source_policy_without_explicit_remote_evidence",
+            job["quarantine_reasons"],
+        )
+
+    def test_editorial_gate_accepts_explicit_portuguese_remote_with_scope(self):
+        job = {
+            "title": "Junior Golang Engineer",
+            "category": "development",
+            "location": "Remoto - Brazil",
+            "description": "A remote engineering role for Brazil.",
+        }
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["quality_gate_status"], "passed")
+        self.assertEqual(job["remote_scope"], "country_restricted")
+
+    def test_editorial_gate_excludes_experienced_conflict(self):
+        job = {
+            "title": "Junior Performance Engineer",
+            "category": "development",
+            "location": "Remote",
+            "description": "Remote role requiring deep experience with distributed systems.",
+        }
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["quality_gate_status"], "excluded")
+        self.assertIn("seniority_conflict", job["quarantine_reasons"])
+
     def test_editorial_gate_excludes_hybrid_and_senior_conflicts(self):
         hybrid = {
             "title": "Junior QA Engineer",
