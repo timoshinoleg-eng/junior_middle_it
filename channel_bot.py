@@ -56,6 +56,16 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 # Импорт новых модулей (с fallback)
 try:
     from job_classifier import JobClassifier, get_job_category_info
@@ -173,6 +183,14 @@ class Config:
     # Product policy: publish every vacancy that passes the editorial gate.
     # A positive emergency ceiling may be set only for an operational incident.
     EMERGENCY_MAX_POSTS_PER_CYCLE = env_int('EMERGENCY_MAX_POSTS_PER_CYCLE', 0)
+    # Candidate link check: only explicit 404/410 excludes a vacancy.
+    URL_PREFLIGHT_ENABLED = os.getenv('URL_PREFLIGHT_ENABLED', 'true').lower() == 'true'
+    URL_PREFLIGHT_TIMEOUT_SECONDS = env_float('URL_PREFLIGHT_TIMEOUT_SECONDS', 8.0)
+    URL_PREFLIGHT_CONCURRENCY = env_int('URL_PREFLIGHT_CONCURRENCY', 6)
+    URL_PREFLIGHT_USER_AGENT = os.getenv(
+        'URL_PREFLIGHT_USER_AGENT',
+        'JuniorMiddleIT-LinkCheck/1.0 (+https://github.com/timoshinoleg-eng/junior_middle_it)',
+    )
     ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
     ENABLE_TELEGRAM_CHANNELS = os.getenv('ENABLE_TELEGRAM_CHANNELS', 'true').lower() == 'true'
     ENABLE_MARKDOWN_V2 = os.getenv('ENABLE_MARKDOWN_V2', 'true').lower() == 'true'
@@ -1091,6 +1109,82 @@ def normalize_url(url: str) -> str:
         return ''
     p = urlsplit(url.strip())
     return urlunsplit((p.scheme, p.netloc, p.path, '', ''))
+
+
+def classify_url_preflight_outcome(status_code: Optional[int]) -> str:
+    """Map a URL check result to the publication-safe preflight policy."""
+    if status_code in {404, 410}:
+        return 'excluded'
+    if status_code is not None and 200 <= status_code < 400:
+        return 'passed'
+    # Authentication, rate limiting, 5xx and network errors are not proof of closure.
+    return 'unknown'
+
+
+def check_application_url_status(url: str) -> Optional[int]:
+    """Return final HTTP status after HEAD, falling back to a compact GET if needed."""
+    try:
+        parsed = urlsplit(str(url or '').strip())
+    except (TypeError, ValueError):
+        return None
+    if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
+        return None
+
+    headers = {'User-Agent': Config.URL_PREFLIGHT_USER_AGENT}
+    timeout = max(1.0, Config.URL_PREFLIGHT_TIMEOUT_SECONDS)
+    try:
+        response = requests.head(
+            url,
+            headers=headers,
+            allow_redirects=True,
+            timeout=timeout,
+        )
+        status_code = response.status_code
+        response.close()
+        # Some ATS providers reject HEAD while accepting normal browser navigation.
+        if status_code not in {405, 501}:
+            return status_code
+        response = requests.get(
+            url,
+            headers={**headers, 'Range': 'bytes=0-1023'},
+            allow_redirects=True,
+            timeout=timeout,
+            stream=True,
+        )
+        status_code = response.status_code
+        response.close()
+        return status_code
+    except requests.RequestException:
+        return None
+
+
+async def preflight_application_urls(jobs: List[Dict]) -> Dict[str, int]:
+    """Annotate qualified, deduplicated candidates without imposing a volume cap."""
+    stats = {'passed': 0, 'excluded': 0, 'unknown': 0, 'disabled': 0}
+    if not jobs:
+        return stats
+    if not Config.URL_PREFLIGHT_ENABLED:
+        for job in jobs:
+            job['url_preflight_status'] = 'disabled'
+            job['url_preflight_http_status'] = None
+        stats['disabled'] = len(jobs)
+        return stats
+
+    concurrency = max(1, Config.URL_PREFLIGHT_CONCURRENCY)
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _check(job: Dict) -> None:
+        async with semaphore:
+            status_code = await asyncio.to_thread(
+                check_application_url_status, str(job.get('url') or '')
+            )
+        outcome = classify_url_preflight_outcome(status_code)
+        job['url_preflight_status'] = outcome
+        job['url_preflight_http_status'] = status_code
+        stats[outcome] += 1
+
+    await asyncio.gather(*(_check(job) for job in jobs))
+    return stats
 
 
 def generate_job_hash(job: Dict) -> str:
@@ -2983,6 +3077,17 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
             if GROWTH_UTILS_AVAILABLE:
                 recent_fps.insert(0, job_fingerprint(job))
 
+        # Link validation intentionally follows the editorial gate and both dedup layers.
+        # Only definitive 404/410 outcomes exclude a candidate; all transient/blocked
+        # outcomes remain publishable with observability fields attached.
+        url_preflight = await preflight_application_urls(publish_candidates)
+        publish_candidates = [
+            job for job in publish_candidates
+            if job.get('url_preflight_status') != 'excluded'
+        ]
+        if url_preflight['excluded']:
+            logger.info("⏭️ URL preflight excluded %s stale application links", url_preflight['excluded'])
+
         # Publish all editorially approved jobs. A ceiling exists only for an operational incident.
         total_selected = len(publish_candidates)
         selected_jobs = select_jobs_for_publication(publish_candidates)
@@ -3021,6 +3126,7 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
             'duplicates': duplicate_count,
             'failed': failed_count,
             'transport': post_transport,
+            'url_preflight': url_preflight,
             'selected_sources': selected_sources,
             'sources': source_results,
         }
@@ -4158,6 +4264,15 @@ async def main():
                 if GROWTH_UTILS_AVAILABLE:
                     recent_fps.insert(0, job_fingerprint(job))
 
+            # Keep the same stale-link policy as the serverless route.
+            url_preflight = await preflight_application_urls(publish_candidates)
+            publish_candidates = [
+                job for job in publish_candidates
+                if job.get('url_preflight_status') != 'excluded'
+            ]
+            if url_preflight['excluded']:
+                logger.info("⏭️ URL preflight excluded %s stale application links", url_preflight['excluded'])
+
             selected_jobs = select_jobs_for_publication(publish_candidates)
 
             logger.info(
@@ -4187,6 +4302,7 @@ async def main():
                 f"(duplicates skipped: {duplicate_count}, failed: {failed_count})"
             )
             CYCLE_TELEMETRY["funnel"]["duplicates"] = duplicate_count
+            CYCLE_TELEMETRY["funnel"]["url_preflight"] = url_preflight
             CYCLE_TELEMETRY["funnel"]["publish_candidates"] = len(publish_candidates)
             CYCLE_TELEMETRY["posted_last_cycle"] = posted_count
             CYCLE_TELEMETRY["posted_total"] += posted_count
