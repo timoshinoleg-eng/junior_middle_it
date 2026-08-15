@@ -266,6 +266,18 @@ class GrowthUtilsTests(unittest.TestCase):
         apply_editorial_quality_gate(job)
         self.assertEqual(job["quality_gate_status"], "passed")
         self.assertEqual(job["remote_scope"], "country_restricted")
+        self.assertEqual(job["geo_restriction"], "Brazil")
+
+    def test_editorial_gate_extracts_specific_geo_restriction(self):
+        job = {
+            "title": "Middle Interview Engineer",
+            "category": "development",
+            "location": "Remote",
+            "description": "Canada-based engineers for a remote contract.",
+        }
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["quality_gate_status"], "passed")
+        self.assertEqual(job["geo_restriction"], "Canada")
 
     def test_editorial_gate_excludes_experienced_conflict(self):
         job = {
