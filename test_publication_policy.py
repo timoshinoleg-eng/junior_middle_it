@@ -2,6 +2,7 @@ import unittest
 
 from channel_bot import (
     Config,
+    classify_job_level,
     diversify_jobs_by_track_and_source,
     format_job_message_legacy,
     select_jobs_for_publication,
@@ -45,6 +46,19 @@ class PublicationPolicyTests(unittest.TestCase):
         self.assertEqual(
             [job["primary_track"] for job in selected],
             ["development", "data_ai", "qa"],
+        )
+
+    def test_level_classifier_requires_explicit_junior_or_middle_evidence(self):
+        self.assertIsNone(
+            classify_job_level(
+                {"title": "Platform Software Engineer", "description": "Remote systems role."}
+            )
+        )
+        self.assertEqual(
+            classify_job_level(
+                {"title": "DevOps Engineer", "description": "Regular remote role."}
+            ),
+            "Middle",
         )
 
     def test_legacy_card_exposes_thematic_stream(self):
