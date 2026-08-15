@@ -312,6 +312,56 @@ class GrowthUtilsTests(unittest.TestCase):
         self.assertEqual(senior["quality_gate_status"], "excluded")
         self.assertIn("seniority_conflict", senior["quarantine_reasons"])
 
+    def test_office_location_without_remote_is_quarantined(self):
+        job = {
+            "title": "Network Operations Engineer",
+            "category": "development",
+            "location": "San Francisco",
+            "description": "Operate network activation systems for a compute infrastructure team.",
+            "level": "Middle",
+            "source": "Ashby:openai",
+        }
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["quality_gate_status"], "quarantine")
+        self.assertIn("missing_remote_evidence", job["quarantine_reasons"])
+
+    def test_remote_first_city_location_gets_geo_label(self):
+        job = {
+            "title": "Junior Data Analyst",
+            "category": "data",
+            "location": "Kuala Lumpur, Malaysia",
+            "description": "Remote-first role with flexible work for a distributed team.",
+            "level": "Junior",
+        }
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["quality_gate_status"], "passed")
+        self.assertEqual(job["geo_restriction"], "Malaysia")
+
+    def test_remote_london_location_gets_united_kingdom_label(self):
+        job = {
+            "title": "Jr Frontend Developer",
+            "category": "development",
+            "location": "London",
+            "description": "Remote full-time role for candidates based in the United Kingdom.",
+            "level": "Junior",
+        }
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["quality_gate_status"], "passed")
+        self.assertEqual(job["geo_restriction"], "United Kingdom")
+
+    def test_explicit_data_role_precedes_vibe_coding_signal(self):
+        job = {
+            "title": "Data Analyst",
+            "category": "development",
+            "location": "Remote - Brazil",
+            "description": "Analyze data for AI-powered product workflows and rapid prototyping.",
+            "level": "Middle",
+        }
+        self.assertEqual(classify_thematic_track(job), "data_ai")
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["primary_track"], "data_ai")
+        self.assertEqual(job["quality_gate_status"], "passed")
+
     def test_publish_score_junior_bias(self):
         junior = {
             "level": "Junior",
