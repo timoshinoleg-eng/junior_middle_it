@@ -36,6 +36,7 @@ try:
     TELETHON_AVAILABLE = True
 except ImportError:
     TELETHON_AVAILABLE = False
+    Message = object  # type: ignore[assignment,misc]  # Keep type annotations import-safe.
     FloodWaitError = None  # type: ignore
     RPCError = None  # type: ignore
 
