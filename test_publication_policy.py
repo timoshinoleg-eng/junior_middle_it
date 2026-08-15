@@ -5,6 +5,7 @@ from channel_bot import (
     classify_job_level,
     diversify_jobs_by_track_and_source,
     format_job_message_legacy,
+    is_duplicate_in_batch,
     select_jobs_for_publication,
 )
 
@@ -47,6 +48,37 @@ class PublicationPolicyTests(unittest.TestCase):
             [job["primary_track"] for job in selected],
             ["development", "data_ai", "qa"],
         )
+
+    def test_in_run_dedup_uses_normalized_url_before_publication(self):
+        seen_hashes = set()
+        seen_fingerprints = []
+        first = {
+            "title": "Junior Backend Engineer",
+            "company": "Acme",
+            "url": "https://example.com/jobs/123?utm_source=board",
+        }
+        repeat = {
+            "title": "Junior Backend Engineer",
+            "company": "Acme",
+            "url": "https://example.com/jobs/123?ref=feed",
+        }
+        self.assertFalse(is_duplicate_in_batch(first, seen_hashes, seen_fingerprints))
+        self.assertTrue(is_duplicate_in_batch(repeat, seen_hashes, seen_fingerprints))
+
+    def test_legacy_card_displays_specific_geo_availability(self):
+        text = format_job_message_legacy(
+            {
+                "title": "Middle Interview Engineer",
+                "company": "Acme",
+                "location": "Remote",
+                "level": "Middle",
+                "source": "Example",
+                "url": "https://example.com/jobs/123",
+                "primary_track": "development",
+                "geo_restriction": "Canada",
+            }
+        )
+        self.assertIn("Доступность:</b> Canada", text)
 
     def test_level_classifier_requires_explicit_junior_or_middle_evidence(self):
         self.assertIsNone(
