@@ -81,12 +81,253 @@ def normalize_job_title_company(job: Dict) -> Dict:
     return job
 
 
+THEMATIC_TRACK_LABELS = {
+    "development": "Разработка",
+    "data_ai": "Data / AI",
+    "vibe_coding": "Vibe coding / Builders",
+    "qa": "QA",
+    "devops_infra": "DevOps / Infra",
+    "design_product": "Design / Product",
+    "support_other": "Other IT",
+}
+
+_REMOTE_SIGNALS = (
+    "remote", "work from home", "wfh", "distributed", "fully distributed",
+    "удалённо", "удаленно", "дистанционно",
+)
+_HYBRID_OR_ONSITE_SIGNALS = (
+    "hybrid", "on-site", "onsite", "in office", "office-based",
+    "гибрид", "офис", "в офисе",
+)
+_WORLDWIDE_SIGNALS = (
+    "worldwide", "anywhere", "global remote", "work from anywhere",
+    "remote worldwide", "из любой страны", "в любой стране",
+)
+_GEO_RESTRICTION_SIGNALS = (
+    "india", "usa", "united states", "canada", "uk", "united kingdom",
+    "europe", "european union", "eu ", "latam", "latin america",
+    "russia", "росси", "снг", "cнg", "germany", "france", "spain",
+    "poland", "japan", "australia", "israel", "brazil", "mexico",
+)
+_SENIORITY_CONFLICT_SIGNALS = (
+    "senior", "staff", "principal", "lead", "head of", "director",
+    "architect", "5+ years", "6+ years", "7+ years", "8+ years",
+)
+_EXPLICIT_JUNIOR_SIGNALS = (
+    "junior", "jr.", "entry level", "entry-level", "graduate", "trainee", "intern",
+    "стажёр", "стажер", "джун",
+)
+_EXPLICIT_MIDDLE_SIGNALS = (
+    "middle", "mid-level", "mid level", "2+ years", "3+ years", "мидл",
+)
+
+
+def _job_text(job: Dict) -> str:
+    """Return normalized text used by the editorial gate."""
+    tags = job.get("tags") or []
+    if not isinstance(tags, list):
+        tags = [str(tags)]
+    parts = [
+        str(job.get("title") or ""),
+        str(job.get("description") or ""),
+        str(job.get("location") or ""),
+        " ".join(str(tag) for tag in tags),
+    ]
+    return " ".join(parts).lower()
+
+
+def _contains_any(text: str, signals: Tuple[str, ...]) -> bool:
+    return any(signal in text for signal in signals)
+
+
+def classify_thematic_track(job: Dict) -> str:
+    """Map legacy categories and vacancy text to one stable audience-facing track."""
+    category = str(job.get("category") or "other").lower()
+    text = _job_text(job)
+
+    vibe_signals = (
+        "vibe coding", "vibecoding", "no-code", "nocode", "low-code", "lowcode",
+        "ai builder", "ai-assisted", "ai assisted", "agentic", "ai agent",
+        "prompt engineer", "rapid prototyping",
+    )
+    if _contains_any(text, vibe_signals):
+        return "vibe_coding"
+    if category == "data" or _contains_any(text, ("machine learning", "data scientist", "data engineer", "analytics", "llm engineer")):
+        return "data_ai"
+    if category == "qa" or _contains_any(text, ("quality assurance", "software tester", "test automation", "qa engineer")):
+        return "qa"
+    if category == "devops" or _contains_any(text, ("site reliability", "sre", "platform engineer", "cloud engineer", "devops")):
+        return "devops_infra"
+    design_signal = bool(re.search(r"\b(?:ux|ui)\b", text)) or _contains_any(
+        text, ("product designer", "product manager")
+    )
+    if category in {"design", "pm"} or design_signal:
+        return "design_product"
+    if category in {"support", "security"}:
+        return "support_other"
+    if category == "development" or _contains_any(text, ("developer", "software engineer", "frontend", "backend", "fullstack", "mobile")):
+        return "development"
+    return "support_other"
+
+
+def build_specialization_tags(job: Dict, track: Optional[str] = None) -> List[str]:
+    """Return stable, lowercase tags for discovery and digest grouping."""
+    text = _job_text(job)
+    track = track or classify_thematic_track(job)
+    tags: List[str] = [track]
+    signals = (
+        ("backend", ("backend", "back-end", "django", "fastapi", "flask", "java", "go ")),
+        ("frontend", ("frontend", "front-end", "react", "vue", "angular")),
+        ("mobile", ("mobile", "android", "ios", "react native", "flutter")),
+        ("fullstack", ("fullstack", "full-stack")),
+        ("data", ("data analyst", "data engineer", "data scientist", "analytics")),
+        ("ml", ("machine learning", "deep learning", "ml engineer", "mlops")),
+        ("ai", ("artificial intelligence", "generative ai", "llm", "large language model")),
+        ("nocode", ("no-code", "nocode", "low-code", "lowcode")),
+        ("agentic_workflows", ("agentic", "ai agent", "workflow automation")),
+        ("qa_manual", ("manual testing", "manual qa")),
+        ("qa_auto", ("automation testing", "test automation", "selenium", "playwright")),
+        ("sre", ("site reliability", "sre")),
+        ("cloud", ("aws", "azure", "gcp", "cloud")),
+        ("uxui", ("ux", "ui", "figma", "product designer")),
+        ("product_management", ("product manager", "product owner")),
+        ("security", ("security", "cybersecurity", "infosec")),
+    )
+    for tag, tag_signals in signals:
+        if _contains_any(text, tag_signals) and tag not in tags:
+            tags.append(tag)
+    return tags[:4]
+
+
+def assess_remote_eligibility(job: Dict, remote_only_sources: Tuple[str, ...] = ()) -> Dict[str, Any]:
+    """Assess remote evidence without presenting inferred conditions as verified facts."""
+    text = _job_text(job)
+    location = str(job.get("location") or "").strip()
+    source = str(job.get("source") or "").strip()
+    source_family = source.split(":", 1)[0].strip().lower()
+    trusted_sources = {str(item).lower() for item in remote_only_sources}
+    source_declares_remote = source.lower() in trusted_sources or source_family in trusted_sources or source.lower().startswith("rss:")
+
+    if _contains_any(text, _HYBRID_OR_ONSITE_SIGNALS):
+        return {
+            "remote_evidence": "",
+            "remote_scope": "not_remote_only",
+            "location_restriction": location,
+            "remote_confidence": 0,
+            "remote_status": "rejected",
+            "remote_reason": "hybrid_or_onsite_signal",
+        }
+
+    evidence = ""
+    if _contains_any(location.lower(), _REMOTE_SIGNALS):
+        evidence = f"location: {location}"
+    elif _contains_any(text, _REMOTE_SIGNALS):
+        evidence = "description marks the role as remote"
+    elif source_declares_remote:
+        evidence = f"remote-only source policy: {source or source_family}"
+
+    if not evidence:
+        return {
+            "remote_evidence": "",
+            "remote_scope": "unconfirmed",
+            "location_restriction": location,
+            "remote_confidence": 0,
+            "remote_status": "quarantine",
+            "remote_reason": "missing_remote_evidence",
+        }
+
+    if _contains_any(text, _WORLDWIDE_SIGNALS):
+        scope = "worldwide"
+    elif re.search(r"\b(?:utc|gmt)\s*[+\-−]?\s*\d{1,2}", text):
+        scope = "timezone_restricted"
+    elif _contains_any(text, _GEO_RESTRICTION_SIGNALS):
+        scope = "country_restricted"
+    else:
+        scope = "scope_unconfirmed"
+
+    confidence = 95 if evidence.startswith("location:") else 80 if source_declares_remote else 70
+    return {
+        "remote_evidence": evidence,
+        "remote_scope": scope,
+        "location_restriction": location,
+        "remote_confidence": confidence,
+        "remote_status": "passed",
+        "remote_reason": "",
+    }
+
+
+def assess_level_evidence(job: Dict) -> Dict[str, Any]:
+    """Describe whether Junior/Middle is explicit or inferred, including conflicts."""
+    title = str(job.get("title") or "").lower()
+    text = _job_text(job)
+    level = str(job.get("level") or "").strip()
+
+    if _contains_any(text, _SENIORITY_CONFLICT_SIGNALS):
+        return {
+            "level_source": "conflict",
+            "level_confidence": 0,
+            "level_reason": "seniority_conflict",
+        }
+    if _contains_any(title, _EXPLICIT_JUNIOR_SIGNALS) or _contains_any(title, _EXPLICIT_MIDDLE_SIGNALS):
+        return {
+            "level_source": "explicit_title",
+            "level_confidence": 95,
+            "level_reason": "",
+        }
+    if _contains_any(text, _EXPLICIT_JUNIOR_SIGNALS) or _contains_any(text, _EXPLICIT_MIDDLE_SIGNALS):
+        return {
+            "level_source": "explicit_description",
+            "level_confidence": 85,
+            "level_reason": "",
+        }
+    if level in {"Junior", "Middle"}:
+        return {
+            "level_source": "inferred",
+            "level_confidence": 55,
+            "level_reason": "level_not_explicit_in_source",
+        }
+    return {
+        "level_source": "unknown",
+        "level_confidence": 0,
+        "level_reason": "missing_level_evidence",
+    }
+
+
+def apply_editorial_quality_gate(job: Dict, remote_only_sources: Tuple[str, ...] = ()) -> Dict:
+    """Attach routing and evidence fields; quarantine uncertain jobs before publication."""
+    track = classify_thematic_track(job)
+    remote = assess_remote_eligibility(job, remote_only_sources=remote_only_sources)
+    level = assess_level_evidence(job)
+    reasons = [reason for reason in (remote["remote_reason"], level["level_reason"]) if reason]
+
+    if remote["remote_status"] == "rejected" or level["level_source"] == "conflict":
+        status = "excluded"
+    elif remote["remote_status"] != "passed" or level["level_confidence"] == 0:
+        status = "quarantine"
+    else:
+        status = "passed"
+
+    job.update(remote)
+    job.update(level)
+    job["primary_track"] = track
+    job["specialization_tags"] = build_specialization_tags(job, track=track)
+    job["quality_gate_status"] = status
+    job["quarantine_reasons"] = reasons
+    return job
+
+
 def compute_publish_score(job: Dict, salary_display: str = "") -> int:
     """
     Numeric quality score for channel selection (higher = better).
     salary_display: pre-extracted display string; empty uses job['salary'].
     """
     score = 0
+    gate_status = str(job.get("quality_gate_status") or "")
+    if gate_status == "excluded":
+        return -100
+    if gate_status == "quarantine":
+        return -50
+
     level = str(job.get("level") or "")
     if level == "Junior":
         score += 4
@@ -120,6 +361,17 @@ def compute_publish_score(job: Dict, salary_display: str = "") -> int:
 
     loc = str(job.get("location") or "").lower()
     if "remote" in loc or "удал" in loc or "flexible" in loc:
+        score += 1
+
+    remote_scope = str(job.get("remote_scope") or "")
+    if remote_scope == "worldwide":
+        score += 2
+    elif remote_scope in {"country_restricted", "timezone_restricted"}:
+        score += 1
+
+    if int(job.get("level_confidence") or 0) >= 85:
+        score += 1
+    if job.get("primary_track") and job.get("primary_track") != "support_other":
         score += 1
 
     return score
