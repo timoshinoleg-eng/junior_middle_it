@@ -170,7 +170,9 @@ class Config:
     TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
     TELEGRAM_SESSION_NAME = os.getenv('TELEGRAM_SESSION_NAME')
     CHECK_INTERVAL = env_int('CHECK_INTERVAL', 1800)
-    MAX_POSTS_PER_CYCLE = env_int('MAX_POSTS_PER_CYCLE', 40)
+    # Product policy: publish every vacancy that passes the editorial gate.
+    # A positive emergency ceiling may be set only for an operational incident.
+    EMERGENCY_MAX_POSTS_PER_CYCLE = env_int('EMERGENCY_MAX_POSTS_PER_CYCLE', 0)
     ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
     ENABLE_TELEGRAM_CHANNELS = os.getenv('ENABLE_TELEGRAM_CHANNELS', 'true').lower() == 'true'
     ENABLE_MARKDOWN_V2 = os.getenv('ENABLE_MARKDOWN_V2', 'true').lower() == 'true'
@@ -1379,8 +1381,19 @@ def job_quality_score(job: Dict) -> tuple:
     return (quality, timestamp)
 
 
-def diversify_jobs_by_source(jobs: List[Dict], limit: int) -> List[Dict]:
-    """Round-robin jobs across source families instead of draining early sources first."""
+TRACK_PUBLICATION_PRIORITY = {
+    'development': 0,
+    'data_ai': 1,
+    'vibe_coding': 2,
+    'qa': 3,
+    'devops_infra': 4,
+    'design_product': 5,
+    'support_other': 6,
+}
+
+
+def diversify_jobs_by_source(jobs: List[Dict], limit: Optional[int] = None) -> List[Dict]:
+    """Round-robin jobs across source families; ``None`` means no product cap."""
     grouped: "OrderedDict[str, List[Dict]]" = OrderedDict()
     for job in jobs:
         grouped.setdefault(base_source_name(job), []).append(job)
@@ -1394,18 +1407,63 @@ def diversify_jobs_by_source(jobs: List[Dict], limit: int) -> List[Dict]:
     )
 
     selected = []
-    while len(selected) < limit and grouped:
+    while grouped and (limit is None or len(selected) < limit):
         empty_sources = []
         for source, source_jobs in grouped.items():
             if not source_jobs:
                 empty_sources.append(source)
                 continue
             selected.append(source_jobs.pop(0))
-            if len(selected) >= limit:
+            if limit is not None and len(selected) >= limit:
                 break
         for source in empty_sources:
             grouped.pop(source, None)
     return selected
+
+
+def thematic_track_for_publication(job: Dict) -> str:
+    """Return the stable stream selected by the editorial gate for public ordering."""
+    return str(job.get('primary_track') or job.get('thematic_track') or 'support_other')
+
+
+def diversify_jobs_by_track_and_source(
+    jobs: List[Dict], limit: Optional[int] = None
+) -> List[Dict]:
+    """Interleave audience streams first and source families second, without suppressing jobs."""
+    grouped: "OrderedDict[str, List[Dict]]" = OrderedDict()
+    for job in jobs:
+        grouped.setdefault(thematic_track_for_publication(job), []).append(job)
+
+    grouped = OrderedDict(
+        (track, diversify_jobs_by_source(track_jobs))
+        for track, track_jobs in sorted(
+            grouped.items(),
+            key=lambda item: (TRACK_PUBLICATION_PRIORITY.get(item[0], 100), item[0])
+        )
+    )
+
+    selected = []
+    while grouped and (limit is None or len(selected) < limit):
+        empty_tracks = []
+        for track, track_jobs in grouped.items():
+            if not track_jobs:
+                empty_tracks.append(track)
+                continue
+            selected.append(track_jobs.pop(0))
+            if limit is not None and len(selected) >= limit:
+                break
+        for track in empty_tracks:
+            grouped.pop(track, None)
+    return selected
+
+
+def select_jobs_for_publication(jobs: List[Dict]) -> List[Dict]:
+    """Publish every qualified job unless an explicit incident-only ceiling is enabled."""
+    emergency_limit = Config.EMERGENCY_MAX_POSTS_PER_CYCLE or None
+    if Config.ENABLE_SOURCE_DIVERSIFY:
+        return diversify_jobs_by_track_and_source(jobs, limit=emergency_limit)
+    ranked = sorted(jobs, key=job_quality_score, reverse=True)
+    return ranked[:emergency_limit] if emergency_limit is not None else ranked
 
 
 def should_skip_source(source_name: str) -> bool:
@@ -1621,6 +1679,21 @@ def format_job_message_legacy(job: Dict) -> str:
         parts.append(f"💵 <b>Зарплата:</b> {escape_html(salary)}")
 
     parts.append(f"🎯 <b>Уровень:</b> {escape_html(level)}")
+
+    track_labels = {
+        'development': 'Разработка',
+        'data_ai': 'Data / AI',
+        'vibe_coding': 'Vibe coding / no-code',
+        'qa': 'QA',
+        'devops_infra': 'DevOps / Infra',
+        'design_product': 'Design / Product',
+        'support_other': 'Другие IT-направления',
+    }
+    primary_track = str(job.get('primary_track') or job.get('thematic_track') or '')
+    if primary_track:
+        parts.append(
+            f"🏷 <b>Поток:</b> {escape_html(track_labels.get(primary_track, primary_track))}"
+        )
 
     meta_bits = []
     if posted_date and posted_date != "Недавно":
@@ -2878,21 +2951,13 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
             if GROWTH_UTILS_AVAILABLE:
                 recent_fps.insert(0, job_fingerprint(job))
 
-        # Soft cap with round-robin by source (quality-preserving diversify)
+        # Publish all editorially approved jobs. A ceiling exists only for an operational incident.
         total_selected = len(publish_candidates)
-        if Config.ENABLE_SOURCE_DIVERSIFY:
-            selected_jobs = diversify_jobs_by_source(publish_candidates, Config.MAX_POSTS_PER_CYCLE)
-        else:
-            publish_candidates.sort(key=job_quality_score, reverse=True)
-            selected_jobs = publish_candidates[:Config.MAX_POSTS_PER_CYCLE]
+        selected_jobs = select_jobs_for_publication(publish_candidates)
         logger.info(
             f"🎯 Отобрано {len(selected_jobs)}/{total_selected} вакансий "
-            f"(лимит {Config.MAX_POSTS_PER_CYCLE}, diversify={Config.ENABLE_SOURCE_DIVERSIFY})"
+            f"(thematic routing, emergency_limit={Config.EMERGENCY_MAX_POSTS_PER_CYCLE or 'off'})"
         )
-        if Config.MAX_POSTS_PER_CYCLE > 40:
-            logger.warning(
-                f"⚠️ Лимит публикации ({Config.MAX_POSTS_PER_CYCLE}) превышает 40 — риск таймаута в serverless"
-            )
 
         selected_sources = {}
         for job in selected_jobs:
@@ -3807,7 +3872,10 @@ async def main():
     logger.info("🚀 Job Bot Starting (v6.5 — sources)")
     logger.info(f"📡 Main channel: {Config.CHANNEL_ID}")
     logger.info(f"⏱️ Check interval: {Config.CHECK_INTERVAL}s")
-    logger.info(f"📊 Max posts per cycle: {Config.MAX_POSTS_PER_CYCLE}")
+    logger.info(
+        "📊 Product cap: disabled; emergency ceiling: %s",
+        Config.EMERGENCY_MAX_POSTS_PER_CYCLE or 'off',
+    )
     logger.info(f"🤖 MarkdownV2: {Config.ENABLE_MARKDOWN_V2}")
     logger.info(f"📱 Telegram channels: {Config.ENABLE_TELEGRAM_CHANNELS}")
     logger.info(f"🧠 Classifier: {CLASSIFIER_AVAILABLE}")
@@ -4053,17 +4121,11 @@ async def main():
                 if GROWTH_UTILS_AVAILABLE:
                     recent_fps.insert(0, job_fingerprint(job))
 
-            if Config.ENABLE_SOURCE_DIVERSIFY:
-                selected_jobs = diversify_jobs_by_source(
-                    publish_candidates, Config.MAX_POSTS_PER_CYCLE
-                )
-            else:
-                publish_candidates.sort(key=job_quality_score, reverse=True)
-                selected_jobs = publish_candidates[:Config.MAX_POSTS_PER_CYCLE]
+            selected_jobs = select_jobs_for_publication(publish_candidates)
 
             logger.info(
                 f"🎯 Отобрано {len(selected_jobs)}/{len(publish_candidates)} "
-                f"(лимит {Config.MAX_POSTS_PER_CYCLE}, diversify={Config.ENABLE_SOURCE_DIVERSIFY})"
+                f"(thematic routing, emergency_limit={Config.EMERGENCY_MAX_POSTS_PER_CYCLE or 'off'})"
             )
 
             # Post all suitable jobs with rate-limiting
