@@ -92,7 +92,7 @@ THEMATIC_TRACK_LABELS = {
 }
 
 _REMOTE_SIGNALS = (
-    "remote", "work from home", "wfh", "distributed", "fully distributed",
+    "remote", "remoto", "work from home", "wfh", "distributed", "fully distributed",
     "удалённо", "удаленно", "дистанционно",
 )
 _HYBRID_OR_ONSITE_SIGNALS = (
@@ -112,6 +112,8 @@ _GEO_RESTRICTION_SIGNALS = (
 _SENIORITY_CONFLICT_SIGNALS = (
     "senior", "staff", "principal", "lead", "head of", "director",
     "architect", "5+ years", "6+ years", "7+ years", "8+ years",
+    "experienced ", "deep experience", "considerable experience",
+    "proven experience", "extensive experience",
 )
 _EXPLICIT_JUNIOR_SIGNALS = (
     "junior", "jr.", "entry level", "entry-level", "graduate", "trainee", "intern",
@@ -223,17 +225,23 @@ def assess_remote_eligibility(job: Dict, remote_only_sources: Tuple[str, ...] = 
         evidence = f"location: {location}"
     elif _contains_any(text, _REMOTE_SIGNALS):
         evidence = "description marks the role as remote"
-    elif source_declares_remote:
-        evidence = f"remote-only source policy: {source or source_family}"
 
+    # Source policy is useful context, but it is not proof that an individual role
+    # is remote. Aggregators and remote-first boards can contain local, hybrid or
+    # expired listings; publish only when the vacancy itself states remote terms.
     if not evidence:
+        reason = (
+            "source_policy_without_explicit_remote_evidence"
+            if source_declares_remote
+            else "missing_remote_evidence"
+        )
         return {
             "remote_evidence": "",
             "remote_scope": "unconfirmed",
             "location_restriction": location,
             "remote_confidence": 0,
             "remote_status": "quarantine",
-            "remote_reason": "missing_remote_evidence",
+            "remote_reason": reason,
         }
 
     if _contains_any(text, _WORLDWIDE_SIGNALS):
@@ -245,7 +253,7 @@ def assess_remote_eligibility(job: Dict, remote_only_sources: Tuple[str, ...] = 
     else:
         scope = "scope_unconfirmed"
 
-    confidence = 95 if evidence.startswith("location:") else 80 if source_declares_remote else 70
+    confidence = 95 if evidence.startswith("location:") else 80
     return {
         "remote_evidence": evidence,
         "remote_scope": scope,
