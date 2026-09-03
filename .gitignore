@@ -46,6 +46,9 @@ logs/
 *.sqlite
 *.sqlite3
 
+# PTB persistence state (v7 B14)
+*.pkl
+
 # Telegram session files (IMPORTANT!)
 *.session
 *.session-journal

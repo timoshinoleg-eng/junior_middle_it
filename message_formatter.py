@@ -5,6 +5,7 @@ Message Formatter Module - Форматирование сообщений ва�
 import re
 from typing import Dict, List, Optional
 from dataclasses import dataclass
+from urllib.parse import quote
 
 # Эмодзи для категорий
 CATEGORY_EMOJIS = {
@@ -291,10 +292,15 @@ class JobMessageFormatter:
                 keyboard.append(row1)
             return {'inline_keyboard': keyboard}
         row1.append({'text': '💾 Сохранить', 'callback_data': f"save:{job_id}"})
-        row1.append({
-            'text': '📤 Поделиться',
-            'switch_inline_query': f"{title} - вакансия для {job.get('level', 'Junior')}"
-        })
+        # v7 (B16): share via https://t.me/share/url — works for every user and
+        # does not require an InlineQueryHandler (switch_inline_query was dead).
+        share_text = f"{title} - вакансия для {job.get('level', 'Junior')}"
+        if url:
+            row1.append({
+                'text': '📤 Поделиться',
+                'url': f"https://t.me/share/url?url={quote(url, safe='')}"
+                       f"&text={quote(share_text, safe='')}",
+            })
         keyboard.append(row1)
         
         row2 = []

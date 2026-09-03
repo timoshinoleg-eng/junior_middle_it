@@ -26,7 +26,10 @@ import re
 import requests
 import xml.etree.ElementTree as ET
 from html import unescape as html_unescape
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, Bot
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, Bot,
+    BotCommand, BotCommandScopeChat,
+)
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, 
     CallbackQueryHandler, filters
@@ -784,26 +787,51 @@ class DatabaseConnection:
             return False
     
     def get_user_favorites(self, user_id: int) -> List[Dict]:
-        """Get user's favorite jobs"""
+        """Get user's favorite jobs.
+
+        v7 (B19): LEFT JOIN + job_payloads fallback — favorites saved under
+        posts from another process (e.g. serverless) previously vanished
+        because their job row was missing locally.
+        """
         results = self.fetchall("""
-            SELECT j.hash, j.title, j.company, j.level, j.category, j.url
+            SELECT f.job_hash, j.title, j.company, j.level, j.category, j.url,
+                   COALESCE(f.status, 'saved')
             FROM user_favorites f
-            JOIN posted_jobs j ON f.job_hash = j.hash
+            LEFT JOIN posted_jobs j ON f.job_hash = j.hash
             WHERE f.user_id = ?
             ORDER BY f.saved_at DESC
         """, (user_id,))
-        
-        return [
-            {
-                'hash': row[0],
-                'title': row[1],
-                'company': row[2],
-                'level': row[3],
-                'category': row[4],
-                'url': row[5],
-            }
-            for row in results
-        ]
+
+        favorites: List[Dict] = []
+        for row in results:
+            job_hash, title, company, level, category, url, status = row
+            if not title:
+                payload = self.get_job_payload(job_hash) or {}
+                title = payload.get('title') or 'Вакансия'
+                company = payload.get('company') or ''
+                level = payload.get('level') or ''
+                category = payload.get('category') or 'other'
+                url = payload.get('url') or ''
+            favorites.append({
+                'hash': job_hash,
+                'title': title,
+                'company': company,
+                'level': level,
+                'category': category,
+                'url': url,
+                'status': status,
+            })
+        return favorites
+
+    def set_favorite_status(self, user_id: int, job_hash: str, status: str) -> None:
+        """v7 (B19): application pipeline status saved→applied→interview→offer/rejected."""
+        try:
+            self.execute(
+                'UPDATE user_favorites SET status = ? WHERE user_id = ? AND job_hash = ?',
+                (status, user_id, job_hash),
+            )
+        except sqlite3.OperationalError:
+            logger.debug("set_favorite_status: legacy schema without status column")
     
     # User settings / profile methods
     def _default_settings(self) -> Dict:
@@ -3400,9 +3428,26 @@ class JobBot:
         self.is_paused = False
         self.formatter = JobMessageFormatter() if FORMATTER_AVAILABLE else None
         self.classifier = JobClassifier() if CLASSIFIER_AVAILABLE else None
-        # /setup conversation: user_id -> step
-        self.setup_steps: Dict[int, str] = {}
-    
+
+    # ---- v7 (B14): wizard state lives in context.user_data so PTB persistence
+    # (PicklePersistence / future PG persister) keeps it across restarts ----
+    @staticmethod
+    def _wizard_step(context) -> Optional[str]:
+        try:
+            return context.user_data.get('setup_step')
+        except Exception:
+            return None
+
+    @staticmethod
+    def _set_wizard_step(context, step: Optional[str]) -> None:
+        try:
+            if step is None:
+                context.user_data.pop('setup_step', None)
+            else:
+                context.user_data['setup_step'] = step
+        except Exception:
+            pass
+
     async def check_admin(self, update: Update) -> bool:
         """Check if user is admin.
 
@@ -3445,8 +3490,8 @@ class JobBot:
                                 text=(
                                     f"🏆 Premium разблокирован: {Config.REF_REWARD_THRESHOLD}+ "
                                     f"приглашённых!\n"
-                                    f"• Senior-вакансии в match\n"
-                                    f"• +{Config.REF_REWARD_DIGEST_BONUS} слотов digests\n"
+                                    f"• Больше вакансий в личном digest "
+                                    f"(+{Config.REF_REWARD_DIGEST_BONUS} слотов)\n"
                                     f"/profile"
                                 ),
                             )
@@ -3507,7 +3552,7 @@ class JobBot:
             f"📌 Главный канал: {channel_link}\n"
             f"📬 Личный digest: /digest on — подборка в ЛС по профилю.\n"
             f"⚡ Мгновенные алерты: /alerts on — 1–2 топа за цикл.\n"
-            f"🏆 Premium: пригласи {thr}+ друзей (/ref) → Senior + больше digests."
+            f"🏆 Premium: пригласи {thr}+ друзей (/ref) → больше вакансий в digest."
             f"{tracks_line}\n\n"
             "*Команды:*\n"
             "/setup — онбординг профиля\n"
@@ -3544,7 +3589,7 @@ class JobBot:
     async def cmd_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start profile onboarding wizard."""
         user_id = update.effective_user.id
-        self.setup_steps[user_id] = 'categories'
+        self._set_wizard_step(context, 'categories')
         self.db.log_event(user_id, 'setup_start', {})
         settings = self.db.get_user_settings(user_id)
         enabled = settings['enabled_categories']
@@ -3565,7 +3610,7 @@ class JobBot:
                 "Настрой категории: /categories\n"
                 "Потом пришли min salary числом (USD, 0 = без фильтра)."
             )
-            self.setup_steps[user_id] = 'salary'
+            self._set_wizard_step(context, 'salary')
 
     async def cmd_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -3604,11 +3649,21 @@ class JobBot:
             await update.message.reply_text("📭 Личный digest выключен.")
             return
         if arg in ('now', 'сейчас'):
-            n = await self.send_personal_digest(user_id)
-            await update.message.reply_text(
-                f"📬 Отправлено вакансий: {n}" if n else
-                "Пока нет свежих вакансий под твой профиль. /setup"
-            )
+            # v7 (B19): distinguish "nothing matched" from "send failed".
+            res = await self.send_personal_digest(user_id)
+            if res['matched'] == 0:
+                await update.message.reply_text(
+                    "Пока нет свежих вакансий под твой профиль. /setup"
+                )
+            elif res['failed'] and not res['sent']:
+                await update.message.reply_text(
+                    f"⚠️ Digest не отправлен ({res['reason']}). Попробуйте позже."
+                )
+            else:
+                msg = f"📬 Отправлено вакансий: {res['sent']}"
+                if res['failed']:
+                    msg += f" (не доставлено: {res['failed']}, {res['reason']})"
+                await update.message.reply_text(msg)
             return
         s = self.db.get_user_settings(user_id)
         await update.message.reply_text(
@@ -3728,8 +3783,14 @@ class JobBot:
             return base + Config.REF_REWARD_DIGEST_BONUS
         return base
 
-    async def send_personal_digest(self, user_id: int) -> int:
-        """Send matched jobs to user DM. Returns count sent."""
+    async def send_personal_digest(self, user_id: int) -> Dict:
+        """Send matched jobs to user DM.
+
+        v7 (B19): returns a structured result instead of a bare int so callers
+        can distinguish "nothing matched" from "send failed":
+        {'matched': int, 'sent': int, 'failed': int, 'reason': str}
+        """
+        result = {'matched': 0, 'sent': 0, 'failed': 0, 'reason': ''}
         settings = self._effective_profile(user_id)
         limit = self._digest_limit(settings)
         jobs = self.db.recent_jobs_for_digest(
@@ -3745,8 +3806,10 @@ class JobBot:
                 matched.append(job)
             if len(matched) >= limit:
                 break
+        result['matched'] = len(matched)
         if not matched:
-            return 0
+            result['reason'] = 'no_matches'
+            return result
 
         premium_tag = " · 🏆" if settings.get('premium_unlocked') else ""
         header = (
@@ -3758,9 +3821,9 @@ class JobBot:
             await self.application.bot.send_message(chat_id=user_id, text=header)
         except Exception as e:
             logger.warning(f"digest header fail user={user_id}: {e}")
-            return 0
+            result['reason'] = f'header_send_failed: {type(e).__name__}'
+            return result
 
-        sent = 0
         for job in matched:
             try:
                 if Config.ENABLE_MARKDOWN_V2 and self.formatter:
@@ -3783,12 +3846,15 @@ class JobBot:
                         parse_mode='HTML',
                         disable_web_page_preview=True,
                     )
-                sent += 1
+                result['sent'] += 1
                 await asyncio.sleep(0.4)
             except Exception as e:
+                result['failed'] += 1
+                result['reason'] = f'send_failed: {type(e).__name__}'
                 logger.debug(f"digest job fail: {e}")
-        self.db.log_event(user_id, 'personal_digest_sent', {'count': sent})
-        return sent
+        self.db.log_event(user_id, 'personal_digest_sent',
+                          {'count': result['sent'], 'failed': result['failed']})
+        return result
 
     async def push_realtime_alerts(self, new_jobs: List[Dict]) -> int:
         """After crawl: DM matching jobs to alert subscribers. Returns total DMs."""
@@ -3865,20 +3931,23 @@ class JobBot:
     async def handle_setup_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle free-text steps of /setup wizard."""
         user_id = update.effective_user.id if update.effective_user else None
-        if not user_id or user_id not in self.setup_steps:
+        step = self._wizard_step(context)
+        if not user_id or not step:
             return
-        step = self.setup_steps.get(user_id)
         text = (update.message.text or '').strip()
 
         if step == 'salary':
-            try:
-                # allow "1500", "$1500", "0"
-                num = int(re.sub(r'[^\d]', '', text) or '0')
-            except ValueError:
-                await update.message.reply_text("Число, например 0 или 2000 (USD-ish min).")
+            # v7 (B19): "abc" must NOT silently become 0 — validate explicitly.
+            digits = re.sub(r'[^\d]', '', text)
+            if not digits:
+                await update.message.reply_text(
+                    "Не вижу число в сообщении. Пришли зарплату цифрами, "
+                    "например 0 или 2500 (0 = без фильтра)."
+                )
                 return
+            num = int(digits)
             self.db.save_user_settings(user_id, {'min_salary_filter': num})
-            self.setup_steps[user_id] = 'skills'
+            self._set_wizard_step(context, 'skills')
             await update.message.reply_text(
                 "⚙️ *Онбординг 3/4 — стек*\n"
                 "Пришли навыки через запятую, например:\n"
@@ -3891,7 +3960,7 @@ class JobBot:
         if step == 'skills':
             skills = '' if text in ('-', '—', 'skip', 'нет') else text[:200]
             self.db.save_user_settings(user_id, {'skills': skills})
-            self.setup_steps[user_id] = 'digest'
+            self._set_wizard_step(context, 'digest')
             await update.message.reply_text(
                 "⚙️ *Онбординг 4/4 — личный digest*\n"
                 "Присылать подборку в ЛС раз в сутки?",
@@ -3988,25 +4057,68 @@ class JobBot:
                 message += f"• {escape_html(title)}\n  🏢 {escape_html(company)} | 🎯 {level}\n\n"
             await update.message.reply_text(message, parse_mode='HTML')
     
-    async def cmd_favorites(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /favorites command"""
-        user_id = update.effective_user.id
+    # ---- v7 (B19): favorites with links / removal / pagination / statuses ----
+    FAVORITES_PAGE_SIZE = 5
+    FAVORITE_STATUS_ORDER = ('saved', 'applied', 'interview', 'offer', 'rejected')
+    FAVORITE_STATUS_LABELS = {
+        'saved': '💾 сохранено',
+        'applied': '📨 отклик',
+        'interview': '🗓 интервью',
+        'offer': '🎉 оффер',
+        'rejected': '🚫 отказ',
+    }
+
+    def _next_favorite_status(self, status: str) -> str:
+        try:
+            idx = self.FAVORITE_STATUS_ORDER.index(status)
+        except ValueError:
+            idx = -1
+        return self.FAVORITE_STATUS_ORDER[(idx + 1) % len(self.FAVORITE_STATUS_ORDER)]
+
+    def _render_favorites(self, user_id: int, page: int = 0):
+        """Plain-text favorites page + inline keyboard (open/status/delete/nav)."""
         favorites = self.db.get_user_favorites(user_id)
-        
-        if self.formatter:
-            message = self.formatter.format_favorites_list(favorites)
-            await update.message.reply_text(
-                message,
-                parse_mode=ParseMode.MARKDOWN_V2
+        if not favorites:
+            return ("💾 Список избранного пуст.\n"
+                    "Жми «Сохранить» на вакансиях в канале или в /digest.", None)
+        page_size = self.FAVORITES_PAGE_SIZE
+        total_pages = (len(favorites) + page_size - 1) // page_size
+        page = max(0, min(page, total_pages - 1))
+        start = page * page_size
+
+        lines = [f"💾 Избранное ({len(favorites)}), стр. {page + 1}/{total_pages}:", ""]
+        rows: List[List[Dict]] = []
+        for i, job in enumerate(favorites[start:start + page_size], start=start + 1):
+            status = job.get('status', 'saved')
+            lines.append(
+                f"{i}. {job.get('title') or 'Вакансия'} — {job.get('company') or '?'}\n"
+                f"    {self.FAVORITE_STATUS_LABELS.get(status, status)}"
             )
-        else:
-            if not favorites:
-                await update.message.reply_text("💾 Список избранного пуст")
-            else:
-                message = f"💾 <b>Избранное ({len(favorites)}):</b>\n\n"
-                for job in favorites[:10]:
-                    message += f"• {escape_html(job['title'])}\n  🏢 {escape_html(job['company'])}\n\n"
-                await update.message.reply_text(message, parse_mode='HTML')
+            row: List[Dict] = []
+            if job.get('url'):
+                row.append({'text': '🔗 Открыть', 'url': job['url']})
+            row.append({
+                'text': f"📋 {self.FAVORITE_STATUS_LABELS.get(status, status)}",
+                'callback_data': f"fav_status:{job['hash']}:{page}",
+            })
+            row.append({'text': '✖️ Удалить', 'callback_data': f"fav_del:{job['hash']}:{page}"})
+            rows.append(row)
+
+        if total_pages > 1:
+            nav: List[Dict] = []
+            if page > 0:
+                nav.append({'text': '⬅️ Раньше', 'callback_data': f'fav_page:{page - 1}'})
+            if page < total_pages - 1:
+                nav.append({'text': 'Позже ➡️', 'callback_data': f'fav_page:{page + 1}'})
+            if nav:
+                rows.append(nav)
+        return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+    async def cmd_favorites(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /favorites command (v7, B19: links/removal/pagination/status)."""
+        user_id = update.effective_user.id
+        text, markup = self._render_favorites(user_id, page=0)
+        await update.message.reply_text(text, reply_markup=markup)
     
     async def cmd_categories(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /categories command"""
@@ -4056,7 +4168,7 @@ class JobBot:
         # --- setup wizard ---
         if data == 'setup_next_salary':
             await query.answer()
-            self.setup_steps[user_id] = 'salary'
+            self._set_wizard_step(context, 'salary')
             await query.edit_message_text(
                 "⚙️ Онбординг 2/4 — min salary\n"
                 "Пришли число в USD (годовой/ориентир), например 0 или 2500.\n"
@@ -4069,7 +4181,7 @@ class JobBot:
                 'digest_enabled': True,
                 'onboarding_done': True,
             })
-            self.setup_steps.pop(user_id, None)
+            self._set_wizard_step(context, None)
             self.db.log_event(user_id, 'setup_done', {'digest': True})
             await query.edit_message_text(
                 "✅ Профиль готов. Digest включён.\n/digest now — пробная подборка."
@@ -4081,7 +4193,7 @@ class JobBot:
                 'digest_enabled': False,
                 'onboarding_done': True,
             })
-            self.setup_steps.pop(user_id, None)
+            self._set_wizard_step(context, None)
             self.db.log_event(user_id, 'setup_done', {'digest': False})
             await query.edit_message_text("✅ Профиль готов. Digest выключен. /digest on — включить.")
             return
@@ -4102,6 +4214,52 @@ class JobBot:
                 pass
             return
 
+        # --- v7 (B19): favorites management ---
+        if data.startswith('fav_page:'):
+            try:
+                page = int(data.split(':', 1)[1])
+            except ValueError:
+                page = 0
+            text, markup = self._render_favorites(user_id, page=page)
+            await query.answer()
+            try:
+                await query.edit_message_text(text, reply_markup=markup)
+            except Exception:
+                pass
+            return
+        if data.startswith('fav_del:'):
+            parts = data.split(':')
+            job_hash = parts[1] if len(parts) > 1 else ''
+            page = int(parts[2]) if len(parts) > 2 and parts[2].lstrip('-').isdigit() else 0
+            self.db.remove_favorite(user_id, job_hash)
+            self.db.log_event(user_id, 'favorite_removed', {'hash': job_hash})
+            text, markup = self._render_favorites(user_id, page=page)
+            await query.answer("Удалено")
+            try:
+                await query.edit_message_text(text, reply_markup=markup)
+            except Exception:
+                pass
+            return
+        if data.startswith('fav_status:'):
+            parts = data.split(':')
+            job_hash = parts[1] if len(parts) > 1 else ''
+            page = int(parts[2]) if len(parts) > 2 and parts[2].lstrip('-').isdigit() else 0
+            current = next(
+                (f.get('status', 'saved') for f in self.db.get_user_favorites(user_id)
+                 if f.get('hash') == job_hash),
+                'saved',
+            )
+            new_status = self._next_favorite_status(current)
+            self.db.set_favorite_status(user_id, job_hash, new_status)
+            self.db.log_event(user_id, 'favorite_status', {'hash': job_hash, 'status': new_status})
+            text, markup = self._render_favorites(user_id, page=page)
+            await query.answer(self.FAVORITE_STATUS_LABELS.get(new_status, new_status))
+            try:
+                await query.edit_message_text(text, reply_markup=markup)
+            except Exception:
+                pass
+            return
+
         if data.startswith('expand:') or data.startswith('compact:'):
             mode = 'full' if data.startswith('expand:') else 'compact'
             job_hash = data.split(':', 1)[1]
@@ -4117,18 +4275,38 @@ class JobBot:
                 formatted = self.formatter.format_job(
                     job, view_mode=mode, bot_username=Config.BOT_USERNAME
                 )
-                await query.edit_message_text(
-                    text=formatted.text,
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=InlineKeyboardMarkup(
-                        formatted.reply_markup['inline_keyboard']
-                    ),
-                    disable_web_page_preview=True,
-                )
+                chat_type = getattr(getattr(query.message, 'chat', None), 'type', 'private')
+                if chat_type == 'private':
+                    # The message belongs to this user's DM — editing in place is safe.
+                    await query.edit_message_text(
+                        text=formatted.text,
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup(
+                            formatted.reply_markup['inline_keyboard']
+                        ),
+                        disable_web_page_preview=True,
+                    )
+                    await query.answer()
+                else:
+                    # v7 (B17): NEVER edit a channel/group post — that rewrites the
+                    # text for all subscribers. Details go to the user's DM instead.
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=formatted.text,
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=InlineKeyboardMarkup(
+                            formatted.reply_markup['inline_keyboard']
+                        ),
+                        disable_web_page_preview=True,
+                    )
+                    await query.answer("📨 Подробности отправлены в личные сообщения")
                 self.db.log_event(user_id, f'job_{mode}', {'hash': job_hash})
             except Exception as e:
                 logger.error(f"expand/compact failed: {e}")
-                await query.answer("Не удалось переключить вид", show_alert=True)
+                try:
+                    await query.answer("Не удалось переключить вид", show_alert=True)
+                except Exception:
+                    pass
             return
         
         if data.startswith('hide_cat:'):
@@ -4155,7 +4333,7 @@ class JobBot:
                 keyboard = self.formatter.create_category_settings_keyboard(enabled)
                 rows = keyboard['inline_keyboard']
                 # Keep setup "next" if user is in wizard
-                if self.setup_steps.get(user_id) == 'categories':
+                if self._wizard_step(context) == 'categories':
                     rows = [r for r in rows if not (
                         len(r) == 1 and r[0].get('callback_data') == 'close_settings'
                     )]
@@ -4190,6 +4368,65 @@ class JobBot:
 # v7 (B20): flipped to True only after polling actually started; render_main's
 # /health reports 5xx until then (previously bot_running was set on import).
 BOT_LIVE = False
+
+# v7 (B15): command menus published via set_my_commands (public + admin scope).
+PUBLIC_BOT_COMMANDS = [
+    ('start', 'Старт и помощь'),
+    ('setup', 'Настроить профиль (4 шага)'),
+    ('profile', 'Мой профиль'),
+    ('digest', 'Личный дайджест: on/off/now'),
+    ('alerts', 'Мгновенные алерты: on/off'),
+    ('favorites', 'Сохранённые вакансии'),
+    ('categories', 'Категории вакансий'),
+    ('tracks', 'Тематические каналы'),
+    ('sources', 'Статус источников'),
+    ('ref', 'Пригласить друга'),
+]
+ADMIN_BOT_COMMANDS = [
+    ('status', 'Статистика публикаций (админ)'),
+    ('last', 'Последние вакансии (админ)'),
+    ('pause', 'Пауза публикации (админ)'),
+    ('resume', 'Возобновить публикацию (админ)'),
+    ('stats_growth', 'Воронка роста (админ)'),
+]
+
+
+async def _post_init_bot(application: Application) -> None:
+    """v7 (B15): publish command menus; failures must not kill startup."""
+    try:
+        await application.bot.set_my_commands(
+            [BotCommand(cmd, desc) for cmd, desc in PUBLIC_BOT_COMMANDS]
+        )
+        if Config.ADMIN_USER_ID:
+            await application.bot.set_my_commands(
+                [BotCommand(cmd, desc)
+                 for cmd, desc in PUBLIC_BOT_COMMANDS + ADMIN_BOT_COMMANDS],
+                scope=BotCommandScopeChat(chat_id=int(Config.ADMIN_USER_ID)),
+            )
+        logger.info("📋 Bot command menus published")
+    except Exception as e:
+        logger.warning(f"set_my_commands failed: {e}")
+
+
+async def _on_unhandled_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """v7 (B15): global PTB error handler.
+
+    Logs + reports to Sentry, and ALWAYS releases a pending callback query with
+    a toast so the user's tap never hangs silently.
+    """
+    error = context.error
+    logger.error(f"❌ Unhandled error: {error}", exc_info=error)
+    try:
+        import sentry_sdk
+        sentry_sdk.capture_exception(error)
+    except Exception:
+        pass
+    query = getattr(update, 'callback_query', None)
+    if query is not None:
+        try:
+            await query.answer("⚠️ Ошибка. Попробуйте ещё раз", show_alert=False)
+        except Exception:
+            pass
 
 # Lightweight telemetry for external monitoring (render_main /health)
 CYCLE_TELEMETRY = {
@@ -4264,10 +4501,24 @@ async def main():
 
     # Setup Telegram bot (job-queue optional for digests)
     builder = Application.builder().token(Config.TELEGRAM_BOT_TOKEN)
-    try:
-        application = builder.build()
-    except Exception:
-        application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
+    # v7 (B14): persistent user_data (incl. /setup wizard step) across restarts.
+    # Serverless FS is read-only and the interactive bot never runs there.
+    if not os.getenv('VERCEL'):
+        try:
+            from telegram.ext import PersistenceInput, PicklePersistence
+            _persistence = PicklePersistence(
+                filepath=os.getenv('PERSISTENCE_FILE', 'bot_persistence.pkl'),
+                store_data=PersistenceInput(
+                    bot_data=True, chat_data=True, user_data=True, callback_data=False
+                ),
+            )
+            builder = builder.persistence(_persistence)
+            logger.info("💾 PicklePersistence enabled (wizard/profile state survives restarts)")
+        except Exception as e:
+            logger.warning(f"Persistence unavailable (state in-memory only): {e}")
+    builder = builder.post_init(_post_init_bot)
+    application = builder.build()
+    application.add_error_handler(_on_unhandled_error)
     job_bot = JobBot(application, db)
     
     # Register command handlers
@@ -4331,9 +4582,12 @@ async def main():
             if Config.ENABLE_PERSONAL_DIGEST:
                 for uid in db.list_digest_subscribers():
                     try:
-                        n = await job_bot.send_personal_digest(uid)
-                        if n:
-                            logger.info(f"📬 Personal digest → {uid}: {n} jobs")
+                        res = await job_bot.send_personal_digest(uid)
+                        if res['sent']:
+                            logger.info(
+                                f"📬 Personal digest → {uid}: {res['sent']} jobs"
+                                + (f" ({res['failed']} failed)" if res['failed'] else "")
+                            )
                         await asyncio.sleep(0.5)
                     except Exception as e:
                         logger.warning(f"Personal digest fail user={uid}: {e}")
