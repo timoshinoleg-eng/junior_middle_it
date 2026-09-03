@@ -668,7 +668,23 @@ class DatabaseConnection:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
+
+        # v7 Stage 1 (B10): per-target delivery ledger. One row per
+        # (job_hash, target_channel) so a job that reached 1 of N channels is
+        # retried ONLY for the channels that failed, instead of being either
+        # globally deduped (lost) or globally reposted (duplicate).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS deliveries (
+                job_hash TEXT NOT NULL,
+                target_channel TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(job_hash, target_channel)
+            )
+        """)
+
         # Indexes
         c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_category ON posted_jobs(category)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_posted_at ON posted_jobs(posted_at)")
@@ -678,6 +694,7 @@ class DatabaseConnection:
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_job_payloads_created ON job_payloads(created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status)")
         
         # Meta table for one-shot migrations and flags
         c.execute("""
@@ -925,6 +942,35 @@ class DatabaseConnection:
         except Exception:
             return None
 
+    # ---- v7 Stage 1 (B10): per-target delivery ledger ----
+    def record_delivery(self, job_hash: str, target_channel: str, status: str,
+                        error: str = '') -> None:
+        """Upsert the delivery state for one (job, target channel) pair."""
+        try:
+            self.execute(
+                'INSERT INTO deliveries (job_hash, target_channel, status, attempts, last_error, updated_at) '
+                'VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP) '
+                'ON CONFLICT(job_hash, target_channel) DO UPDATE SET '
+                'status=excluded.status, attempts=deliveries.attempts + 1, '
+                'last_error=excluded.last_error, updated_at=CURRENT_TIMESTAMP',
+                (job_hash, str(target_channel), status, error),
+            )
+        except Exception as e:
+            logger.debug(f"record_delivery failed: {e}")
+
+    def failed_deliveries(self, limit: int = 100, max_attempts: int = 5) -> List[Dict]:
+        """Jobs with targets that still need a retry (B10)."""
+        rows = self.fetchall(
+            'SELECT job_hash, target_channel, attempts FROM deliveries '
+            "WHERE status = 'failed' AND attempts < ? "
+            'ORDER BY updated_at ASC LIMIT ?',
+            (max_attempts, limit),
+        )
+        return [
+            {'job_hash': r[0], 'target_channel': r[1], 'attempts': r[2]}
+            for r in rows
+        ]
+
     def list_digest_subscribers(self) -> List[int]:
         rows = self.fetchall(
             'SELECT user_id FROM user_settings WHERE digest_enabled = 1'
@@ -1131,6 +1177,51 @@ def init_database() -> DatabaseConnection:
     return DatabaseConnection()
 
 
+def run_v7_migration(db: DatabaseConnection) -> bool:
+    """v7 Stage 1 idempotent schema migration for pre-v7 SQLite databases.
+
+    - deliveries ledger (B10: per-target retry)
+    - posted_jobs.last_seen_at (republish freshness observability)
+    - user_favorites.status (Stage 2 application pipeline)
+    """
+    def _columns(cursor, table: str) -> set:
+        cursor.execute(f"PRAGMA table_info({table})")
+        return {row[1] for row in cursor.fetchall()}
+
+    try:
+        c = db.conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS deliveries (
+                job_hash TEXT NOT NULL,
+                target_channel TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(job_hash, target_channel)
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status)")
+
+        cols = _columns(c, 'posted_jobs')
+        if 'last_seen_at' not in cols:
+            c.execute("ALTER TABLE posted_jobs ADD COLUMN last_seen_at TIMESTAMP")
+
+        cols = _columns(c, 'user_favorites')
+        if 'status' not in cols:
+            c.execute("ALTER TABLE user_favorites ADD COLUMN status TEXT DEFAULT 'saved'")
+
+        db.conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"❌ v7 migration failed: {e}", exc_info=True)
+        try:
+            db.conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -1322,6 +1413,14 @@ def register_posted_job(job: Dict, db: DatabaseConnection) -> None:
                 job.get('category', 'other')
             )
         )
+    # v7 (Stage 1 observability): last time this job was seen/posted.
+    try:
+        db.execute(
+            'UPDATE posted_jobs SET last_seen_at = CURRENT_TIMESTAMP WHERE hash = ?',
+            (job_hash,),
+        )
+    except sqlite3.OperationalError:
+        pass  # pre-v7 schema without the column; run_v7_migration adds it
     logger.debug(f"💾 Saved new job: {job.get('title', 'N/A')}")
 
 
@@ -2839,11 +2938,35 @@ async def fetch_telegram_channels() -> List[Dict]:
         return []
 
 
-async def get_recent_channel_job_hashes(limit: Optional[int] = None) -> set:
-    """Read recent channel messages via Telethon and return hashes for posted job URLs."""
+def dedup_target_channels() -> List[str]:
+    """v7 (B11): every channel whose history must feed dedup — the main channel
+    plus all routed thematic channels (multi-track)."""
+    channels = [Config.CHANNEL_ID]
+    channels.extend(ch for _, ch in (Config.CHANNEL_ROUTES or []))
+    unique: List[str] = []
+    seen = set()
+    for ch in channels:
+        ch = (ch or '').strip()
+        if ch and ch not in seen:
+            seen.add(ch)
+            unique.append(ch)
+    return unique
+
+
+async def get_recent_channel_job_hashes(limit: Optional[int] = None,
+                                        channels: Optional[List[str]] = None) -> set:
+    """Read recent channel messages via Telethon and return hashes for posted job URLs.
+
+    v7 (B11): scans the main channel AND routed thematic channels, otherwise
+    multi-track posts would be deduped only against the main channel.
+    """
     if not TELEGRAM_PARSER_AVAILABLE:
         return set()
     if not Config.TELEGRAM_API_ID or not Config.TELEGRAM_API_HASH:
+        return set()
+    if channels is None:
+        channels = dedup_target_channels()
+    if not channels:
         return set()
     try:
         parser = TelegramJobParser()
@@ -2851,21 +2974,28 @@ async def get_recent_channel_job_hashes(limit: Optional[int] = None) -> set:
             return set()
         hashes = set()
         try:
-            entity = await parser.client.get_entity(Config.CHANNEL_ID)
-            async for message in parser.client.iter_messages(entity, limit=limit or Config.RECENT_TELEGRAM_MESSAGES):
-                text = getattr(message, 'message', '') or ''
-                urls = extract_urls_from_text(text)
-                if getattr(message, 'reply_markup', None):
-                    for row in getattr(message.reply_markup, 'rows', []) or []:
-                        for button in getattr(row, 'buttons', []) or []:
-                            url = getattr(button, 'url', None)
-                            if url:
-                                urls.append(url)
-                for url in urls:
-                    hashes.add(hashlib.sha256(normalize_url(url).encode()).hexdigest()[:16])
+            max_msgs = limit or Config.RECENT_TELEGRAM_MESSAGES
+            for chat_id in channels:
+                try:
+                    entity = await parser.client.get_entity(chat_id)
+                    async for message in parser.client.iter_messages(entity, limit=max_msgs):
+                        text = getattr(message, 'message', '') or ''
+                        urls = extract_urls_from_text(text)
+                        if getattr(message, 'reply_markup', None):
+                            for row in getattr(message.reply_markup, 'rows', []) or []:
+                                for button in getattr(row, 'buttons', []) or []:
+                                    url = getattr(button, 'url', None)
+                                    if url:
+                                        urls.append(url)
+                        for url in urls:
+                            hashes.add(hashlib.sha256(normalize_url(url).encode()).hexdigest()[:16])
+                except Exception as e:
+                    logger.warning(f"⚠️ Dedup history unavailable for {chat_id}: {e}")
         finally:
             await parser.disconnect()
-        logger.info(f"🔎 Loaded {len(hashes)} recent channel job hashes")
+        logger.info(
+            f"🔎 Loaded {len(hashes)} recent job hashes from {len(channels)} channel(s)"
+        )
         return hashes
     except Exception as e:
         logger.warning(f"⚠️ Could not load recent channel history for dedup: {e}")
@@ -2953,6 +3083,11 @@ async def post_job_with_bot(bot: Bot, job: Dict, db: Optional[DatabaseConnection
         if i > 0:
             await asyncio.sleep(Config.MULTI_TRACK_POST_DELAY)
         ok = await _send_job_to_chat(bot, job, chat_id, interactive=interactive)
+        if db:
+            # v7 (B10): remember the outcome per target channel so the next
+            # cycle retries ONLY the failed ones.
+            db.record_delivery(job_hash, chat_id, 'sent' if ok else 'failed',
+                               error='' if ok else 'send_error')
         if ok:
             any_ok = True
             logger.info(
@@ -2960,6 +3095,38 @@ async def post_job_with_bot(bot: Bot, job: Dict, db: Optional[DatabaseConnection
                 f"[{job.get('category', 'other')}|{job.get('source', 'N/A')}]"
             )
     return any_ok
+
+
+async def retry_failed_deliveries(bot: Bot, db: DatabaseConnection,
+                                  interactive: bool = True,
+                                  limit: int = 100) -> Dict[str, int]:
+    """v7 Stage 1 (B10): resend jobs only to channels where delivery failed.
+
+    Returns counters {'retried', 'sent', 'failed', 'missing_payload'}.
+    """
+    stats = {'retried': 0, 'sent': 0, 'failed': 0, 'missing_payload': 0}
+    if bot is None or db is None:
+        return stats
+    for row in db.failed_deliveries(limit=limit):
+        job_hash = row['job_hash']
+        target = row['target_channel']
+        job = db.get_job_payload(job_hash)
+        if not job:
+            stats['missing_payload'] += 1
+            db.record_delivery(job_hash, target, 'failed', error='payload_missing')
+            continue
+        job['hash'] = job_hash
+        stats['retried'] += 1
+        ok = await _send_job_to_chat(bot, job, target, interactive=interactive)
+        db.record_delivery(job_hash, target, 'sent' if ok else 'failed',
+                           error='' if ok else 'send_error')
+        stats['sent' if ok else 'failed'] += 1
+        if ok:
+            logger.info(f"🔁 Delivery retry succeeded → {target} ({job_hash})")
+        await asyncio.sleep(Config.MULTI_TRACK_POST_DELAY)
+    if stats['retried']:
+        logger.info(f"🔁 Delivery retries: {stats}")
+    return stats
 
 
 async def post_job_with_telethon(job: Dict) -> bool:
@@ -3038,6 +3205,7 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
     db = init_database() if use_sqlite else None
     if db:
         run_hash_migration(db)
+        run_v7_migration(db)
     # v7 (B06): interactive buttons require the callback-handling process to have
     # the job payload (job_payloads table). Serverless instances have no shared
     # store, so their posts go out without save/expand buttons (TODO Stage 1: PG).
@@ -3075,6 +3243,10 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
                 'detail': telethon_preflight.get('detail'),
                 'transport': post_transport,
             }
+
+    # v7 Stage 1 (B10): first, retry previously failed per-channel deliveries.
+    if db and bot:
+        await retry_failed_deliveries(bot, db, interactive=interactive)
 
     started = time.monotonic()
     all_jobs = []
@@ -4001,83 +4173,18 @@ class JobBot:
             return
     
     async def post_job(self, job: Dict) -> bool:
-        """Post job to one or more track channels (multi-track aware)."""
+        """Post job to one or more track channels (multi-track aware).
+
+        v7 Stage 1: unified with the serverless path via post_job_with_bot,
+        which saves the payload BEFORE sending (B08) and records per-target
+        delivery outcomes for retry (B10).
+        """
         if self.is_paused:
             logger.info("⏸️ Skipped posting (bot is paused)")
             return False
-
-        job_hash = job.get('hash') or generate_job_hash(job)
-        job['hash'] = job_hash
-        self.db.save_job_payload(job_hash, job)
-
-        targets = get_target_channels(job)
-        if not targets:
-            logger.error("❌ No target channels for job")
-            return False
-
-        any_ok = False
-        for i, chat_id in enumerate(targets):
-            if i > 0:
-                await asyncio.sleep(Config.MULTI_TRACK_POST_DELAY)
-            try:
-                if Config.ENABLE_MARKDOWN_V2 and self.formatter:
-                    formatted = self.formatter.format_job(
-                        job, view_mode='compact', bot_username=Config.BOT_USERNAME
-                    )
-                    await self.application.bot.send_message(
-                        chat_id=chat_id,
-                        text=formatted.text,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        reply_markup=InlineKeyboardMarkup(
-                            formatted.reply_markup['inline_keyboard']
-                        ),
-                        disable_web_page_preview=formatted.disable_web_page_preview
-                    )
-                else:
-                    await self.application.bot.send_message(
-                        chat_id=chat_id,
-                        text=format_job_message_legacy(job),
-                        parse_mode='HTML',
-                        disable_web_page_preview=True
-                    )
-                any_ok = True
-                logger.info(
-                    f"✅ Posted → {chat_id}: {job.get('title', 'N/A')} "
-                    f"[{job.get('category', 'other')}]"
-                )
-            except RetryAfter as e:
-                logger.warning(f"⏳ Flood control {chat_id}: {e.retry_after}s")
-                await asyncio.sleep(e.retry_after)
-                try:
-                    # one retry after flood wait
-                    if Config.ENABLE_MARKDOWN_V2 and self.formatter:
-                        formatted = self.formatter.format_job(
-                            job, view_mode='compact', bot_username=Config.BOT_USERNAME
-                        )
-                        await self.application.bot.send_message(
-                            chat_id=chat_id,
-                            text=formatted.text,
-                            parse_mode=ParseMode.MARKDOWN_V2,
-                            reply_markup=InlineKeyboardMarkup(
-                                formatted.reply_markup['inline_keyboard']
-                            ),
-                            disable_web_page_preview=True,
-                        )
-                    else:
-                        await self.application.bot.send_message(
-                            chat_id=chat_id,
-                            text=format_job_message_legacy(job),
-                            parse_mode='HTML',
-                            disable_web_page_preview=True,
-                        )
-                    any_ok = True
-                except Exception as e2:
-                    logger.error(f"❌ Retry fail → {chat_id}: {e2}")
-            except TimedOut:
-                logger.error(f"❌ Timeout → {chat_id}")
-            except Exception as e:
-                logger.error(f"❌ Failed → {chat_id}: {e}")
-        return any_ok
+        return await post_job_with_bot(
+            self.application.bot, job, db=self.db, interactive=True
+        )
 
 # ==================== MAIN LOOP ====================
 # v7 (B20): flipped to True only after polling actually started; render_main's
@@ -4153,7 +4260,8 @@ async def main():
     # Initialize database
     db = init_database()
     run_hash_migration(db)
-    
+    run_v7_migration(db)
+
     # Setup Telegram bot (job-queue optional for digests)
     builder = Application.builder().token(Config.TELEGRAM_BOT_TOKEN)
     try:
@@ -4295,7 +4403,14 @@ async def main():
             CYCLE_TELEMETRY["cycle_started_at"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
             CYCLE_TELEMETRY["sources_done"] = 0
             all_jobs = []
-            
+
+            # v7 Stage 1 (B10): before collecting new jobs, retry deliveries
+            # that failed for specific target channels last time.
+            try:
+                await retry_failed_deliveries(application.bot, db)
+            except Exception as e:
+                logger.warning(f"Delivery retry step failed: {e}")
+
             # Fetch from API sources
             for fetch_func, source_name in api_fetch_functions:
                 jobs = await loop.run_in_executor(
