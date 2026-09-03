@@ -50,30 +50,45 @@ def config_summary() -> dict:
 STATE = {
     "started_at": time.time(),
     "bot_thread_started": False,
-    "bot_running": False,
     "error": None,
 }
 STATE_LOCK = threading.Lock()
+
+
+def _bot_live() -> bool:
+    """True only once channel_bot has actually started polling (v7, B20).
+
+    Previously the wrapper reported ``bot_running`` as soon as the module was
+    imported, so /health claimed 200 even for a dead bot. The source of truth
+    is now channel_bot.BOT_LIVE, which flips after start_polling() succeeds.
+    """
+    try:
+        import channel_bot as _cb
+        return bool(getattr(_cb, "BOT_LIVE", False))
+    except Exception:
+        return False
 
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/health", "/healthz", "/"):
             with STATE_LOCK:
-                running = STATE["bot_running"] and not STATE["error"]
-                payload = {
-                    "ok": running,
-                    "service": "junior_middle_it_bot",
-                    "uptime_s": int(time.time() - STATE["started_at"]),
-                    "bot": (
-                        "running" if running
-                        else "crashed" if STATE["error"]
-                        else "starting"
-                    ),
-                    "error": STATE["error"],
-                    "config": config_summary(),
-                    "cycle": None,
-                }
+                error = STATE["error"]
+            live = _bot_live()
+            running = live and not error
+            payload = {
+                "ok": running,
+                "service": "junior_middle_it_bot",
+                "uptime_s": int(time.time() - STATE["started_at"]),
+                "bot": (
+                    "running" if running
+                    else "crashed" if error
+                    else "starting"
+                ),
+                "error": error,
+                "config": config_summary(),
+                "cycle": None,
+            }
             # pull live cycle telemetry from channel_bot if imported
             try:
                 import channel_bot as _cb
@@ -82,7 +97,11 @@ class HealthHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
+            # v7 (B20): a dead bot worker now surfaces as 5xx so external
+            # monitors and Render's health check see the failure instead of
+            # getting a false 200.
+            status_code = 200 if running else 503
+            self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -103,19 +122,17 @@ def run_bot() -> None:
 
         import channel_bot
 
-        with STATE_LOCK:
-            STATE["bot_running"] = True
+        # NOTE: do NOT mark the bot running here — import is not the same as a
+        # healthy bot. channel_bot.BOT_LIVE is the source of truth (v7, B20).
         print("[render_main] channel_bot imported, entering main()", flush=True)
         asyncio.run(channel_bot.main())
         # main() should never return; if it does, treat as crash.
         with STATE_LOCK:
-            STATE["bot_running"] = False
             STATE["error"] = "channel_bot.main() returned unexpectedly"
     except BaseException as e:
         tb = traceback.format_exc()
         print(f"[render_main] BOT CRASHED: {tb}", flush=True)
         with STATE_LOCK:
-            STATE["bot_running"] = False
             STATE["error"] = f"{type(e).__name__}: {e} | ...{tb[-400:]}"
 
 

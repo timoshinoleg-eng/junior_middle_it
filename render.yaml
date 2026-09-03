@@ -30,7 +30,15 @@ services:
         value: "true"
       - key: CHECK_INTERVAL
         value: "1800"
+      # v7 Stage 0 kill-switch: publishing stays OFF until the owner enables it
+      # on exactly ONE process (see docs/v7/DECISION_LOG.md, D-02).
+      - key: PUBLISH_ENABLED
+        value: "false"
+      - key: PROCESS_ROLE
+        value: "all"      # bot | publisher | all
+      # Finite publish ceiling (B05): values < 1 are clamped to 20 by the app;
+      # unlimited requires UNLIMITED_POSTS_PER_CYCLE=true (incident-only flag).
       - key: EMERGENCY_MAX_POSTS_PER_CYCLE
-        value: "0"        # 0 = no product cap; use only during an operational incident
+        value: "20"
       - key: BOT_USERNAME
         value: junior_jobs_channel_bot

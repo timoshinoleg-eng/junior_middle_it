@@ -263,9 +263,14 @@ class JobMessageFormatter:
         job: Dict,
         view_mode: str = 'compact',
         bot_username: str = '',
+        interactive: bool = True,
     ) -> Dict:
         """
         Inline keyboard: open/save/share, expand, hide category, invite CTA.
+
+        v7 (B06 interim): ``interactive=False`` emits a non-interactive card
+        (open-link only) for posts published by processes without access to the
+        job payload store — their save/expand callbacks cannot work anyway.
         """
         job_id = job.get('hash') or job.get('content_hash') or 'unknown'
         # callback_data max 64 bytes — keep hash short (we use 16-char hashes)
@@ -279,6 +284,12 @@ class JobMessageFormatter:
         row1 = []
         if url:
             row1.append({'text': '🔗 Открыть', 'url': url})
+        if not interactive:
+            # v7 (B06 interim): non-interactive card — link only, no callbacks
+            # that require the job payload store.
+            if row1:
+                keyboard.append(row1)
+            return {'inline_keyboard': keyboard}
         row1.append({'text': '💾 Сохранить', 'callback_data': f"save:{job_id}"})
         row1.append({
             'text': '📤 Поделиться',
@@ -312,14 +323,17 @@ class JobMessageFormatter:
         job: Dict,
         view_mode: str = 'compact',
         bot_username: str = '',
+        interactive: bool = True,
     ) -> FormattedMessage:
         """Format job message; bot_username enables invite deep-link button."""
         if view_mode == 'compact':
             text = self._format_compact(job)
         else:
             text = self._format_full(job)
-        
-        keyboard = self.create_inline_keyboard(job, view_mode, bot_username=bot_username)
+
+        keyboard = self.create_inline_keyboard(
+            job, view_mode, bot_username=bot_username, interactive=interactive
+        )
         
         return FormattedMessage(
             text=text,

@@ -65,3 +65,6 @@ tmp/
 *.backup
 .vercel
 .env*
+
+# local test environments
+.venv*/

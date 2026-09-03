@@ -19,8 +19,10 @@ class PublicationPolicyTests(unittest.TestCase):
     def setUp(self):
         self.original_diversify = Config.ENABLE_SOURCE_DIVERSIFY
         self.original_emergency_limit = Config.EMERGENCY_MAX_POSTS_PER_CYCLE
+        self.original_unlimited = Config.UNLIMITED_POSTS_PER_CYCLE
         Config.ENABLE_SOURCE_DIVERSIFY = True
         Config.EMERGENCY_MAX_POSTS_PER_CYCLE = 0
+        Config.UNLIMITED_POSTS_PER_CYCLE = False
         self.jobs = [
             {"title": "Backend A", "source": "Source A", "primary_track": "development"},
             {"title": "Data A", "source": "Source A", "primary_track": "data_ai"},
@@ -32,11 +34,30 @@ class PublicationPolicyTests(unittest.TestCase):
     def tearDown(self):
         Config.ENABLE_SOURCE_DIVERSIFY = self.original_diversify
         Config.EMERGENCY_MAX_POSTS_PER_CYCLE = self.original_emergency_limit
+        Config.UNLIMITED_POSTS_PER_CYCLE = self.original_unlimited
 
-    def test_zero_emergency_limit_keeps_every_qualified_job(self):
-        selected = select_jobs_for_publication(self.jobs)
-        self.assertEqual(len(selected), len(self.jobs))
-        self.assertEqual({job["title"] for job in selected}, {job["title"] for job in self.jobs})
+    def test_zero_emergency_limit_is_clamped_to_finite_default(self):
+        # v7 (B05): "0 = unlimited" is gone; a 0 ceiling falls back to the
+        # finite default (20) so the selection can never be unbounded.
+        Config.EMERGENCY_MAX_POSTS_PER_CYCLE = 0
+        many = [
+            {"title": f"Backend {i}", "source": f"Source {i % 3}", "primary_track": "development"}
+            for i in range(25)
+        ]
+        selected = select_jobs_for_publication(many)
+        self.assertEqual(len(selected), 20)
+
+    def test_unlimited_requires_explicit_flag(self):
+        Config.EMERGENCY_MAX_POSTS_PER_CYCLE = 20
+        many = [
+            {"title": f"Backend {i}", "source": f"Source {i % 3}", "primary_track": "development"}
+            for i in range(25)
+        ]
+        selected = select_jobs_for_publication(many)
+        self.assertEqual(len(selected), 20)
+        Config.UNLIMITED_POSTS_PER_CYCLE = True
+        selected_all = select_jobs_for_publication(many)
+        self.assertEqual(len(selected_all), 25)
 
     def test_thematic_queue_interleaves_streams_before_repeating(self):
         selected = diversify_jobs_by_track_and_source(self.jobs)

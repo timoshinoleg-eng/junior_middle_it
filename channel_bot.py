@@ -56,6 +56,17 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_int_positive(name: str, default: int) -> int:
+    """Positive int env var with fail-safe clamp.
+
+    v7 (B05): the "0 = unlimited" convention was removed after it produced an
+    unbounded, deterministic publish slice in production. Values below 1 fall
+    back to the default; a truly unlimited mode requires an explicit flag.
+    """
+    value = env_int(name, default)
+    return value if value >= 1 else default
+
+
 def env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     if not value:
@@ -180,9 +191,16 @@ class Config:
     TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
     TELEGRAM_SESSION_NAME = os.getenv('TELEGRAM_SESSION_NAME')
     CHECK_INTERVAL = env_int('CHECK_INTERVAL', 1800)
-    # Product policy: publish every vacancy that passes the editorial gate.
-    # A positive emergency ceiling may be set only for an operational incident.
-    EMERGENCY_MAX_POSTS_PER_CYCLE = env_int('EMERGENCY_MAX_POSTS_PER_CYCLE', 0)
+    # v7 stop-valve (Stage 0): publication is OFF until the owner explicitly
+    # enables it on the single chosen publisher process (see docs/v7/DECISION_LOG.md).
+    PUBLISH_ENABLED = os.getenv('PUBLISH_ENABLED', 'false').lower() == 'true'
+    # PROCESS_ROLE: bot | publisher | all (default all — current single-process deploys)
+    PROCESS_ROLE = os.getenv('PROCESS_ROLE', 'all').lower()
+    # Product policy (v7, B05): publications are finite by default. "0 = unlimited"
+    # is removed; values < 1 clamp to the default. Unlimited requires an explicit,
+    # auditable flag and is meant for operational incidents only.
+    EMERGENCY_MAX_POSTS_PER_CYCLE = env_int_positive('EMERGENCY_MAX_POSTS_PER_CYCLE', 20)
+    UNLIMITED_POSTS_PER_CYCLE = os.getenv('UNLIMITED_POSTS_PER_CYCLE', 'false').lower() == 'true'
     # Candidate link check: only explicit 404/410 excludes a vacancy.
     URL_PREFLIGHT_ENABLED = os.getenv('URL_PREFLIGHT_ENABLED', 'true').lower() == 'true'
     URL_PREFLIGHT_TIMEOUT_SECONDS = env_float('URL_PREFLIGHT_TIMEOUT_SECONDS', 8.0)
@@ -269,10 +287,23 @@ class Config:
         return routes
 
     @classmethod
-    def validate(cls) -> bool:
+    def validate(cls, require_admin: bool = False, require_cron_secret: bool = False) -> bool:
         errors = []
         if not cls.TELEGRAM_BOT_TOKEN:
             errors.append("❌ TELEGRAM_BOT_TOKEN is required")
+        # v7 (B02/B03): fail-closed startup validation. Roles opt in because the
+        # serverless publisher does not need ADMIN_USER_ID and the bot does not
+        # need CRON_SECRET.
+        if require_admin and not cls.ADMIN_USER_ID:
+            errors.append(
+                "❌ ADMIN_USER_ID is required (v7 fail-closed): "
+                "admin commands are denied for everyone without it"
+            )
+        if require_cron_secret and not cls.CRON_SECRET:
+            errors.append(
+                "❌ CRON_SECRET is required (v7 fail-closed): "
+                "/api/cron refuses to run without it"
+            )
         if not cls.CHANNEL_ID:
             errors.append("❌ CHANNEL_ID is required")
         if cls.CHANNEL_ID and not (cls.CHANNEL_ID.startswith('@') or cls.CHANNEL_ID.startswith('-')):
@@ -1575,8 +1606,16 @@ def diversify_jobs_by_track_and_source(
 
 
 def select_jobs_for_publication(jobs: List[Dict]) -> List[Dict]:
-    """Publish every qualified job unless an explicit incident-only ceiling is enabled."""
-    emergency_limit = Config.EMERGENCY_MAX_POSTS_PER_CYCLE or None
+    """Select qualified jobs under a finite ceiling (v7, B05).
+
+    The ceiling is always a positive number; publishing without a ceiling
+    requires the explicit UNLIMITED_POSTS_PER_CYCLE flag (incident-only).
+    """
+    if Config.UNLIMITED_POSTS_PER_CYCLE:
+        emergency_limit = None
+    else:
+        # 0/None can never mean "unlimited": fall back to the finite default.
+        emergency_limit = Config.EMERGENCY_MAX_POSTS_PER_CYCLE or 20
     if Config.ENABLE_SOURCE_DIVERSIFY:
         return diversify_jobs_by_track_and_source(jobs, limit=emergency_limit)
     ranked = sorted(jobs, key=job_quality_score, reverse=True)
@@ -2846,13 +2885,20 @@ def get_target_channels(job: Dict) -> List[str]:
     return [Config.CHANNEL_ID] if Config.CHANNEL_ID else []
 
 
-async def _send_job_to_chat(bot: Bot, job: Dict, chat_id: str) -> bool:
-    """Low-level send one job message to one chat."""
+async def _send_job_to_chat(bot: Bot, job: Dict, chat_id: str, interactive: bool = True,
+                            max_flood_retries: int = 3) -> bool:
+    """Low-level send one job message to one chat.
+
+    v7 (B12): RetryAfter handling is bounded with backoff instead of unbounded
+    recursion. v7 (B06): ``interactive=False`` posts without save/expand buttons
+    when no process-wide payload store is available (serverless interim).
+    """
     try:
         if Config.ENABLE_MARKDOWN_V2 and FORMATTER_AVAILABLE:
             formatter = JobMessageFormatter()
             formatted = formatter.format_job(
-                job, view_mode='compact', bot_username=Config.BOT_USERNAME
+                job, view_mode='compact', bot_username=Config.BOT_USERNAME,
+                interactive=interactive,
             )
             await bot.send_message(
                 chat_id=chat_id,
@@ -2870,15 +2916,27 @@ async def _send_job_to_chat(bot: Bot, job: Dict, chat_id: str) -> bool:
             )
         return True
     except RetryAfter as e:
-        logger.warning(f"⏳ Flood control {chat_id}: retry after {e.retry_after}s")
-        await asyncio.sleep(e.retry_after)
-        return await _send_job_to_chat(bot, job, chat_id)
+        if max_flood_retries <= 0:
+            logger.error(f"❌ Flood control retries exhausted for {chat_id}, giving up on this post")
+            return False
+        wait = max(1.0, float(e.retry_after))
+        logger.warning(
+            f"⏳ Flood control {chat_id}: retry after {wait}s "
+            f"({max_flood_retries} retries left)"
+        )
+        await asyncio.sleep(wait)
+        return await _send_job_to_chat(
+            bot, job, chat_id,
+            interactive=interactive,
+            max_flood_retries=max_flood_retries - 1,
+        )
     except Exception as e:
         logger.error(f"❌ Send fail → {chat_id}: {e}")
         return False
 
 
-async def post_job_with_bot(bot: Bot, job: Dict, db: Optional[DatabaseConnection] = None) -> bool:
+async def post_job_with_bot(bot: Bot, job: Dict, db: Optional[DatabaseConnection] = None,
+                            interactive: bool = True) -> bool:
     """Post a job using a bare Bot instance, suitable for cron/serverless (multi-track aware)."""
     job_hash = job.get('hash') or generate_job_hash(job)
     job['hash'] = job_hash
@@ -2894,7 +2952,7 @@ async def post_job_with_bot(bot: Bot, job: Dict, db: Optional[DatabaseConnection
     for i, chat_id in enumerate(targets):
         if i > 0:
             await asyncio.sleep(Config.MULTI_TRACK_POST_DELAY)
-        ok = await _send_job_to_chat(bot, job, chat_id)
+        ok = await _send_job_to_chat(bot, job, chat_id, interactive=interactive)
         if ok:
             any_ok = True
             logger.info(
@@ -2961,7 +3019,18 @@ async def check_telethon_post_permissions() -> Dict:
 
 
 async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: Optional[int] = None) -> Dict:
-    """Run a single collection/publication cycle for serverless cron deployments."""
+    """Run a single collection/publication cycle for serverless cron deployments.
+
+    v7 Stage 0: guarded by the PUBLISH_ENABLED kill-switch and PROCESS_ROLE;
+    serverless posts are published without interactive save/expand buttons
+    (B06 interim — no shared payload store until Stage 1).
+    """
+    if not Config.PUBLISH_ENABLED:
+        logger.info("⛔ PUBLISH_ENABLED=false — publication cycle skipped (v7 kill-switch)")
+        return {'ok': True, 'skipped': 'publish_disabled'}
+    if Config.PROCESS_ROLE not in ('publisher', 'all'):
+        logger.info("⛔ PROCESS_ROLE=%s — publication cycles disabled on this process", Config.PROCESS_ROLE)
+        return {'ok': True, 'skipped': f'role:{Config.PROCESS_ROLE}'}
     if not Config.validate():
         return {'ok': False, 'error': 'invalid_config'}
     configure_webshare_proxy()
@@ -2969,6 +3038,15 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
     db = init_database() if use_sqlite else None
     if db:
         run_hash_migration(db)
+    # v7 (B06): interactive buttons require the callback-handling process to have
+    # the job payload (job_payloads table). Serverless instances have no shared
+    # store, so their posts go out without save/expand buttons (TODO Stage 1: PG).
+    interactive = db is not None
+    if not interactive:
+        logger.warning(
+            "⚠️ Serverless publish: interactive buttons disabled — "
+            "payload store unavailable until Stage 1 (PostgreSQL)"
+        )
     bot = None
     post_transport = 'bot'
     if Config.TELEGRAM_BOT_TOKEN:
@@ -3048,6 +3126,12 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
         # (where SQLite is unavailable) to prevent reposting across cron invocations.
         recent_hashes = set()
         if not use_sqlite:
+            if (not TELEGRAM_PARSER_AVAILABLE
+                    or not Config.TELEGRAM_API_ID or not Config.TELEGRAM_API_HASH):
+                logger.error(
+                    "🚨 v7 B06: serverless run has no Telegram session — "
+                    "history-based dedup is INACTIVE for this cycle"
+                )
             recent_hashes = await get_recent_channel_job_hashes()
         elif Config.DEDUP_MODE == 'telegram_history':
             recent_hashes = await get_recent_channel_job_hashes()
@@ -3104,7 +3188,7 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
         posted_count = 0
         for job in selected_jobs:
             if bot:
-                posted = await post_job_with_bot(bot, job, db=db)
+                posted = await post_job_with_bot(bot, job, db=db, interactive=interactive)
             else:
                 posted = await post_job_with_telethon(job)
             if posted:
@@ -3148,10 +3232,20 @@ class JobBot:
         self.setup_steps: Dict[int, str] = {}
     
     async def check_admin(self, update: Update) -> bool:
-        """Check if user is admin"""
+        """Check if user is admin.
+
+        v7 (B03): fail-closed. Without ADMIN_USER_ID configured the admin
+        surface is denied for everyone instead of being open for everyone.
+        """
         if not Config.ADMIN_USER_ID:
-            return True
-        
+            logger.error("🔒 check_admin denied: ADMIN_USER_ID is not configured (fail-closed)")
+            if getattr(update, 'message', None):
+                try:
+                    await update.message.reply_text("❌ У вас нет прав для этой команды")
+                except Exception:
+                    pass
+            return False
+
         user_id = update.effective_user.id
         if user_id != Config.ADMIN_USER_ID:
             await update.message.reply_text("❌ У вас нет прав для этой команды")
@@ -3986,6 +4080,10 @@ class JobBot:
         return any_ok
 
 # ==================== MAIN LOOP ====================
+# v7 (B20): flipped to True only after polling actually started; render_main's
+# /health reports 5xx until then (previously bot_running was set on import).
+BOT_LIVE = False
+
 # Lightweight telemetry for external monitoring (render_main /health)
 CYCLE_TELEMETRY = {
     "cycles_done": 0,
@@ -4001,18 +4099,25 @@ CYCLE_TELEMETRY = {
 
 async def main():
     """Main application loop"""
-    if not Config.validate():
+    # v7 (B03): ADMIN_USER_ID is mandatory at bot startup — without it admin
+    # commands would be denied for everyone (fail-closed since Stage 0).
+    if not Config.validate(require_admin=True):
         sys.exit(1)
     configure_webshare_proxy()
     init_sentry()
 
     logger.info("=" * 60)
-    logger.info("🚀 Job Bot Starting (v6.5 — sources)")
+    logger.info("🚀 Job Bot Starting (v7 — stabilization)")
     logger.info(f"📡 Main channel: {Config.CHANNEL_ID}")
     logger.info(f"⏱️ Check interval: {Config.CHECK_INTERVAL}s")
     logger.info(
-        "📊 Product cap: disabled; emergency ceiling: %s",
-        Config.EMERGENCY_MAX_POSTS_PER_CYCLE or 'off',
+        "⛔ Kill-switch: PUBLISH_ENABLED=%s PROCESS_ROLE=%s",
+        Config.PUBLISH_ENABLED, Config.PROCESS_ROLE,
+    )
+    logger.info(
+        "📊 Publish ceiling: %s",
+        'UNLIMITED (incident flag!)' if Config.UNLIMITED_POSTS_PER_CYCLE
+        else Config.EMERGENCY_MAX_POSTS_PER_CYCLE,
     )
     logger.info(f"🤖 MarkdownV2: {Config.ENABLE_MARKDOWN_V2}")
     logger.info(f"📱 Telegram channels: {Config.ENABLE_TELEGRAM_CHANNELS}")
@@ -4087,6 +4192,8 @@ async def main():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
+    global BOT_LIVE
+    BOT_LIVE = True
 
     # Daily channel digest + personal DM digests
     if Config.ENABLE_DAILY_DIGEST and getattr(application, 'job_queue', None):
@@ -4171,7 +4278,19 @@ async def main():
                 logger.info("⏸️ Bot is paused, skipping collection cycle")
                 await asyncio.sleep(60)
                 continue
-            
+
+            # v7 Stage 0 kill-switch (B01/B07): when publishing is disabled or this
+            # process is not the publisher role, keep the bot serving users but skip
+            # the whole fetch/post cycle so two processes can never post at once.
+            if not Config.PUBLISH_ENABLED or Config.PROCESS_ROLE not in ('publisher', 'all'):
+                logger.info(
+                    "⛔ Kill-switch active (PUBLISH_ENABLED=%s, PROCESS_ROLE=%s) — "
+                    "collection cycle skipped",
+                    Config.PUBLISH_ENABLED, Config.PROCESS_ROLE,
+                )
+                await asyncio.sleep(Config.CHECK_INTERVAL)
+                continue
+
             logger.info("🔄 Starting job collection cycle...")
             CYCLE_TELEMETRY["cycle_started_at"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
             CYCLE_TELEMETRY["sources_done"] = 0
