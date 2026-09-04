@@ -18,14 +18,26 @@ import logging
 import sys
 from collections import OrderedDict
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Set
 import signal
 import asyncio
 import re
 import requests
-import xml.etree.ElementTree as ET
+# v7 (B27): defusedxml guards external RSS/XML parsing against entity-expansion
+# attacks; fall back to stdlib ET only if the dependency is missing.
+try:
+    import defusedxml.ElementTree as ET
+    DEFUSED_XML_AVAILABLE = True
+except ImportError:
+    import xml.etree.ElementTree as ET
+    DEFUSED_XML_AVAILABLE = False
 from html import unescape as html_unescape
+from concurrent.futures import ThreadPoolExecutor
+
+import http_guard
+import http_cache
+import ats_scrapers_adapter
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton, Bot,
     BotCommand, BotCommandScopeChat,
@@ -188,6 +200,11 @@ class Config:
     ).split(',')
     ENABLE_EXTRA_SOURCES = os.getenv('ENABLE_EXTRA_SOURCES', 'true').lower() == 'true'
     ENABLE_RSS_SOURCES = os.getenv('ENABLE_RSS_SOURCES', 'true').lower() == 'true'
+    # v7 (B24): bounded parallelism inside ATS fetchers (per-company requests).
+    ATS_FETCH_CONCURRENCY = env_int_positive('ATS_FETCH_CONCURRENCY', 6)
+    # v7 (D-10): kalil0321/ats-scrapers adapter — 'auto' (use when importable),
+    # 'true' (log loudly if not) or 'false' (never). See ats_scrapers_adapter.py.
+    USE_ATS_SCRAPERS = os.getenv('USE_ATS_SCRAPERS', 'auto').lower()
     # v6.6: skip source after N consecutive hard failures (0 = never skip)
     SOURCE_FAIL_SKIP = env_int('SOURCE_FAIL_SKIP', 3)
     TELEGRAM_API_ID = os.getenv('TELEGRAM_API_ID')
@@ -236,6 +253,9 @@ class Config:
     PERSONAL_DIGEST_LOOKBACK_HOURS = env_int('PERSONAL_DIGEST_LOOKBACK_HOURS', 36)
     # v6.3 growth ops
     DEDUP_RETENTION_DAYS = env_int('DEDUP_RETENTION_DAYS', 28)
+    # v7 (B23): freshness gate — vacancies published more than this many days
+    # ago are dropped from publication (unparseable dates are kept).
+    FRESHNESS_MAX_DAYS = env_int('FRESHNESS_MAX_DAYS', 14)
     ENABLE_REALTIME_ALERTS = os.getenv('ENABLE_REALTIME_ALERTS', 'true').lower() == 'true'
     REALTIME_ALERTS_MAX = env_int('REALTIME_ALERTS_MAX', 2)
     REF_REWARD_THRESHOLD = env_int('REF_REWARD_THRESHOLD', 3)
@@ -688,6 +708,19 @@ class DatabaseConnection:
             )
         """)
 
+        # v7 Stage 3 (B22): persistent per-source run history — fail-streak
+        # auto-skip survives cold starts (was in-memory only).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS source_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                fetched INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                elapsed_ms INTEGER
+            )
+        """)
+
         # Indexes
         c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_category ON posted_jobs(category)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_posted_at ON posted_jobs(posted_at)")
@@ -698,6 +731,7 @@ class DatabaseConnection:
         c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_job_payloads_created ON job_payloads(created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_source_runs_source ON source_runs(source, started_at)")
         
         # Meta table for one-shot migrations and flags
         c.execute("""
@@ -999,6 +1033,35 @@ class DatabaseConnection:
             for r in rows
         ]
 
+    # ---- v7 Stage 3 (B22): persistent source run history ----
+    def record_source_run(self, source: str, fetched: int, error: str = '',
+                          elapsed_ms: int = 0) -> None:
+        try:
+            self.execute(
+                'INSERT INTO source_runs (source, fetched, error, elapsed_ms) '
+                'VALUES (?, ?, ?, ?)',
+                (source, int(fetched), (error or '')[:300], int(elapsed_ms)),
+            )
+            # keep the ledger bounded (~2000 newest rows)
+            self.execute(
+                'DELETE FROM source_runs WHERE id NOT IN '
+                '(SELECT id FROM source_runs ORDER BY id DESC LIMIT 2000)'
+            )
+        except Exception as e:
+            logger.debug(f"record_source_run failed: {e}")
+
+    def recent_source_runs(self, limit: int = 50) -> List[Dict]:
+        rows = self.fetchall(
+            'SELECT source, started_at, fetched, error, elapsed_ms '
+            'FROM source_runs ORDER BY id DESC LIMIT ?',
+            (limit,),
+        )
+        return [
+            {'source': r[0], 'started_at': r[1], 'fetched': r[2],
+             'error': r[3] or '', 'elapsed_ms': r[4] or 0}
+            for r in rows
+        ]
+
     def list_digest_subscribers(self) -> List[int]:
         rows = self.fetchall(
             'SELECT user_id FROM user_settings WHERE digest_enabled = 1'
@@ -1231,6 +1294,18 @@ def run_v7_migration(db: DatabaseConnection) -> bool:
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status)")
 
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS source_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                fetched INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                elapsed_ms INTEGER
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_source_runs_source ON source_runs(source, started_at)")
+
         cols = _columns(c, 'posted_jobs')
         if 'last_seen_at' not in cols:
             c.execute("ALTER TABLE posted_jobs ADD COLUMN last_seen_at TIMESTAMP")
@@ -1271,36 +1346,96 @@ def classify_url_preflight_outcome(status_code: Optional[int]) -> str:
     return 'unknown'
 
 
+# ---- v7 (B23): freshness gate ----
+def parse_published_date(raw) -> Optional[datetime]:
+    """Parse common 'published' representations into an aware datetime.
+
+    Returns None when the value is missing/unparseable — such jobs are KEPT
+    (the gate only excludes confidently stale postings).
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    # epoch seconds / milliseconds
+    if s.isdigit():
+        try:
+            ts = int(s)
+            if ts > 10**12:  # milliseconds
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
+    # ISO-8601 (Greenhouse/Ashby use trailing Z)
+    iso = s.replace('Z', '+00:00')
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        pass
+    for fmt in ('%Y-%m-%d', '%d.%m.%Y', '%d/%m/%Y', '%B %d, %Y', '%b %d, %Y'):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def job_is_stale(job: Dict, max_age_days: Optional[int] = None,
+                 now: Optional[datetime] = None) -> bool:
+    """v7 (B23): True when the vacancy's published date is older than the gate."""
+    limit_days = max_age_days if max_age_days is not None else Config.FRESHNESS_MAX_DAYS
+    if limit_days <= 0:
+        return False
+    published = parse_published_date(job.get('published'))
+    if published is None:
+        return False
+    moment = now or datetime.now(timezone.utc)
+    age_days = (moment - published).total_seconds() / 86400.0
+    return age_days > limit_days
+
+
 def check_application_url_status(url: str) -> Optional[int]:
-    """Return final HTTP status after HEAD, falling back to a compact GET if needed."""
+    """Return final HTTP status after HEAD, falling back to a compact GET if needed.
+
+    v7 (B21): requests go through http_guard.guarded_request — domain allowlist
+    and resolved-IP validation on EVERY hop (no SSRF into private/loopback
+    ranges, including via redirects). Hosts outside the allowlist return None
+    ("unknown") and stay publishable.
+    """
     try:
         parsed = urlsplit(str(url or '').strip())
     except (TypeError, ValueError):
         return None
     if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
         return None
+    if not http_guard.validate_url(url):
+        return None
 
     headers = {'User-Agent': Config.URL_PREFLIGHT_USER_AGENT}
     timeout = max(1.0, Config.URL_PREFLIGHT_TIMEOUT_SECONDS)
     try:
-        response = requests.head(
-            url,
-            headers=headers,
-            allow_redirects=True,
-            timeout=timeout,
+        response = http_guard.guarded_request(
+            'HEAD', url, headers=headers, timeout=timeout,
         )
+        if response is None:
+            return None
         status_code = response.status_code
         response.close()
         # Some ATS providers reject HEAD while accepting normal browser navigation.
         if status_code not in {405, 501}:
             return status_code
-        response = requests.get(
-            url,
+        response = http_guard.guarded_request(
+            'GET', url,
             headers={**headers, 'Range': 'bytes=0-1023'},
-            allow_redirects=True,
             timeout=timeout,
             stream=True,
         )
+        if response is None:
+            return None
         status_code = response.status_code
         response.close()
         return status_code
@@ -1758,14 +1893,22 @@ def should_skip_source(source_name: str) -> bool:
     return SOURCE_HEALTH.should_skip(source_name, Config.SOURCE_FAIL_SKIP)
 
 
-def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) -> List[Dict]:
-    """Retry wrapper with exponential backoff + source health recording."""
+def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) -> Dict:
+    """Retry wrapper with exponential backoff + source health recording.
+
+    v7 (B22): returns a TYPED outcome instead of a bare list so callers can
+    distinguish "source failed" from "source returned zero jobs":
+    {'ok': bool, 'jobs': [...], 'error': str, 'skipped': bool, 'elapsed_ms': int}
+    """
+    outcome = {'ok': False, 'jobs': [], 'error': '', 'skipped': False, 'elapsed_ms': 0}
     if should_skip_source(source_name):
         streak = SOURCE_HEALTH.fail_streak(source_name) if SOURCE_HEALTH else 0
         logger.warning(
             f"⏭️ Skip {source_name}: fail streak {streak}≥{Config.SOURCE_FAIL_SKIP}"
         )
-        return []
+        outcome['skipped'] = True
+        outcome['error'] = f'auto-skipped (fail streak {streak})'
+        return outcome
     last_err = ""
     t0 = time.monotonic()
     for attempt in range(max_retries):
@@ -1775,7 +1918,8 @@ def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) ->
             elapsed = int((time.monotonic() - t0) * 1000)
             if EXTRA_SOURCES_AVAILABLE and SOURCE_HEALTH is not None:
                 SOURCE_HEALTH.record(source_name, len(result or []), elapsed_ms=elapsed)
-            return result
+            outcome.update({'ok': True, 'jobs': result or [], 'elapsed_ms': elapsed})
+            return outcome
         except requests.exceptions.HTTPError as e:
             last_err = f"HTTP {getattr(e.response, 'status_code', '?')}"
             if e.response is not None and e.response.status_code == 429:
@@ -1790,9 +1934,40 @@ def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) ->
             logger.error(f"❌ {source_name} error (attempt {attempt+1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(DELAYS['after_error'] * (attempt + 1))
+    elapsed = int((time.monotonic() - t0) * 1000)
     if EXTRA_SOURCES_AVAILABLE and SOURCE_HEALTH is not None:
-        SOURCE_HEALTH.record(source_name, 0, error=last_err or "failed", elapsed_ms=int((time.monotonic() - t0) * 1000))
-    return []
+        SOURCE_HEALTH.record(source_name, 0, error=last_err or "failed", elapsed_ms=elapsed)
+    outcome.update({'ok': False, 'jobs': [], 'error': last_err or 'failed', 'elapsed_ms': elapsed})
+    return outcome
+
+
+def warm_source_health_from_db(db: DatabaseConnection) -> None:
+    """v7 (B22): rebuild fail streaks from the persistent source_runs ledger
+    so auto-skip survives cold starts instead of resetting every restart."""
+    if not EXTRA_SOURCES_AVAILABLE or SOURCE_HEALTH is None:
+        return
+    try:
+        rows = db.fetchall(
+            'SELECT source, error FROM source_runs ORDER BY id DESC LIMIT 400'
+        )
+    except sqlite3.OperationalError:
+        return  # pre-v7 schema
+    streaks: Dict[str, int] = {}
+    resolved: Set[str] = set()
+    for source, error in rows:
+        if source in resolved:
+            continue
+        if error:
+            streaks[source] = streaks.get(source, 0) + 1
+        else:
+            # First success (walking newest-first) finalizes the streak counted
+            # so far; keep it, just stop scanning this source.
+            resolved.add(source)
+    restored = {s: n for s, n in streaks.items() if n > 0}
+    for source, streak in restored.items():
+        SOURCE_HEALTH.restore_fail_streak(source, streak)
+    if restored:
+        logger.info(f"📡 Restored source fail streaks after cold start: {restored}")
 
 # ==================== JOB PROCESSING ====================
 def classify_job_level(job_data: Dict) -> Optional[str]:
@@ -2636,100 +2811,142 @@ def fetch_superjob() -> List[Dict]:
         return []
 
 
-def fetch_greenhouse() -> List[Dict]:
-    """Greenhouse public boards for configured company tokens."""
-    jobs = []
-    for board in non_empty_csv(Config.GREENHOUSE_BOARDS):
+def _guarded(fetch_one, label: str):
+    """v7 (B22/B24): wrap a per-company fetch so one failure never kills the batch."""
+    def _wrapped(key: str):
         try:
-            response = requests.get(
-                f"https://api.greenhouse.io/v1/boards/{board}/jobs",
-                params={'content': 'true'},
-                headers=get_headers(),
-                timeout=15
-            )
-            response.raise_for_status()
-            for item in response.json().get('jobs', []):
-                offices = item.get('offices') or []
-                location = ', '.join([office.get('name', '') for office in offices if office.get('name')]) or 'Remote'
-                jobs.append({
-                    'title': item.get('title', ''),
-                    'company': board,
-                    'description': strip_html(item.get('content', '')),
-                    'url': item.get('absolute_url', ''),
-                    'salary': 'Не указана',
-                    'location': location,
-                    'published': item.get('updated_at', ''),
-                    'employment_type': '',
-                    'source': f'Greenhouse:{board}',
-                    'tags': [dept.get('name', '') for dept in item.get('departments', []) if dept.get('name')]
-                })
+            return fetch_one(key)
         except Exception as e:
-            logger.error(f"❌ Greenhouse {board} error: {e}")
+            logger.error(f"❌ {label} {key} error: {e}")
+            return e
+    return _wrapped
+
+
+def fetch_greenhouse() -> List[Dict]:
+    """Greenhouse public boards — v7 (B24): bounded concurrent per-board fetches."""
+    boards = non_empty_csv(Config.GREENHOUSE_BOARDS)
+    if Config.USE_ATS_SCRAPERS in ('auto', 'true') and ats_scrapers_adapter.ATS_SCRAPERS_AVAILABLE:
+        return ats_scrapers_adapter.fetch_greenhouse(boards)
+
+    def _fetch_board(board: str) -> List[Dict]:
+        data = http_cache.fetch_json_cached(
+            f"https://api.greenhouse.io/v1/boards/{board}/jobs?content=true",
+            headers=get_headers(),
+            timeout=15,
+        )
+        out = []
+        for item in data.get('jobs', []):
+            offices = item.get('offices') or []
+            location = ', '.join([office.get('name', '') for office in offices if office.get('name')]) or 'Remote'
+            out.append({
+                'title': item.get('title', ''),
+                'company': board,
+                'description': strip_html(item.get('content', '')),
+                'url': item.get('absolute_url', ''),
+                'salary': 'Не указана',
+                'location': location,
+                'published': item.get('updated_at', ''),
+                'employment_type': '',
+                'source': f'Greenhouse:{board}',
+                'tags': [dept.get('name', '') for dept in item.get('departments', []) if dept.get('name')]
+            })
+        return out
+
+    jobs: List[Dict] = []
+    workers = max(1, Config.ATS_FETCH_CONCURRENCY)
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix='greenhouse') as pool:
+        for board, result in zip(boards, pool.map(_guarded(_fetch_board, 'Greenhouse'), boards)):
+            if isinstance(result, Exception):
+                logger.error(f"❌ Greenhouse {board} error: {result}")
+            else:
+                jobs.extend(result)
     return jobs
 
 
 def fetch_lever() -> List[Dict]:
-    """Lever public postings for configured company IDs."""
-    jobs = []
-    for company in non_empty_csv(Config.LEVER_COMPANIES):
-        try:
-            response = requests.get(
-                f"https://api.lever.co/v0/postings/{company}",
-                params={'mode': 'json'},
-                headers=get_headers(),
-                timeout=15
-            )
-            response.raise_for_status()
-            for item in response.json():
-                categories = item.get('categories') or {}
-                location = categories.get('location', 'Remote')
-                workplace_type = item.get('workplaceType') or item.get('workplace_type') or ''
-                if str(workplace_type).lower() == 'remote' and 'remote' not in location.lower():
-                    location = f"{location}, Remote" if location else 'Remote'
-                jobs.append({
-                    'title': item.get('text', ''),
-                    'company': company,
-                    'description': strip_html(item.get('descriptionPlain', '') or item.get('description', '')),
-                    'url': item.get('hostedUrl', '') or item.get('applyUrl', ''),
-                    'salary': 'Не указана',
-                    'location': location,
-                    'published': str(item.get('createdAt', '')),
-                    'employment_type': categories.get('commitment', ''),
-                    'source': f'Lever:{company}',
-                    'tags': [categories.get('team', '')] if categories.get('team') else []
-                })
-        except Exception as e:
-            logger.error(f"❌ Lever {company} error: {e}")
+    """Lever public postings — v7 (B24): bounded concurrent per-company fetches."""
+    companies = non_empty_csv(Config.LEVER_COMPANIES)
+    if Config.USE_ATS_SCRAPERS in ('auto', 'true') and ats_scrapers_adapter.ATS_SCRAPERS_AVAILABLE:
+        return ats_scrapers_adapter.fetch_lever(companies)
+
+    def _fetch_company(company: str) -> List[Dict]:
+        data = http_cache.fetch_json_cached(
+            f"https://api.lever.co/v0/postings/{company}?mode=json",
+            headers=get_headers(),
+            timeout=15,
+        )
+        out = []
+        for item in data:
+            categories = item.get('categories') or {}
+            location = categories.get('location', 'Remote')
+            workplace_type = item.get('workplaceType') or item.get('workplace_type') or ''
+            if str(workplace_type).lower() == 'remote' and 'remote' not in location.lower():
+                location = f"{location}, Remote" if location else 'Remote'
+            out.append({
+                'title': item.get('text', ''),
+                'company': company,
+                'description': strip_html(item.get('descriptionPlain', '') or item.get('description', '')),
+                'url': item.get('hostedUrl', '') or item.get('applyUrl', ''),
+                'salary': 'Не указана',
+                'location': location,
+                'published': str(item.get('createdAt', '')),
+                'employment_type': categories.get('commitment', ''),
+                'source': f'Lever:{company}',
+                'tags': [categories.get('team', '')] if categories.get('team') else []
+            })
+        return out
+
+    jobs: List[Dict] = []
+    workers = max(1, Config.ATS_FETCH_CONCURRENCY)
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix='lever') as pool:
+        for company, result in zip(companies, pool.map(_guarded(_fetch_company, 'Lever'), companies)):
+            if isinstance(result, Exception):
+                logger.error(f"❌ Lever {company} error: {result}")
+            else:
+                jobs.extend(result)
     return jobs
 
 
 def fetch_ashby() -> List[Dict]:
-    """Ashby public job boards for configured company names."""
-    jobs = []
-    for company in non_empty_csv(Config.ASHBY_COMPANIES):
-        try:
-            response = requests.get(
-                f"https://api.ashbyhq.com/posting-api/job-board/{company}",
-                headers=get_headers(),
-                timeout=20
-            )
-            response.raise_for_status()
-            for item in response.json().get('jobs', []):
-                location = item.get('locationName') or item.get('location', 'Remote')
-                jobs.append({
-                    'title': item.get('title', ''),
-                    'company': company,
-                    'description': strip_html(item.get('descriptionHtml', '') or item.get('descriptionPlain', '')),
-                    'url': item.get('jobUrl', '') or item.get('applyUrl', ''),
-                    'salary': item.get('compensation', '') or 'Не указана',
-                    'location': location,
-                    'published': item.get('publishedAt', ''),
-                    'employment_type': item.get('employmentType', ''),
-                    'source': f'Ashby:{company}',
-                    'tags': [item.get('department', '')] if item.get('department') else []
-                })
-        except Exception as e:
-            logger.error(f"❌ Ashby {company} error: {e}")
+    """Ashby public job boards — v7 (B24): bounded concurrent per-company fetches."""
+    companies = non_empty_csv(Config.ASHBY_COMPANIES)
+    if Config.USE_ATS_SCRAPERS in ('auto', 'true') and ats_scrapers_adapter.ATS_SCRAPERS_AVAILABLE:
+        return ats_scrapers_adapter.fetch_ashby(companies)
+
+    def _fetch_company(company: str) -> List[Dict]:
+        data = http_cache.fetch_json_cached(
+            f"https://api.ashbyhq.com/posting-api/job-board/{company}",
+            headers=get_headers(),
+            timeout=20,
+        )
+        out = []
+        for item in data.get('jobs', []):
+            location = item.get('locationName') or item.get('location', 'Remote')
+            out.append({
+                'title': item.get('title', ''),
+                'company': company,
+                'description': strip_html(item.get('descriptionHtml', '') or item.get('descriptionPlain', '')),
+                'url': item.get('jobUrl', '') or item.get('applyUrl', ''),
+                'salary': item.get('compensation', '') or 'Не указана',
+                'location': location,
+                'published': item.get('publishedAt', ''),
+                'employment_type': item.get('employmentType', ''),
+                'source': f'Ashby:{company}',
+                'tags': [item.get('department', '')] if item.get('department') else []
+            })
+        return out
+
+    jobs: List[Dict] = []
+    workers = max(1, Config.ATS_FETCH_CONCURRENCY)
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix='ashby') as pool:
+        for company, result in zip(companies, pool.map(_guarded(_fetch_company, 'Ashby'), companies)):
+            if isinstance(result, Exception):
+                logger.error(f"❌ Ashby {company} error: {result}")
+            else:
+                jobs.extend(result)
     return jobs
 
 
@@ -3234,6 +3451,7 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
     if db:
         run_hash_migration(db)
         run_v7_migration(db)
+        warm_source_health_from_db(db)
     # v7 (B06): interactive buttons require the callback-handling process to have
     # the job payload (job_payloads table). Serverless instances have no shared
     # store, so their posts go out without save/expand buttons (TODO Stage 1: PG).
@@ -3285,10 +3503,23 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
             if source_budget_seconds and time.monotonic() - started > source_budget_seconds:
                 logger.warning(f"⏱️ Source budget exceeded, stopping before {source_name}")
                 break
-            jobs = safe_fetch_with_retry(fetch_func, source_name, max_retries=1)
+            outcome = safe_fetch_with_retry(fetch_func, source_name, max_retries=1)
+            jobs = outcome['jobs']
             all_jobs.extend(jobs)
-            source_results.append({'source': source_name, 'fetched': len(jobs)})
-            logger.info(f"📥 Fetched {len(jobs)} jobs from {source_name}")
+            source_results.append({
+                'source': source_name,
+                'fetched': len(jobs),
+                'ok': outcome['ok'],
+                'error': outcome['error'],
+                'skipped': outcome['skipped'],
+            })
+            if db:
+                db.record_source_run(source_name, len(jobs),
+                                     outcome['error'], outcome['elapsed_ms'])
+            if outcome['ok']:
+                logger.info(f"📥 Fetched {len(jobs)} jobs from {source_name}")
+            else:
+                logger.warning(f"⚠️ Source {source_name}: {outcome['error'] or 'no jobs'}")
 
         if Config.ENABLE_TELEGRAM_CHANNELS:
             if source_budget_seconds and time.monotonic() - started > source_budget_seconds:
@@ -3299,10 +3530,15 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
                 source_results.append({'source': 'Telegram channels', 'fetched': len(tg_jobs)})
 
         classified_jobs = []
+        stale_count = 0
         for job in all_jobs:
             if GROWTH_UTILS_AVAILABLE:
                 normalize_job_title_company(job)
             if not is_suitable_job(job):
+                continue
+            # v7 (B23): freshness gate — never publish stale postings.
+            if job_is_stale(job):
+                stale_count += 1
                 continue
             level = classify_job_level(job)
             if not level:
@@ -3321,6 +3557,8 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
                     continue
             job['hash'] = generate_job_hash(job)
             classified_jobs.append(job)
+        if stale_count:
+            logger.info(f"⏭️ Freshness gate dropped {stale_count} stale vacancies")
 
         # Deduplication: always load recent hashes from channel history on serverless
         # (where SQLite is unavailable) to prevent reposting across cron invocations.
@@ -4498,6 +4736,7 @@ async def main():
     db = init_database()
     run_hash_migration(db)
     run_v7_migration(db)
+    warm_source_health_from_db(db)
 
     # Setup Telegram bot (job-queue optional for digests)
     builder = Application.builder().token(Config.TELEGRAM_BOT_TOKEN)
@@ -4667,13 +4906,22 @@ async def main():
 
             # Fetch from API sources
             for fetch_func, source_name in api_fetch_functions:
-                jobs = await loop.run_in_executor(
+                outcome = await loop.run_in_executor(
                     None, safe_fetch_with_retry, fetch_func, source_name
                 )
+                jobs = outcome['jobs']
                 all_jobs.extend(jobs)
                 CYCLE_TELEMETRY["last_source"] = source_name
                 CYCLE_TELEMETRY["sources_done"] += 1
-                logger.info(f"📥 Fetched {len(jobs)} jobs from {source_name}")
+                try:
+                    db.record_source_run(source_name, len(jobs),
+                                         outcome['error'], outcome['elapsed_ms'])
+                except Exception:
+                    pass
+                if outcome['ok']:
+                    logger.info(f"📥 Fetched {len(jobs)} jobs from {source_name}")
+                else:
+                    logger.warning(f"⚠️ Source {source_name}: {outcome['error'] or 'no jobs'}")
             
             # Fetch from Telegram channels
             if Config.ENABLE_TELEGRAM_CHANNELS:
@@ -4684,14 +4932,20 @@ async def main():
             
             # Filter, classify and process
             classified_jobs = []
-            _f = {"not_suitable": 0, "no_level": 0, "quality_gate": 0, "salary": 0, "tracks": 0}
+            _f = {"not_suitable": 0, "no_level": 0, "quality_gate": 0, "salary": 0,
+                  "tracks": 0, "stale": 0}
             for job in all_jobs:
                 if GROWTH_UTILS_AVAILABLE:
                     normalize_job_title_company(job)
                 if not is_suitable_job(job):
                     _f["not_suitable"] += 1
                     continue
-                
+
+                # v7 (B23): freshness gate
+                if job_is_stale(job):
+                    _f["stale"] += 1
+                    continue
+
                 # Classify level
                 level = classify_job_level(job)
                 if level:

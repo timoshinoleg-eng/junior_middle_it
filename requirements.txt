@@ -1,7 +1,8 @@
 # Core dependencies
+# v7 (B25): versions bumped past known CVEs; keep in sync with pyproject.toml.
 python-telegram-bot[job-queue]==20.6
-python-dotenv==1.0.0
-requests==2.31.0
+python-dotenv>=1.2.2
+requests>=2.33.0
 
 # Error tracking / observability
 sentry-sdk>=2.0
@@ -9,11 +10,18 @@ sentry-sdk>=2.0
 # Growth P0: fuzzy cross-source dedup
 rapidfuzz>=3.6.0
 
+# v7 (B27): safe parsing of external RSS/XML
+defusedxml>=0.7.1
+
 # Telegram channel parsing (optional)
 # Установите для работы с Telegram-каналами:
 # pip install telethon
 telethon>=1.28.5
 PySocks>=1.7.1
 
-# Optional: для продвинутой обработки дат
-# python-dateutil>=2.8.0
+# --- Optional: ATS collector upgrade (kalil0321/ats-scrapers, MIT) ---
+# НЕ ставится вместе с основным окружением: конфликт зависимостей
+# (требует httpx>=0.27, а python-telegram-bot 20.6 пинит httpx~=0.25.0).
+# Использовать только в отдельном окружении процесса-коллектора
+# (см. docs/v7/DECISION_LOG.md, D-10).
+# ats-scrapers>=0.3.0

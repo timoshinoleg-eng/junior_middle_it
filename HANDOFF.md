@@ -69,9 +69,9 @@ Admin after crawl: `/sources`, `/status`, `/stats_growth`, `/tracks`.
 
 1. **CHANNEL_ROUTES** — owner will send specialty channel IDs later; leave multi-track off until then.  
 2. **Keyed APIs** (Reed/Jooble/FindWork/SuperJob/Adzuna) — only if keys appear in env; not required.  
-3. **Source health is in-memory** — resets on process restart (serverless cold start clears streaks).  
+3. **Source health is persistent** (v7, B22) — fail streaks are restored from the `source_runs` table after a cold start; previously they were in-memory only.  
 4. **Overlap** RemoteOK full + multi-cat / Himalayas API + RSS — OK, hash/fuzzy dedup.  
-5. **PTB LGPLv3** — noted earlier; keep awareness for commercial redistribute.  
+5. **PTB GPL-3.0** (v7 correction, B26) — python-telegram-bot 20.6 is GPL-3.0, NOT LGPLv3 as stated in earlier notes. No copyleft obligations for private SaaS operation without distribution, but any binary/package distribution requires GPL compatibility — resolve with legal before monetization (docs/v7/DECISION_LOG.md D-07).  
 6. **ROI next** — deploy prod + white traffic + metrics > more sources.
 
 ## Next session ideas (not started)

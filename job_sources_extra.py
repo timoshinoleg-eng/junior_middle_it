@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import logging
 import re
-import xml.etree.ElementTree as ET
+# v7 (B27): defusedxml for external RSS/XML (entity-expansion safe); stdlib fallback.
+try:
+    import defusedxml.ElementTree as ET
+except ImportError:  # pragma: no cover - dep normally present
+    import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -519,6 +523,14 @@ class SourceHealthRegistry:
 
     def fail_streak(self, name: str) -> int:
         return int(self._fail_streak.get(name, 0))
+
+    def restore_fail_streak(self, name: str, streak: int) -> None:
+        """v7 (B22): rebuild an in-memory streak from the persistent source_runs
+        ledger after a cold start (previously every restart reset health)."""
+        streak = max(0, int(streak))
+        self._fail_streak[name] = streak
+        if streak:
+            self._cooldown_left.setdefault(name, 0)
 
     def should_skip(self, name: str, max_fails: int = 3) -> bool:
         """

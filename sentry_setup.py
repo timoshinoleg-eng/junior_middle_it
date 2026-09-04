@@ -74,6 +74,27 @@ def _scrub(event, hint):
     return event
 
 
+def _detect_environment() -> str:
+    """Best-effort deployment environment (v7, B27).
+
+    Previously hard-coded to "production"/"railway", which mislabelled Render
+    deploys as railway. Resolution order:
+    1. explicit SENTRY_ENVIRONMENT override;
+    2. platform-specific markers (Vercel, Render, Railway);
+    3. "dev".
+    """
+    explicit = os.getenv("SENTRY_ENVIRONMENT", "").strip()
+    if explicit:
+        return explicit
+    if os.getenv("VERCEL"):
+        return "vercel"
+    if os.getenv("RENDER"):
+        return "render"
+    if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"):
+        return "railway"
+    return "dev"
+
+
 def init_sentry() -> Optional[object]:
     """Initialize Sentry if SENTRY_DSN is set. Returns init response or None."""
     dsn = os.getenv("SENTRY_DSN", "").strip()
@@ -89,7 +110,7 @@ def init_sentry() -> Optional[object]:
         return None
 
     release = os.getenv("SENTRY_RELEASE", "").strip() or "dev"
-    environment = "production" if os.getenv("VERCEL") else "railway"
+    environment = _detect_environment()
 
     sentry_logging = LoggingIntegration(
         level=logging.INFO,

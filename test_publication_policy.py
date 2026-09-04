@@ -145,27 +145,36 @@ class PublicationPolicyTests(unittest.TestCase):
                 self.assertEqual(classify_url_preflight_outcome(status_code), "unknown")
 
     def test_url_preflight_invalid_link_is_unknown_without_http_request(self):
-        with patch("channel_bot.requests.head") as head:
+        with patch("channel_bot.requests.request") as request:
             status = check_application_url_status("https://[")
         self.assertIsNone(status)
-        head.assert_not_called()
+        request.assert_not_called()
 
     def test_url_preflight_retries_head_incompatible_ats_with_compact_get(self):
         class FakeResponse:
-            def __init__(self, status_code):
+            def __init__(self, status_code, headers=None):
                 self.status_code = status_code
+                self.headers = headers or {}
 
             def close(self):
                 return None
 
-        with patch("channel_bot.requests.head", return_value=FakeResponse(405)) as head:
-            with patch("channel_bot.requests.get", return_value=FakeResponse(200)) as get:
-                status = check_application_url_status("https://example.test/apply")
+        responses = [FakeResponse(405), FakeResponse(200)]
+        with patch("http_guard.validate_url", return_value=True), \
+             patch("channel_bot.requests.request", side_effect=responses) as request:
+            status = check_application_url_status("https://example.test/apply")
 
         self.assertEqual(status, 200)
-        head.assert_called_once()
-        get.assert_called_once()
-        self.assertEqual(get.call_args.kwargs["headers"]["Range"], "bytes=0-1023")
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[0].args[0], "HEAD")
+        self.assertEqual(request.call_args_list[1].args[0], "GET")
+        self.assertEqual(request.call_args_list[1].kwargs["headers"]["Range"], "bytes=0-1023")
+
+    def test_url_preflight_skips_host_outside_allowlist_without_request(self):
+        with patch("channel_bot.requests.request") as request:
+            status = check_application_url_status("https://not-on-allowlist.example/apply")
+        self.assertIsNone(status)
+        request.assert_not_called()
 
     def test_url_preflight_filters_only_closed_candidates_without_network(self):
         jobs = [

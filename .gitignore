@@ -49,6 +49,9 @@ logs/
 # PTB persistence state (v7 B14)
 *.pkl
 
+# HTTP ETag cache (v7 B24)
+http_cache.json
+
 # Telegram session files (IMPORTANT!)
 *.session
 *.session-journal

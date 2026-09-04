@@ -151,26 +151,27 @@ def backfill_categories(db_path: str = 'jobs.db'):
     
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
+
     try:
+        # v7 (B13): posted_jobs has no `description` column — backfill must run
+        # on the columns that actually exist (title carries the signal).
         cursor.execute("""
-            SELECT hash, title, description, url, source 
-            FROM posted_jobs 
+            SELECT hash, title, url, source
+            FROM posted_jobs
             WHERE category = 'other' OR category IS NULL
         """)
         jobs = cursor.fetchall()
-        
+
         if not jobs:
             logger.info("✅ Нет вакансий для категоризации")
             return True
-        
+
         logger.info(f"🔄 Категоризация {len(jobs)} вакансий...")
-        
+
         updated = 0
-        for job_hash, title, description, url, source in jobs:
+        for job_hash, title, url, source in jobs:
             job_data = {
                 'title': title or '',
-                'description': description or '',
                 'url': url or '',
                 'source': source or '',
             }
@@ -241,7 +242,9 @@ if __name__ == '__main__':
     if args.schema:
         print_schema(args.db)
     elif args.backfill:
-        backfill_categories(args.db)
+        # v7 (B13): a failed backfill must not exit 0.
+        success = backfill_categories(args.db)
+        sys.exit(0 if success else 1)
     else:
         success = migrate_database(args.db)
         sys.exit(0 if success else 1)
