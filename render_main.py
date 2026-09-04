@@ -141,7 +141,8 @@ def main() -> None:
     t = threading.Thread(target=run_bot, name="bot-worker", daemon=False)
     t.start()
     print(f"[render_main] health server on :{port}/health", flush=True)
-    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    # Binding $PORT on all interfaces is required by Render.
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)  # nosec B104
     server.daemon_threads = True
     server.serve_forever()
 

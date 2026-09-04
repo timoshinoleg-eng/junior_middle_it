@@ -12,11 +12,8 @@ from __future__ import annotations
 
 import logging
 import re
-# v7 (B27): defusedxml for external RSS/XML (entity-expansion safe); stdlib fallback.
-try:
-    import defusedxml.ElementTree as ET
-except ImportError:  # pragma: no cover - dep normally present
-    import xml.etree.ElementTree as ET
+# v7 (B27): defusedxml for external RSS/XML (entity-expansion safe), hard dep.
+import defusedxml.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 

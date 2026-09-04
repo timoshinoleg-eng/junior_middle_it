@@ -25,13 +25,8 @@ import asyncio
 import re
 import requests
 # v7 (B27): defusedxml guards external RSS/XML parsing against entity-expansion
-# attacks; fall back to stdlib ET only if the dependency is missing.
-try:
-    import defusedxml.ElementTree as ET
-    DEFUSED_XML_AVAILABLE = True
-except ImportError:
-    import xml.etree.ElementTree as ET
-    DEFUSED_XML_AVAILABLE = False
+# attacks. It is a hard dependency (requirements.txt) — no stdlib fallback.
+import defusedxml.ElementTree as ET
 from html import unescape as html_unescape
 from concurrent.futures import ThreadPoolExecutor
 
@@ -764,9 +759,10 @@ class DatabaseConnection:
             ('premium_unlocked', 'INTEGER DEFAULT 0'),
         ):
             try:
-                c.execute(f'SELECT {col} FROM user_settings LIMIT 1')
+                # col/decl come from the hardcoded tuple above, never from user input.
+                c.execute(f'SELECT {col} FROM user_settings LIMIT 1')  # nosec B608
             except sqlite3.OperationalError:
-                c.execute(f'ALTER TABLE user_settings ADD COLUMN {col} {decl}')
+                c.execute(f'ALTER TABLE user_settings ADD COLUMN {col} {decl}')  # nosec B608
         
         self.conn.commit()
         logger.info("✅ Database initialized")
@@ -1480,7 +1476,8 @@ def generate_job_hash(job: Dict) -> str:
     
     title = job.get('title', '').lower()
     company = job.get('company', '').lower()
-    return hashlib.md5(f"{title}_{company}".encode()).hexdigest()
+    # v7 (bandit B324): dedup fingerprint only, never a security boundary.
+    return hashlib.md5(f"{title}_{company}".encode(), usedforsecurity=False).hexdigest()
 
 
 def extract_urls_from_text(text: str) -> List[str]:

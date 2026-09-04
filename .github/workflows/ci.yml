@@ -1,0 +1,70 @@
+# v7 Stage 4 (B28): PR gate. Every PR must pass compile + tests + lint + SCA.
+# Tests are fully mocked: no Telegram API, no channel posts, no live endpoints.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pr-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+
+      - name: pip-audit (installed runtime environment)
+        run: |
+          pip install pip-audit
+          pip-audit -l
+
+      - name: Install dev tools
+        run: pip install ruff bandit
+
+      - name: Compile check
+        run: python -m compileall -q . -x 'ci-check|\.venv.*'
+
+      - name: Unit + integration tests (mocked Telegram, no network)
+        run: python -m unittest discover -v
+
+      - name: Ruff (legacy-adapted config, see pyproject.toml)
+        run: ruff check .
+
+      - name: Bandit (medium+ severity on application code)
+        run: >
+          bandit -q -ll
+          channel_bot.py api/cron.py api/health.py render_main.py
+          http_guard.py http_cache.py ats_scrapers_adapter.py
+          message_formatter.py growth_utils.py job_classifier.py
+          job_sources_extra.py migrate_db.py sentry_setup.py
+          telegram_auth.py telegram_job_parser.py
+
+      - name: Migration smoke (empty DB + legacy DB)
+        run: |
+          python migrate_db.py --db /tmp/empty.db
+          python - <<'EOF'
+          import sqlite3, subprocess, sys
+          conn = sqlite3.connect('/tmp/legacy.db')
+          conn.execute(
+              "CREATE TABLE posted_jobs (hash TEXT PRIMARY KEY, title TEXT NOT NULL,"
+              " company TEXT NOT NULL, level TEXT, url TEXT, source TEXT,"
+              " category TEXT DEFAULT 'other',"
+              " posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+          conn.commit(); conn.close()
+          r = subprocess.run([sys.executable, 'migrate_db.py', '--db', '/tmp/legacy.db'])
+          sys.exit(r.returncode)
+          EOF
+
+      - name: Concurrent publishers must not double-post (regression, B07/B10)
+        run: python -m unittest test_concurrency_v7 -v
