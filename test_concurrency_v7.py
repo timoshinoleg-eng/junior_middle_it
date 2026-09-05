@@ -196,6 +196,37 @@ class ConcurrentPublishPathTests(unittest.TestCase):
         self.assertTrue(db.claim_delivery(h, "@main"))
         db.conn.close()
 
+    def test_two_retry_workers_claim_failed_delivery_once(self):
+        """B07 regression: concurrent retry workers must not double-send."""
+        db = DatabaseConnection(self.path)
+        run_v7_migration(db)
+        h = generate_job_hash(JOBS[0])
+        db.save_job_payload(h, {**JOBS[0], "hash": h})
+        db.record_delivery(h, "@qa", "failed", error="first_send_failed")
+        barrier = threading.Barrier(2)
+        claims = []
+        errors = []
+
+        def worker():
+            try:
+                barrier.wait(timeout=10)
+                claims.append(db.claim_failed_delivery(h, "@qa"))
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker), threading.Thread(target=worker)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(claims), 1)
+        self.assertEqual(db.fetchone(
+            "SELECT status FROM deliveries WHERE job_hash = ? AND target_channel = ?",
+            (h, "@qa"),
+        )[0], "pending")
+        db.conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

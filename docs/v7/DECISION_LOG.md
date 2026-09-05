@@ -186,14 +186,18 @@
   (3) `run_hash_migration` пропускается на Postgres (зависит от `rowid`
   SQLite). (4) Локальная проверка на живом Postgres в этом окружении
   недоступна (Docker daemon не запущен) — путь PostgreSQL гейтится в CI
-  (`postgres-gate`, сервис `postgres:16` + `TEST_DATABASE_URL`).
+  (`postgres-gate`, сервис `postgres:16` + `TEST_DATABASE_URL`). (5) Перед
+  переключением с заполненной SQLite-базы нужен экспорт/импорт леджеров в PG;
+  подключение к чистой PG с `PUBLISH_ENABLED=true` запрещено до верификации.
+  Любой сбой claim теперь блокирует отправку, а не включает fail-open.
 
 ## D-15. Персистентность бота в БД (DbPersistence вместо PicklePersistence)
 
 - **Решение:** `DbPersistence(BasePersistence)` хранит снимок состояния PTB
   (`user_data`/`chat_data`/`bot_data`/`conversations`) в таблице `bot_state`
-  как `base64(pickle)`. Загружается при старте, сбрасывается на `flush()`.
-  В `render_main` подключается при наличии `db`, иначе фоллбэк на
+  как `base64(pickle)`. Загружается при старте и сохраняется при каждом
+  изменении `update_*`/`drop_*`, а `flush()` делает финальный снимок. В
+  `render_main` подключается при наличии `db`, иначе фоллбэк на
   `PicklePersistence`-файл.
 - **Обоснование:** `PicklePersistence` писал `bot_persistence.pkl` на
   эфемерную ФС Render → визард/профиль терялись при рестарте. Теперь
@@ -202,4 +206,22 @@
   `chat_id` и произвольные объекты (JSON бы их сломал).
 - **Ограничения:** тот же уровень доверия, что у `PicklePersistence` (pickle
   своего состояния, не внешних данных); таблица `bot_state` добавлена в DDL
-  обоих диалектов и в карту upsert (`key`).
+  обоих диалектов и в карту upsert (`key`). Вызовы `update_*` синхронно
+  записывают snapshot в БД, поэтому аварийный процесс теряет максимум текущую
+  операцию, а не весь интервал до `flush()`.
+
+## D-16. Безопасная обработка доставки и cutover
+
+- **Решение:** и новые, и retry-публикации обязаны получить леджер-клейм до
+  отправки. `claim_failed_delivery()` атомарно переводит `failed` в `pending`,
+  поэтому два retry-worker не отправляют один payload одновременно. Ошибка
+  леджера теперь fail-closed: отправка пропускается, а не выполняется
+  «unguarded».
+- **Соединение:** чтение через `DatabaseConnection` завершает транзакцию
+  после fetch и один раз переподключается при operational error; SQLite
+  получает `busy_timeout` и WAL в сериализованной фазе инициализации.
+- **Cutover:** `migrate_db.py --import-sqlite PATH` открывает SQLite read-only,
+  создаёт/дополняет PG-схему, идемпотентно переносит леджеры через
+  `ON CONFLICT DO NOTHING` и синхронизирует BIGSERIAL. Порядок запуска:
+  короткая пауза → `PUBLISH_ENABLED=false` → импорт → сверка counts →
+  включение публикаций только на Render.

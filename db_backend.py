@@ -156,10 +156,18 @@ class Backend:
 class SQLiteBackend(Backend):
     name = SQLITE
     placeholder = "?"
-    operational_errors = (sqlite3.OperationalError, sqlite3.DatabaseError)
+    # OperationalError covers lock contention and connection-level failures;
+    # other DatabaseError subclasses (e.g. malformed SQL) must not be retried
+    # as if the database disappeared.
+    operational_errors = (sqlite3.OperationalError,)
 
     def connect(self, dsn: str):
-        return sqlite3.connect(dsn, check_same_thread=False)
+        conn = sqlite3.connect(dsn, check_same_thread=False, timeout=30)
+        # Reduce transient `database is locked` failures when two publisher
+        # threads/processes touch the same legacy SQLite file. WAL setup is
+        # deliberately deferred until the serialized schema-init phase.
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
 
     def columns(self, cursor, table: str) -> Set[str]:
         cursor.execute(f"PRAGMA table_info({table})")

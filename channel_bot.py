@@ -605,6 +605,12 @@ CATEGORY_NAMES_RU = {
 }
 
 # ==================== DATABASE ====================
+# SQLite allows multiple readers but serializes schema writes. The concurrency
+# regression intentionally opens two connections at once, so serialize only
+# the short startup DDL phase; normal queries remain independently locked.
+_DATABASE_INIT_LOCK = threading.RLock()
+
+
 class DatabaseConnection:
     """Thread-safe database connection with enhanced schema.
 
@@ -630,23 +636,41 @@ class DatabaseConnection:
             self.conn = self.backend.connect(self.db_path)
 
     def _reconnect(self) -> None:
-        """Re-open after a dropped connection (hosted Postgres suspends idle computes)."""
-        logger.warning("🔄 Database connection lost — reconnecting")
+        """Re-open after a dropped connection (hosted Postgres may suspend idle computes)."""
+        with self._lock:
+            logger.warning("🔄 Database connection lost — reconnecting")
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self._connect()
+
+    def _rollback_quietly(self) -> None:
         try:
-            self.conn.close()
+            self.conn.rollback()
         except Exception:
             pass
-        self._connect()
 
     def _initialize(self):
         """Initialize database schema with migrations"""
-        c = self.conn.cursor()
-
-        for statement in self.backend.ddl():
-            c.execute(statement)
-        self.conn.commit()
-        self._migrate_columns(c)
-        self.conn.commit()
+        with _DATABASE_INIT_LOCK:
+            c = self.conn.cursor()
+            try:
+                if isinstance(self.backend, db_backend.SQLiteBackend) and self.db_path != ":memory:":
+                    c.execute("PRAGMA journal_mode=WAL")
+                for statement in self.backend.ddl():
+                    c.execute(self.backend.prepare(statement))
+                self.conn.commit()
+                self._migrate_columns(c)
+                self.conn.commit()
+            except Exception:
+                self._rollback_quietly()
+                raise
+            finally:
+                try:
+                    c.close()
+                except Exception:
+                    pass
         logger.info("✅ Database initialized")
 
     def _migrate_columns(self, c) -> None:
@@ -676,27 +700,54 @@ class DatabaseConnection:
                 # col/decl come from the hardcoded tuple above, never user input.
                 c.execute(f"ALTER TABLE user_settings ADD COLUMN {col} {decl}")  # nosec B608
 
+    def _run_query(self, query: str, params: tuple = (), fetch: str = ""):
+        """Run one query, closing read transactions and retrying a lost link once.
+
+        psycopg2 starts a transaction for every SELECT. Committing after the
+        rows are read prevents Neon from holding an idle-in-transaction session
+        during the long collection interval. A reconnect+retry is limited to
+        one attempt and only for backend-declared operational errors.
+        """
+        prepared = self.backend.prepare(query)
+        for attempt in range(2):
+            try:
+                with self._lock:
+                    cursor = self.conn.cursor()
+                    cursor.execute(prepared, params)
+                    if fetch == "one":
+                        result = cursor.fetchone()
+                    elif fetch == "all":
+                        result = cursor.fetchall()
+                    else:
+                        result = cursor
+                    # Commit SELECTs as well as writes: this closes the
+                    # psycopg2 transaction before the next polling interval.
+                    self.conn.commit()
+                    return result
+            except self.backend.operational_errors:
+                self._rollback_quietly()
+                if attempt == 0:
+                    self._reconnect()
+                    continue
+                raise
+            except Exception:
+                # Leave the connection usable after a statement error (notably
+                # PostgreSQL's InFailedSqlTransaction state).
+                self._rollback_quietly()
+                raise
+        raise RuntimeError("database query retry exhausted")  # pragma: no cover
+
     def execute(self, query: str, params: tuple = ())->"sqlite3.Cursor":
         """Execute write query and commit. SQL is dialect-normalised first."""
-        with self._lock:
-            cursor = self.conn.cursor()
-            cursor.execute(self.backend.prepare(query), params)
-            self.conn.commit()
-            return cursor
+        return self._run_query(query, params)
 
     def fetchone(self, query: str, params: tuple = ()):
-        """Execute query and fetch one row (dialect-normalised)."""
-        with self._lock:
-            cursor = self.conn.cursor()
-            cursor.execute(self.backend.prepare(query), params)
-            return cursor.fetchone()
+        """Execute query, fetch one row, and close the read transaction."""
+        return self._run_query(query, params, fetch="one")
 
     def fetchall(self, query: str, params: tuple = ()):
-        """Execute query and fetch all rows (dialect-normalised)."""
-        with self._lock:
-            cursor = self.conn.cursor()
-            cursor.execute(self.backend.prepare(query), params)
-            return cursor.fetchall()
+        """Execute query, fetch all rows, and close the read transaction."""
+        return self._run_query(query, params, fetch="all")
     
     def close(self):
         """Close database connection"""
@@ -976,10 +1027,31 @@ class DatabaseConnection:
             cursor = self.execute(sql, (job_hash, target))
             return cursor.rowcount == 1
         except Exception as e:
-            # A broken ledger must not silently stop publishing; dedup degrades
-            # to the other layers (posted_jobs / channel history) instead.
-            logger.warning(f"claim_delivery unavailable, publishing unguarded: {e}")
-            return True
+            # Never publish without a durable claim: a DB outage is safer than
+            # turning the original duplicate-post incident back on.
+            logger.error(f"claim_delivery unavailable; skipping delivery: {e}")
+            return False
+
+    def claim_failed_delivery(self, job_hash: str, target_channel: str,
+                              max_attempts: int = 5) -> bool:
+        """Atomically reserve one failed delivery for a retry.
+
+        The retry worker may run concurrently in more than one process. A
+        read-only ``failed_deliveries()`` list is not a claim: both workers can
+        observe the same row and send it. Transitioning ``failed`` -> ``pending``
+        in one UPDATE makes exactly one worker win before either sends.
+        """
+        try:
+            cursor = self.execute(
+                "UPDATE deliveries SET status='pending', updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_hash = ? AND target_channel = ? AND status = 'failed' "
+                "AND attempts < ?",
+                (job_hash, str(target_channel), max(1, int(max_attempts))),
+            )
+            return cursor.rowcount == 1
+        except Exception as e:
+            logger.warning(f"retry claim unavailable for {job_hash}/{target_channel}: {e}")
+            return False
 
     def failed_deliveries(self, limit: int = 100, max_attempts: int = 5) -> List[Dict]:
         """Jobs with targets that still need a retry (B10)."""
@@ -1280,34 +1352,45 @@ class DbPersistence(BasePersistence):
         return self._bot_data
 
     async def update_bot_data(self, data):
-        self._bot_data = data
+        if self._bot_data != data:
+            self._bot_data = data
+            self._save()
 
     async def refresh_bot_data(self, bot_data):
         self._bot_data = bot_data
+        self._save()
 
     async def get_chat_data(self):
         return self._chat_data
 
     async def update_chat_data(self, chat_id, data):
-        self._chat_data[chat_id] = data
+        if self._chat_data.get(chat_id) != data:
+            self._chat_data[chat_id] = data
+            self._save()
 
     async def refresh_chat_data(self, chat_id, data):
         self._chat_data[chat_id] = data
+        self._save()
 
     async def get_user_data(self):
         return self._user_data
 
     async def update_user_data(self, user_id, data):
-        self._user_data[user_id] = data
+        if self._user_data.get(user_id) != data:
+            self._user_data[user_id] = data
+            self._save()
 
     async def refresh_user_data(self, user_id, data):
         self._user_data[user_id] = data
+        self._save()
 
     async def get_callback_data(self):
         return self._callback_data
 
     async def update_callback_data(self, data):
-        self._callback_data = data
+        if self._callback_data != data:
+            self._callback_data = data
+            self._save()
 
     async def get_conversations(self, name):
         return self._conversations[name]
@@ -1317,12 +1400,17 @@ class DbPersistence(BasePersistence):
             self._conversations[name].pop(key, None)
         else:
             self._conversations[name][key] = new_state
+        self._save()
 
     async def drop_chat_data(self, chat_id):
-        self._chat_data.pop(chat_id, None)
+        if chat_id in self._chat_data:
+            self._chat_data.pop(chat_id, None)
+            self._save()
 
     async def drop_user_data(self, user_id):
-        self._user_data.pop(user_id, None)
+        if user_id in self._user_data:
+            self._user_data.pop(user_id, None)
+            self._save()
 
     async def flush(self):
         self._save()
@@ -3445,6 +3533,11 @@ async def retry_failed_deliveries(bot: Bot, db: DatabaseConnection,
     for row in db.failed_deliveries(limit=limit):
         job_hash = row['job_hash']
         target = row['target_channel']
+        # B07 applies to retries too: the failed row must be claimed before
+        # reading/sending the payload, otherwise two retry workers duplicate
+        # the same Telegram message.
+        if not db.claim_failed_delivery(job_hash, target):
+            continue
         job = db.get_job_payload(job_hash)
         if not job:
             stats['missing_payload'] += 1

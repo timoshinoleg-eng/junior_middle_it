@@ -25,6 +25,10 @@
 
 **Review fix (on main):** auto-skip no longer permanent; Windows signal handlers try/except; `datetime` UTC aware.
 
+**v7 license correction (2026-09-05):** python-telegram-bot 20.6 is LGPLv3,
+not GPL-3.0. The earlier GPL-3.0 statement in this handoff is obsolete; see
+`docs/v7/DECISION_LOG.md` D-07 for the verification sources.
+
 ## Key files
 
 ```

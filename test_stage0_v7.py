@@ -99,6 +99,15 @@ class CheckAdminFailClosedTests(unittest.TestCase):
             self.assertFalse(asyncio.run(bot.check_admin(self._update(43))))
 
 
+class HealthRedactionTests(unittest.TestCase):
+    def test_render_health_summary_does_not_expose_channel_value(self):
+        import render_main
+        with mock.patch.dict(os.environ, {"CHANNEL_ID": "@private-channel"}, clear=False):
+            summary = render_main.config_summary()
+        self.assertTrue(summary["CHANNEL_ID"])
+        self.assertNotIn("CHANNEL_ID_VAL", summary)
+
+
 class CronAuthTests(unittest.TestCase):
     def test_missing_secret_fails_closed_with_503(self):
         status, payload = api_cron.authorize_cron_request(

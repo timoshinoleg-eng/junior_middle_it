@@ -175,6 +175,96 @@ def migrate_database(db_path: str = 'jobs.db'):
         conn.close()
 
 
+def migrate_sqlite_to_postgres(sqlite_path: str, postgres_url: str) -> dict:
+    """Copy durable ledgers from SQLite into an initialized PostgreSQL backend.
+
+    This is intentionally an explicit cutover command, not automatic startup
+    behaviour: the owner pauses publishing, runs it once against the live Neon
+    URL, verifies counts, and only then enables the Render publisher. Rows are
+    inserted idempotently with ``ON CONFLICT DO NOTHING``; source data is never
+    deleted or modified. The source SQLite file is opened read-only.
+    """
+    if not os.path.exists(sqlite_path):
+        raise FileNotFoundError(sqlite_path)
+    source = sqlite3.connect(f"file:{Path(sqlite_path).resolve()}?mode=ro", uri=True)
+    backend = db_backend.get_backend(postgres_url)
+    target = backend.connect(postgres_url)
+    copied = {}
+    tables = (
+        'posted_jobs', 'user_favorites', 'user_settings',
+        'telegram_content_hashes', 'events', 'referrals', 'job_payloads',
+        'deliveries', 'source_runs', 'meta', 'bot_state',
+    )
+    try:
+        target_cursor = target.cursor()
+        for statement in backend.ddl():
+            target_cursor.execute(statement)
+        # Match DatabaseConnection's compatibility migrations before copying;
+        # otherwise legacy observability/profile columns would be silently
+        # omitted from the target column intersection below.
+        compatibility = (
+            "ALTER TABLE posted_jobs ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'other'",
+            "ALTER TABLE posted_jobs ADD COLUMN IF NOT EXISTS fingerprint TEXT DEFAULT ''",
+            "ALTER TABLE posted_jobs ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP",
+            "ALTER TABLE user_favorites ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'saved'",
+            "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS skills TEXT DEFAULT ''",
+            "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS digest_enabled SMALLINT DEFAULT 0",
+            "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS onboarding_done SMALLINT DEFAULT 0",
+            "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS alerts_enabled SMALLINT DEFAULT 0",
+            "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS premium_unlocked SMALLINT DEFAULT 0",
+        )
+        for statement in compatibility:
+            target_cursor.execute(statement)
+        target.commit()
+        for table in tables:
+            source_cursor = source.execute(f"PRAGMA table_info({table})")
+            source_columns = [row[1] for row in source_cursor.fetchall()]
+            if not source_columns:
+                copied[table] = 0
+                continue
+            if not all(col.replace("_", "").isalnum() for col in source_columns):
+                raise ValueError(f"unsafe SQLite column metadata in {table!r}")
+            target_columns = backend.columns(target_cursor, table)
+            columns = [col for col in source_columns if col in target_columns]
+            if not columns:
+                copied[table] = 0
+                continue
+            quoted = ", ".join(columns)
+            placeholders = ", ".join(["%s"] * len(columns))
+            # Table/column names come only from sqlite PRAGMA metadata and are
+            # constrained to identifier characters; values remain parameters.
+            insert = (
+                f"INSERT INTO {table} ({quoted}) VALUES ({placeholders}) "
+                "ON CONFLICT DO NOTHING"  # nosec B608
+            )
+            rows = source.execute(f"SELECT {quoted} FROM {table}").fetchall()  # nosec B608
+            for row in rows:
+                target_cursor.execute(insert, row)
+            copied[table] = len(rows)
+        # Keep BIGSERIAL ids above all imported values for future inserts.
+        for table in ('user_favorites', 'events', 'source_runs'):
+            target_cursor.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = %s "
+                "AND column_name = 'id'",
+                (table,),
+            )
+            if target_cursor.fetchone():
+                target_cursor.execute(
+                    "SELECT setval(pg_get_serial_sequence(%s, 'id'), "
+                    "COALESCE(MAX(id), 1), MAX(id) IS NOT NULL) FROM " + table,  # nosec B608 (allowlisted table)
+                    (table,),
+                )
+        target.commit()
+        return copied
+    except Exception:
+        target.rollback()
+        raise
+    finally:
+        source.close()
+        target.close()
+
+
 def backfill_categories(db_path: str = 'jobs.db'):
     """
     Бэкфилл существующих вакансий с помощью классификатора.
@@ -273,10 +363,21 @@ if __name__ == '__main__':
     parser.add_argument('--db', default='jobs.db', help='Path to database file')
     parser.add_argument('--backfill', action='store_true', help='Run category backfill')
     parser.add_argument('--schema', action='store_true', help='Print database schema')
+    parser.add_argument('--import-sqlite', metavar='PATH', help='Copy SQLite ledgers into DATABASE_URL')
     
     args = parser.parse_args()
     
-    if args.schema:
+    if args.import_sqlite:
+        if not db_backend.database_url():
+            parser.error('--import-sqlite requires DATABASE_URL or TEST_DATABASE_URL')
+        try:
+            result = migrate_sqlite_to_postgres(args.import_sqlite, db_backend.database_url())
+            logger.info(f"✅ SQLite -> PostgreSQL import complete: {result}")
+            sys.exit(0)
+        except Exception as exc:
+            logger.error(f"❌ SQLite -> PostgreSQL import failed: {exc}")
+            sys.exit(1)
+    elif args.schema:
         print_schema(args.db)
     elif args.backfill:
         # v7 (B13): a failed backfill must not exit 0.

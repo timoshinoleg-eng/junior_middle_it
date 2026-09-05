@@ -35,7 +35,6 @@ def config_summary() -> dict:
         "TELEGRAM_BOT_TOKEN": present("TELEGRAM_BOT_TOKEN"),
         "TELEGRAM_BOT_ID": (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").split(":")[0] if present("TELEGRAM_BOT_TOKEN") else "",
         "CHANNEL_ID": present("CHANNEL_ID"),
-        "CHANNEL_ID_VAL": os.getenv("CHANNEL_ID", "")[:30] if present("CHANNEL_ID") else "",
         "APIFY_API_TOKEN": present("APIFY_API_TOKEN"),
         "TELEGRAM_API_ID": present("TELEGRAM_API_ID"),
         "TELEGRAM_API_HASH": present("TELEGRAM_API_HASH"),
@@ -86,7 +85,9 @@ class HealthHandler(BaseHTTPRequestHandler):
                     else "crashed" if error
                     else "starting"
                 ),
-                "error": error,
+                # Do not expose exception text/traceback on the public health
+                # endpoint; details stay in server logs and Sentry.
+                "error": bool(error),
                 "config": config_summary(),
                 "cycle": None,
             }
@@ -132,9 +133,11 @@ def run_bot() -> None:
             STATE["error"] = "channel_bot.main() returned unexpectedly"
     except BaseException as e:
         tb = traceback.format_exc()
-        print(f"[render_main] BOT CRASHED: {tb}", flush=True)
+        print(f"[render_main] BOT CRASHED: {tb}", flush=True)  # server log only
         with STATE_LOCK:
-            STATE["error"] = f"{type(e).__name__}: {e} | ...{tb[-400:]}"
+            # Keep the public health payload boolean-only; traceback remains in
+            # the process log and is captured by Sentry if configured.
+            STATE["error"] = True
 
 
 def main() -> None:

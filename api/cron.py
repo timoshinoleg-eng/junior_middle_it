@@ -9,6 +9,7 @@ v7 Stage 0 hardening:
   and server logs only; clients receive a generic ``internal_error``.
 """
 import asyncio
+import hmac
 import json
 import os
 import sys
@@ -39,7 +40,8 @@ def authorize_cron_request(headers, secret: Optional[str]) -> Tuple[int, dict]:
         auth = headers.get("authorization", "") or ""
     except AttributeError:
         auth = ""
-    if auth != f"Bearer {secret}":
+    expected = f"Bearer {secret}"
+    if not hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8")):
         return 401, {"ok": False, "error": "unauthorized"}
     return 200, {}
 
