@@ -9,18 +9,27 @@ zero duplicates regardless of interleaving.
 
 No network, no Telegram I/O.
 """
+import asyncio
 import os
 import sqlite3
 import sys
 import tempfile
 import threading
 import unittest
+from collections import Counter
+from unittest.mock import patch
+
+import channel_bot
+from channel_bot import (
+    DatabaseConnection,
+    generate_job_hash,
+    post_job_with_bot,
+    run_v7_migration,
+)
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
-
-from channel_bot import DatabaseConnection, generate_job_hash, run_v7_migration
 
 
 JOBS = [
@@ -117,6 +126,70 @@ class ConcurrentPublishersTests(unittest.TestCase):
         # after successful retry the ledger is clean
         db.record_delivery(h, "@qa", "sent")
         self.assertEqual(db.failed_deliveries(limit=10), [])
+        db.conn.close()
+
+
+class ConcurrentPublishPathTests(unittest.TestCase):
+    """Drive the REAL publish path (post_job_with_bot) from two publishers.
+
+    The ledger's UNIQUE(job_hash, target_channel) de-duplicates ROWS, not
+    messages: two processes that both reach the send step produce one ledger
+    row and two channel posts. This test counts actual sends, so it fails on
+    the original incident symptom (duplicate posts) instead of passing on
+    storage invariants alone.
+    """
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.sends = Counter()
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    async def _fake_send(self, bot, job, chat_id, interactive=True,
+                         max_flood_retries=3):
+        self.sends[(job["hash"], chat_id)] += 1
+        await asyncio.sleep(0)
+        return True
+
+    async def _publisher(self):
+        db = DatabaseConnection(self.path)
+        run_v7_migration(db)
+        for job in JOBS:
+            job = dict(job)
+            job["hash"] = generate_job_hash(job)
+            await post_job_with_bot(object(), job, db=db)
+        db.conn.close()
+
+    def test_two_publishers_send_each_job_to_each_channel_once(self):
+        with patch.object(channel_bot, "get_target_channels",
+                          lambda job: list(TARGETS)), \
+             patch.object(channel_bot, "_send_job_to_chat", self._fake_send), \
+             patch.object(channel_bot.Config, "MULTI_TRACK_POST_DELAY", 0):
+
+            async def run():
+                await asyncio.gather(self._publisher(), self._publisher())
+
+            asyncio.run(run())
+
+        self.assertEqual(sum(self.sends.values()), len(JOBS) * len(TARGETS))
+        self.assertEqual({k: v for k, v in self.sends.items() if v > 1}, {})
+
+    def test_abandoned_pending_claim_is_reclaimable_after_timeout(self):
+        """A crash after claiming must not drop the delivery forever."""
+        db = DatabaseConnection(self.path)
+        run_v7_migration(db)
+        job = dict(JOBS[0])
+        h = generate_job_hash(job)
+        self.assertTrue(db.claim_delivery(h, "@main"))
+        self.assertFalse(db.claim_delivery(h, "@main"))  # fresh claim is held
+        # Simulate an abandoned claim from 30 minutes ago.
+        db.execute(
+            "UPDATE deliveries SET updated_at = datetime('now', '-30 minutes') "
+            "WHERE job_hash = ? AND target_channel = ?", (h, "@main"),
+        )
+        self.assertTrue(db.claim_delivery(h, "@main"))
         db.conn.close()
 
 

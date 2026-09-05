@@ -1016,6 +1016,45 @@ class DatabaseConnection:
         except Exception as e:
             logger.debug(f"record_delivery failed: {e}")
 
+    def claim_delivery(self, job_hash: str, target_channel: str,
+                       stale_after_minutes: int = 10) -> bool:
+        """Atomically claim one (job, channel) delivery BEFORE sending (v7, B07).
+
+        Returns True only when this caller won the claim and may send. An
+        existing row means another cycle or process owns (or already completed)
+        that delivery, so the caller must skip it — otherwise two publishers
+        both send and the channel gets a duplicate post. The ledger's
+        UNIQUE(job_hash, target_channel) de-duplicates ROWS, not messages:
+        without this claim two concurrent publishers produce one ledger row
+        and two messages.
+
+        A 'pending' row older than stale_after_minutes is treated as abandoned
+        (the process died mid-send) and may be re-claimed, so a crash cannot
+        silently drop a delivery forever.
+        """
+        target = str(target_channel)
+        try:
+            cursor = self.execute(
+                'INSERT OR IGNORE INTO deliveries '
+                '(job_hash, target_channel, status, attempts, last_error, updated_at) '
+                "VALUES (?, ?, 'pending', 0, '', CURRENT_TIMESTAMP)",
+                (job_hash, target),
+            )
+            if cursor.rowcount == 1:
+                return True
+            cursor = self.execute(
+                "UPDATE deliveries SET status='pending', updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_hash = ? AND target_channel = ? AND status = 'pending' "
+                "AND updated_at <= datetime('now', ?)",
+                (job_hash, target, f'-{max(1, int(stale_after_minutes))} minutes'),
+            )
+            return cursor.rowcount == 1
+        except Exception as e:
+            # A broken ledger must not silently stop publishing; dedup degrades
+            # to the other layers (posted_jobs / channel history) instead.
+            logger.warning(f"claim_delivery unavailable, publishing unguarded: {e}")
+            return True
+
     def failed_deliveries(self, limit: int = 100, max_attempts: int = 5) -> List[Dict]:
         """Jobs with targets that still need a retry (B10)."""
         rows = self.fetchall(
@@ -3324,6 +3363,15 @@ async def post_job_with_bot(bot: Bot, job: Dict, db: Optional[DatabaseConnection
     for i, chat_id in enumerate(targets):
         if i > 0:
             await asyncio.sleep(Config.MULTI_TRACK_POST_DELAY)
+        # v7 (B07): claim the slot BEFORE sending. Without this, two publishers
+        # racing on the same job both send and the channel gets a duplicate —
+        # the ledger would still show a single row, hiding the incident.
+        if db is not None and not db.claim_delivery(job_hash, chat_id):
+            logger.info(
+                f"⏭️ Skip {chat_id}: delivery already claimed/sent for {job_hash}"
+            )
+            any_ok = True
+            continue
         ok = await _send_job_to_chat(bot, job, chat_id, interactive=interactive)
         if db:
             # v7 (B10): remember the outcome per target channel so the next
