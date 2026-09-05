@@ -26,6 +26,14 @@ services:
       # Numeric Telegram user id; set it in the Render dashboard.
       - key: ADMIN_USER_ID
         sync: false
+      # v7 (zero-cost storage): Neon Postgres connection string. Without it the
+      # bot falls back to the local SQLite file (which is wiped on every Render
+      # free restart — the root cause of the duplicate-post incident). Paste the
+      # Neon "Connection string" (must include ?sslmode=require) here; psycopg2
+      # is installed via requirements.txt and db_backend selects Postgres when
+      # this var is present.
+      - key: DATABASE_URL
+        sync: false
       - key: TELEGRAM_API_ID
         sync: false
       - key: TELEGRAM_API_HASH

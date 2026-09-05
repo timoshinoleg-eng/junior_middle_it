@@ -68,3 +68,47 @@ jobs:
 
       - name: Concurrent publishers must not double-post (regression, B07/B10)
         run: python -m unittest test_concurrency_v7 -v
+
+  # v7 (B07-storage): the same suite must pass against a real PostgreSQL so the
+  # Neon-backed delivery ledger + persistence are actually exercised, not just
+  # the SQLite path. TEST_DATABASE_URL selects the Postgres backend; db_backend
+  # isolates each test in its own schema (keyed by db_path). sslmode=disable is
+  # fine for the in-CI service; production (Neon) URLs keep sslmode=require.
+  postgres-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+
+      - name: Compile check
+        run: python -m compileall -q . -x 'ci-check|\.venv.*'
+
+      - name: Unit + integration tests (PostgreSQL backend)
+        run: python -m unittest discover -v
+
+      - name: Concurrent publishers must not double-post (PostgreSQL, B07/B10)
+        run: python -m unittest test_concurrency_v7 -v

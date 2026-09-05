@@ -16,7 +16,7 @@ import sqlite3
 import hashlib
 import logging
 import sys
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Set
@@ -29,17 +29,23 @@ import requests
 import defusedxml.ElementTree as ET
 from html import unescape as html_unescape
 from concurrent.futures import ThreadPoolExecutor
+import threading
+import base64
+import pickle
 
 import http_guard
 import http_cache
 import ats_scrapers_adapter
+# v7 (zero-cost infra): storage backends. SQLite stays the default; setting
+# DATABASE_URL switches the whole app to PostgreSQL without touching a query.
+import db_backend
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton, Bot,
     BotCommand, BotCommandScopeChat,
 )
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, 
-    CallbackQueryHandler, filters
+    Application, CommandHandler, ContextTypes,
+    CallbackQueryHandler, filters, BasePersistence
 )
 from telegram.error import InvalidToken, RetryAfter, TelegramError, TimedOut
 from telegram.constants import ParseMode
@@ -600,157 +606,65 @@ CATEGORY_NAMES_RU = {
 
 # ==================== DATABASE ====================
 class DatabaseConnection:
-    """Thread-safe SQLite database connection with enhanced schema"""
-    def __init__(self, db_path: str = 'jobs.db'):
+    """Thread-safe database connection with enhanced schema.
+
+    Backend is chosen by ``DATABASE_URL``: without it this is the historical
+    SQLite file (unchanged behaviour); with it, PostgreSQL via ``db_backend``.
+    The schema, the queries and the public API are identical on both.
+    """
+    def __init__(self, db_path: str = 'jobs.db', url: Optional[str] = None):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.backend = db_backend.get_backend(url)
+        self._lock = threading.RLock()
+        self._connect()
         self._initialize()
-    
+
+    def _connect(self) -> None:
+        if db_backend.is_postgres(self.backend):
+            # The path is meaningless here: the DSN carries the connection.
+            self.conn = self.backend.connect(self.backend.dsn)
+            if os.getenv(db_backend.TEST_DATABASE_URL):
+                # Test isolation: one schema per distinct db_path.
+                self.backend.new_test_schema(self.conn, self.db_path)
+        else:
+            self.conn = self.backend.connect(self.db_path)
+
+    def _reconnect(self) -> None:
+        """Re-open after a dropped connection (hosted Postgres suspends idle computes)."""
+        logger.warning("🔄 Database connection lost — reconnecting")
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self._connect()
+
     def _initialize(self):
         """Initialize database schema with migrations"""
         c = self.conn.cursor()
-        
-        # Main jobs table
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS posted_jobs (
-                hash TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                company TEXT NOT NULL,
-                level TEXT,
-                url TEXT,
-                source TEXT,
-                category TEXT DEFAULT 'other',
-                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # User favorites
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS user_favorites (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                job_hash TEXT NOT NULL,
-                saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, job_hash)
-            )
-        """)
-        
-        # User settings / profile
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS user_settings (
-                user_id INTEGER PRIMARY KEY,
-                enabled_categories TEXT DEFAULT 'development,qa,devops,data,marketing,sales,pm,design,other',
-                hide_senior BOOLEAN DEFAULT 1,
-                min_salary_filter INTEGER DEFAULT 0,
-                skills TEXT DEFAULT '',
-                digest_enabled INTEGER DEFAULT 0,
-                onboarding_done INTEGER DEFAULT 0,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Telegram content hashes for dedup
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS telegram_content_hashes (
-                hash TEXT PRIMARY KEY,
-                source TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
 
-        # Product analytics events (start, save, share, referral)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                user_id INTEGER,
-                name TEXT NOT NULL,
-                props TEXT DEFAULT '{}'
-            )
-        """)
+        for statement in self.backend.ddl():
+            c.execute(statement)
+        self.conn.commit()
+        self._migrate_columns(c)
+        self.conn.commit()
+        logger.info("✅ Database initialized")
 
-        # Referral graph: invitee -> referrer (first touch wins)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS referrals (
-                user_id INTEGER PRIMARY KEY,
-                referrer_id INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Full job JSON for expand/compact callbacks
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS job_payloads (
-                hash TEXT PRIMARY KEY,
-                payload TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # v7 Stage 1 (B10): per-target delivery ledger. One row per
-        # (job_hash, target_channel) so a job that reached 1 of N channels is
-        # retried ONLY for the channels that failed, instead of being either
-        # globally deduped (lost) or globally reposted (duplicate).
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS deliveries (
-                job_hash TEXT NOT NULL,
-                target_channel TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(job_hash, target_channel)
-            )
-        """)
-
-        # v7 Stage 3 (B22): persistent per-source run history — fail-streak
-        # auto-skip survives cold starts (was in-memory only).
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS source_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL,
-                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                fetched INTEGER NOT NULL DEFAULT 0,
-                error TEXT,
-                elapsed_ms INTEGER
-            )
-        """)
-
-        # Indexes
-        c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_category ON posted_jobs(category)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_posted_at ON posted_jobs(posted_at)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_favorites_user ON user_favorites(user_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tg_hashes_created ON telegram_content_hashes(created_at)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_events_name_ts ON events(name, ts)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_job_payloads_created ON job_payloads(created_at)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_source_runs_source ON source_runs(source, started_at)")
-        
-        # Meta table for one-shot migrations and flags
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Migration: add category if not exists
-        try:
-            c.execute("SELECT category FROM posted_jobs LIMIT 1")
-        except sqlite3.OperationalError:
+    def _migrate_columns(self, c) -> None:
+        """Add columns that older databases are missing (works on both dialects)."""
+        posted = self.backend.columns(c, 'posted_jobs')
+        if 'category' not in posted:
             c.execute("ALTER TABLE posted_jobs ADD COLUMN category TEXT DEFAULT 'other'")
-
-        # Migration: fingerprint for fuzzy dedup
-        try:
-            c.execute("SELECT fingerprint FROM posted_jobs LIMIT 1")
-        except sqlite3.OperationalError:
+        if 'fingerprint' not in posted:
             c.execute("ALTER TABLE posted_jobs ADD COLUMN fingerprint TEXT DEFAULT ''")
             c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_fingerprint ON posted_jobs(fingerprint)")
+        if 'last_seen_at' not in posted:
+            c.execute("ALTER TABLE posted_jobs ADD COLUMN last_seen_at TIMESTAMP")
 
-        # Migration: profile columns on user_settings
+        favorites = self.backend.columns(c, 'user_favorites')
+        if 'status' not in favorites:
+            c.execute("ALTER TABLE user_favorites ADD COLUMN status TEXT DEFAULT 'saved'")
+
+        settings = self.backend.columns(c, 'user_settings')
         for col, decl in (
             ('skills', "TEXT DEFAULT ''"),
             ('digest_enabled', 'INTEGER DEFAULT 0'),
@@ -758,38 +672,49 @@ class DatabaseConnection:
             ('alerts_enabled', 'INTEGER DEFAULT 0'),
             ('premium_unlocked', 'INTEGER DEFAULT 0'),
         ):
-            try:
-                # col/decl come from the hardcoded tuple above, never from user input.
-                c.execute(f'SELECT {col} FROM user_settings LIMIT 1')  # nosec B608
-            except sqlite3.OperationalError:
-                c.execute(f'ALTER TABLE user_settings ADD COLUMN {col} {decl}')  # nosec B608
-        
-        self.conn.commit()
-        logger.info("✅ Database initialized")
-    
+            if col not in settings:
+                # col/decl come from the hardcoded tuple above, never user input.
+                c.execute(f"ALTER TABLE user_settings ADD COLUMN {col} {decl}")  # nosec B608
+
     def execute(self, query: str, params: tuple = ())->"sqlite3.Cursor":
-        """Execute query with commit"""
-        cursor = self.conn.cursor()
-        cursor.execute(query, params)
-        self.conn.commit()
-        return cursor
-    
+        """Execute write query and commit. SQL is dialect-normalised first."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(self.backend.prepare(query), params)
+            self.conn.commit()
+            return cursor
+
     def fetchone(self, query: str, params: tuple = ()):
-        """Execute query and fetch one row"""
-        cursor = self.conn.cursor()
-        cursor.execute(query, params)
-        return cursor.fetchone()
-    
+        """Execute query and fetch one row (dialect-normalised)."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(self.backend.prepare(query), params)
+            return cursor.fetchone()
+
     def fetchall(self, query: str, params: tuple = ()):
-        """Execute query and fetch all rows"""
-        cursor = self.conn.cursor()
-        cursor.execute(query, params)
-        return cursor.fetchall()
+        """Execute query and fetch all rows (dialect-normalised)."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(self.backend.prepare(query), params)
+            return cursor.fetchall()
     
     def close(self):
         """Close database connection"""
         self.conn.close()
         logger.info("🔌 Database connection closed")
+
+    # ---- bot runtime persistence (replaces PicklePersistence on disk) ----
+    def set_state(self, key: str, value: str) -> None:
+        """Upsert an opaque string value (e.g. a base64 pickle blob)."""
+        self.execute(
+            "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+
+    def get_state(self, key: str) -> Optional[str]:
+        """Return a stored string value, or None if absent."""
+        row = self.fetchone("SELECT value FROM bot_state WHERE key = ?", (key,))
+        return row[0] if row else None
     
     # User favorites methods
     def add_favorite(self, user_id: int, job_hash: str) -> bool:
@@ -1042,12 +967,13 @@ class DatabaseConnection:
             )
             if cursor.rowcount == 1:
                 return True
-            cursor = self.execute(
+            stale = max(1, int(stale_after_minutes))
+            sql = (
                 "UPDATE deliveries SET status='pending', updated_at=CURRENT_TIMESTAMP "
                 "WHERE job_hash = ? AND target_channel = ? AND status = 'pending' "
-                "AND updated_at <= datetime('now', ?)",
-                (job_hash, target, f'-{max(1, int(stale_after_minutes))} minutes'),
+                f"AND updated_at <= {self.backend.ts_ago(stale)}"  # nosec B608  (int-only interpolation)
             )
+            cursor = self.execute(sql, (job_hash, target))
             return cursor.rowcount == 1
         except Exception as e:
             # A broken ledger must not silently stop publishing; dedup degrades
@@ -1298,6 +1224,113 @@ class DatabaseConnection:
         return [r[0] for r in rows if r and r[0]]
 
 
+class DbPersistence(BasePersistence):
+    """PTB persistence backed by the shared database instead of a pickle file.
+
+    Replaces PicklePersistence so wizard/profile/conversation state survives
+    Render's ephemeral filesystem (v7 zero-cost storage goal). The whole
+    snapshot is pickled (preserving int chat/user keys and arbitrary objects,
+    exactly like PicklePersistence) and stored base64-encoded in ``bot_state``.
+    Loaded once at startup; flushed on every PTB persistence update.
+    """
+
+    KEY = "ptb_state"
+
+    def __init__(self, db: DatabaseConnection, store_data=None):
+        super().__init__(store_data=store_data)
+        self._db = db
+        self._bot_data: Dict = {}
+        self._chat_data: Dict = defaultdict(dict)
+        self._user_data: Dict = defaultdict(dict)
+        self._callback_data = None
+        self._conversations: Dict = defaultdict(dict)
+        self._load()
+
+    def _load(self) -> None:
+        raw = self._db.get_state(self.KEY)
+        if not raw:
+            return
+        try:
+            # Our own state blob (equivalent trust level to PicklePersistence's
+            # on-disk pickle); not attacker-controlled input.
+            data = pickle.loads(base64.b64decode(raw))  # nosec B301
+        except Exception:
+            logger.warning("⚠️ DbPersistence: corrupt state blob, starting fresh")
+            return
+        self._bot_data = data.get("bot_data", {}) or {}
+        self._chat_data = defaultdict(dict, data.get("chat_data", {}) or {})
+        self._user_data = defaultdict(dict, data.get("user_data", {}) or {})
+        self._callback_data = data.get("callback_data")
+        self._conversations = defaultdict(dict, data.get("conversations", {}) or {})
+
+    def _save(self) -> None:
+        blob = {
+            "bot_data": dict(self._bot_data),
+            "chat_data": {k: dict(v) for k, v in self._chat_data.items()},
+            "user_data": {k: dict(v) for k, v in self._user_data.items()},
+            "callback_data": self._callback_data,
+            "conversations": {k: dict(v) for k, v in self._conversations.items()},
+        }
+        try:
+            self._db.set_state(self.KEY, base64.b64encode(pickle.dumps(blob)).decode("ascii"))
+        except Exception as e:  # pragma: no cover - outer caller logs
+            logger.warning(f"⚠️ DbPersistence: flush failed: {e}")
+
+    async def get_bot_data(self):
+        return self._bot_data
+
+    async def update_bot_data(self, data):
+        self._bot_data = data
+
+    async def refresh_bot_data(self, bot_data):
+        self._bot_data = bot_data
+
+    async def get_chat_data(self):
+        return self._chat_data
+
+    async def update_chat_data(self, chat_id, data):
+        self._chat_data[chat_id] = data
+
+    async def refresh_chat_data(self, chat_id, data):
+        self._chat_data[chat_id] = data
+
+    async def get_user_data(self):
+        return self._user_data
+
+    async def update_user_data(self, user_id, data):
+        self._user_data[user_id] = data
+
+    async def refresh_user_data(self, user_id, data):
+        self._user_data[user_id] = data
+
+    async def get_callback_data(self):
+        return self._callback_data
+
+    async def update_callback_data(self, data):
+        self._callback_data = data
+
+    async def get_conversations(self, name):
+        return self._conversations[name]
+
+    async def update_conversation(self, name, key, new_state):
+        if new_state is None:
+            self._conversations[name].pop(key, None)
+        else:
+            self._conversations[name][key] = new_state
+
+    async def drop_chat_data(self, chat_id):
+        self._chat_data.pop(chat_id, None)
+
+    async def drop_user_data(self, user_id):
+        self._user_data.pop(user_id, None)
+
+    async def flush(self):
+        self._save()
+
+    async def drop_database(self):
+        self._db.execute("DELETE FROM bot_state WHERE key = ?", (self.KEY,))
+
+
 def init_database() -> DatabaseConnection:
     """Initialize and return database connection"""
     return DatabaseConnection()
@@ -1311,8 +1344,8 @@ def run_v7_migration(db: DatabaseConnection) -> bool:
     - user_favorites.status (Stage 2 application pipeline)
     """
     def _columns(cursor, table: str) -> set:
-        cursor.execute(f"PRAGMA table_info({table})")
-        return {row[1] for row in cursor.fetchall()}
+        # Backend-aware: PRAGMA on SQLite, information_schema on PostgreSQL.
+        return db.backend.columns(cursor, table)
 
     try:
         c = db.conn.cursor()
@@ -1625,9 +1658,14 @@ def register_posted_job(job: Dict, db: DatabaseConnection) -> None:
 
 def run_hash_migration(db: DatabaseConnection) -> bool:
     """One-shot idempotent migration of posted_jobs hashes to normalized URLs.
-    
+
     Uses db.conn directly to keep the entire migration in a single SQLite transaction.
     """
+    # PostgreSQL databases are always created fresh via db_backend.ddl() with
+    # already-normalised hashes, so this legacy SQLite rewrite (which relies on
+    # SQLite's implicit `rowid`) is a no-op there.
+    if db_backend.is_postgres(db.backend):
+        return True
     conn = db.conn
     try:
         c = conn.cursor()
@@ -4786,18 +4824,26 @@ async def main():
     # Setup Telegram bot (job-queue optional for digests)
     builder = Application.builder().token(Config.TELEGRAM_BOT_TOKEN)
     # v7 (B14): persistent user_data (incl. /setup wizard step) across restarts.
-    # Serverless FS is read-only and the interactive bot never runs there.
+    # The interactive bot never runs on serverless (read-only FS), so skip there.
     if not os.getenv('VERCEL'):
         try:
-            from telegram.ext import PersistenceInput, PicklePersistence
-            _persistence = PicklePersistence(
-                filepath=os.getenv('PERSISTENCE_FILE', 'bot_persistence.pkl'),
-                store_data=PersistenceInput(
-                    bot_data=True, chat_data=True, user_data=True, callback_data=False
-                ),
+            from telegram.ext import PersistenceInput
+            store_data = PersistenceInput(
+                bot_data=True, chat_data=True, user_data=True, callback_data=False
             )
+            if db is not None:
+                # DB-backed: wizard/profile state survives Render's ephemeral
+                # FS because it lives in the shared DB (Neon Postgres), not a file.
+                _persistence = DbPersistence(db, store_data=store_data)
+                logger.info("💾 DbPersistence enabled (state survives restarts via DB)")
+            else:
+                from telegram.ext import PicklePersistence
+                _persistence = PicklePersistence(
+                    filepath=os.getenv('PERSISTENCE_FILE', 'bot_persistence.pkl'),
+                    store_data=store_data,
+                )
+                logger.info("💾 PicklePersistence enabled (file fallback; no DB)")
             builder = builder.persistence(_persistence)
-            logger.info("💾 PicklePersistence enabled (wizard/profile state survives restarts)")
         except Exception as e:
             logger.warning(f"Persistence unavailable (state in-memory only): {e}")
     builder = builder.post_init(_post_init_bot)

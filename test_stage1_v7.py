@@ -67,12 +67,13 @@ class V7MigrationTests(unittest.TestCase):
             # second run must not fail (idempotent)
             self.assertTrue(run_v7_migration(db))
 
-            cols = {r[1] for r in db.conn.execute("PRAGMA table_info(posted_jobs)")}
+            # Backend-aware introspection (PRAGMA on SQLite, information_schema
+            # on PostgreSQL) so this test passes under both CI backends.
+            cols = db.backend.columns(db.conn.cursor(), 'posted_jobs')
             self.assertIn("last_seen_at", cols)
-            fav_cols = {r[1] for r in db.conn.execute("PRAGMA table_info(user_favorites)")}
+            fav_cols = db.backend.columns(db.conn.cursor(), 'user_favorites')
             self.assertIn("status", fav_cols)
-            tables = {r[0] for r in db.conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}
+            tables = db.backend.tables(db.conn.cursor())
             self.assertIn("deliveries", tables)
             db.conn.close()
         finally:

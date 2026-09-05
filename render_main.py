@@ -44,6 +44,7 @@ def config_summary() -> dict:
         "GREENHOUSE_BOARDS": present("GREENHOUSE_BOARDS"),
         "DEDUP_MODE": os.getenv("DEDUP_MODE", "sqlite"),
         "CHECK_INTERVAL": os.getenv("CHECK_INTERVAL", "1800"),
+        "DATABASE_URL": present("DATABASE_URL"),
     }
 
 

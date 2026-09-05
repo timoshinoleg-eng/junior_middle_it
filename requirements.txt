@@ -13,6 +13,11 @@ rapidfuzz>=3.6.0
 # v7 (B27): safe parsing of external RSS/XML
 defusedxml>=0.7.1
 
+# v7 (B07-storage): PostgreSQL backend (Neon free tier) for the delivery
+# ledger + bot persistence so published-state survives Render restarts.
+# Lazy-imported by db_backend; only required when DATABASE_URL is set.
+psycopg2-binary>=2.9.9
+
 # Telegram channel parsing (optional)
 # Установите для работы с Telegram-каналами:
 # pip install telethon

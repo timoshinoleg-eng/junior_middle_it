@@ -165,3 +165,41 @@
   переменной, exit 0 с ней).
 - **Ограничение:** `sync: false`-переменные не попадают в preview-окружения —
   для PR-превью валидация будет падать. Учесть при включении превью.
+
+## D-14. Хранилище на PostgreSQL (нулевая стоимость, Neon)
+
+- **Решение:** добавлен `db_backend.py` — тонкий слой бэкендов. SQLite
+  остаётся по умолчанию (без `DATABASE_URL` поведение байт-в-байт старое);
+  при наличии `DATABASE_URL` выбирается PostgreSQL (Neon free tier). Схема
+  портирована 1:1, сами запросы (~65 штук) не переписывались.
+- **Механизм:** `translate_placeholders` (`?` → `%s`),
+  `translate_upsert` (`INSERT OR IGNORE/REPLACE` → `ON CONFLICT …`),
+  `ts_ago` (`datetime('now', ?)` → `now() - interval 'N min'`),
+  `columns/tables` (`PRAGMA` → `information_schema`). Тестовая изоляция
+  PostgreSQL: отдельная схема на `db_path` (md5) через `search_path`.
+- **Обоснование:** на Render free ФС эфемерна — SQLite-файл стирается при
+  рестарте, это и есть корень инцидента с дублями. Внешний бесплатный
+  Postgres (Neon) решает проблему без платного плана Render.
+- **Ограничения:** (1) `psycopg2-binary` добавлен в `requirements.txt`
+  (ленивый импорт в `db_backend`); (2) `sslmode=require` добавляется к URL,
+  если отсутствует — для локального/CI Postgres передавать `?sslmode=disable`;
+  (3) `run_hash_migration` пропускается на Postgres (зависит от `rowid`
+  SQLite). (4) Локальная проверка на живом Postgres в этом окружении
+  недоступна (Docker daemon не запущен) — путь PostgreSQL гейтится в CI
+  (`postgres-gate`, сервис `postgres:16` + `TEST_DATABASE_URL`).
+
+## D-15. Персистентность бота в БД (DbPersistence вместо PicklePersistence)
+
+- **Решение:** `DbPersistence(BasePersistence)` хранит снимок состояния PTB
+  (`user_data`/`chat_data`/`bot_data`/`conversations`) в таблице `bot_state`
+  как `base64(pickle)`. Загружается при старте, сбрасывается на `flush()`.
+  В `render_main` подключается при наличии `db`, иначе фоллбэк на
+  `PicklePersistence`-файл.
+- **Обоснование:** `PicklePersistence` писал `bot_persistence.pkl` на
+  эфемерную ФС Render → визард/профиль терялись при рестарте. Теперь
+  состояние в разделяемой БД (Neon) и переживает рестарты. Сохранена
+  семантика `PicklePersistence`: `pickle` бережёт int-ключи `user_id`/
+  `chat_id` и произвольные объекты (JSON бы их сломал).
+- **Ограничения:** тот же уровень доверия, что у `PicklePersistence` (pickle
+  своего состояния, не внешних данных); таблица `bot_state` добавлена в DDL
+  обоих диалектов и в карту upsert (`key`).
