@@ -71,7 +71,7 @@ Admin after crawl: `/sources`, `/status`, `/stats_growth`, `/tracks`.
 2. **Keyed APIs** (Reed/Jooble/FindWork/SuperJob/Adzuna) — only if keys appear in env; not required.  
 3. **Source health is persistent** (v7, B22) — fail streaks are restored from the `source_runs` table after a cold start; previously they were in-memory only.  
 4. **Overlap** RemoteOK full + multi-cat / Himalayas API + RSS — OK, hash/fuzzy dedup.  
-5. **PTB GPL-3.0** (v7 correction, B26) — python-telegram-bot 20.6 is GPL-3.0, NOT LGPLv3 as stated in earlier notes. No copyleft obligations for private SaaS operation without distribution, but any binary/package distribution requires GPL compatibility — resolve with legal before monetization (docs/v7/DECISION_LOG.md D-07).  
+5. **PTB LGPLv3** (v7, B26 — corrected 2026-09-05) — python-telegram-bot 20.6 is **LGPLv3**, confirmed by `pip show python-telegram-bot`, the PyPI JSON API (`license: LGPLv3`, classifier `License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)`) and python-telegram-bot.org. An earlier v7 note claimed GPL-3.0 and was wrong; MIT project + LGPLv3 dependency is a routine, weakly binding combination (no copyleft for the project itself) — confirm with legal before monetization (docs/v7/DECISION_LOG.md D-07).  
 6. **ROI next** — deploy prod + white traffic + metrics > more sources.
 
 ## Next session ideas (not started)

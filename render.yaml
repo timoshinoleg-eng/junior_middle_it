@@ -6,6 +6,12 @@ services:
     region: frankfurt
     rootDir: .
     buildCommand: pip install -r requirements.txt
+    # v7 pre-flight: fail the deploy HERE with a readable validation error
+    # instead of starting, exiting via sys.exit(1) and being rolled back by
+    # the health check. Runs after build, before start; envVars are available.
+    preDeployCommand: >-
+      python -c "import channel_bot; import sys;
+      sys.exit(0 if channel_bot.Config.validate(require_admin=True) else 1)"
     startCommand: python render_main.py
     healthCheckPath: /health
     autoDeploy: true
@@ -14,6 +20,11 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false          # set manually in Render dashboard
       - key: CHANNEL_ID
+        sync: false
+      # v7 (B03, fail-closed): without this the bot process calls sys.exit(1)
+      # at startup -> /health answers 503 -> Render rolls the deploy back.
+      # Numeric Telegram user id; set it in the Render dashboard.
+      - key: ADMIN_USER_ID
         sync: false
       - key: TELEGRAM_API_ID
         sync: false
