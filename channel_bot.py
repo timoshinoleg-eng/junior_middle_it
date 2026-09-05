@@ -1217,7 +1217,7 @@ class DatabaseConnection:
     def recent_fingerprints(self, limit: int = 250) -> List[str]:
         rows = self.fetchall(
             'SELECT fingerprint FROM posted_jobs '
-            'WHERE fingerprint IS NOT NULL AND fingerprint != "" '
+            'WHERE fingerprint IS NOT NULL AND fingerprint != \'\' '
             'ORDER BY posted_at DESC LIMIT ?',
             (limit,)
         )
@@ -1343,6 +1343,13 @@ def run_v7_migration(db: DatabaseConnection) -> bool:
     - posted_jobs.last_seen_at (republish freshness observability)
     - user_favorites.status (Stage 2 application pipeline)
     """
+    # DatabaseConnection._initialize already applies the complete dialect-
+    # specific schema. The historical migration below contains SQLite's
+    # AUTOINCREMENT syntax, so never run it verbatim on PostgreSQL.
+    # (Postgres upgrades are handled by _migrate_columns during initialization.)
+    if db_backend.is_postgres(db.backend):
+        return True
+
     def _columns(cursor, table: str) -> set:
         # Backend-aware: PRAGMA on SQLite, information_schema on PostgreSQL.
         return db.backend.columns(cursor, table)

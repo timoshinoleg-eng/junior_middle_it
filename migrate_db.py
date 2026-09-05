@@ -15,6 +15,8 @@ import sqlite3
 import logging
 from pathlib import Path
 
+import db_backend
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -23,8 +25,43 @@ logger = logging.getLogger(__name__)
 
 
 def migrate_database(db_path: str = 'jobs.db'):
-    """Выполнение миграции базы данных"""
-    
+    """Выполнение миграции базы данных (SQLite или DATABASE_URL).
+
+    Production now initializes the complete schema through ``DatabaseConnection``.
+    This standalone command remains useful for the historical SQLite file and
+    also supports Neon/PostgreSQL: when ``DATABASE_URL`` (or the test override)
+    is present, it applies the backend's complete dialect-specific DDL instead
+    of sending SQLite-only ``AUTOINCREMENT``/``PRAGMA`` statements to Postgres.
+    """
+    database_url = db_backend.database_url()
+    if database_url:
+        backend = db_backend.get_backend(database_url)
+        conn = backend.connect(database_url)
+        cursor = conn.cursor()
+        try:
+            for statement in backend.ddl():
+                cursor.execute(statement)
+            conn.commit()
+            cursor.execute("SELECT COUNT(*) FROM posted_jobs")
+            total_jobs = cursor.fetchone()[0]
+            logger.info("✅ PostgreSQL schema migration successfully completed!")
+            logger.info(f"📊 Всего вакансий в базе: {total_jobs}")
+            if total_jobs > 0:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM posted_jobs WHERE category = %s"
+                    if db_backend.is_postgres(backend)
+                    else "SELECT COUNT(*) FROM posted_jobs WHERE category = ?",
+                    ('other',),
+                )
+                logger.info(f"📊 Вакансий без категории: {cursor.fetchone()[0]}")
+            return True
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"❌ Ошибка PostgreSQL-миграции: {e}")
+            return False
+        finally:
+            conn.close()
+
     if not os.path.exists(db_path):
         logger.warning(f"⚠️ База данных {db_path} не найдена. Будет создана новая.")
     

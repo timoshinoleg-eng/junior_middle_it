@@ -88,26 +88,28 @@ class ConcurrentPublishersTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
-        conn = sqlite3.connect(self.path)
+        # Re-open through DatabaseConnection so the same assertion covers
+        # SQLite and the PostgreSQL CI backend (TEST_DATABASE_URL).
+        db = DatabaseConnection(self.path)
         try:
-            posted = conn.execute("SELECT COUNT(*) FROM posted_jobs").fetchone()[0]
+            posted = db.fetchone("SELECT COUNT(*) FROM posted_jobs")[0]
             self.assertEqual(posted, len(JOBS))  # each job exactly once
 
-            per_hash = conn.execute(
+            per_hash = db.fetchall(
                 "SELECT hash, COUNT(*) FROM posted_jobs GROUP BY hash HAVING COUNT(*) > 1"
-            ).fetchall()
+            )
             self.assertEqual(per_hash, [])       # no duplicate rows
 
-            delivery_dups = conn.execute(
+            delivery_dups = db.fetchall(
                 "SELECT job_hash, target_channel, COUNT(*) FROM deliveries "
                 "GROUP BY job_hash, target_channel HAVING COUNT(*) > 1"
-            ).fetchall()
+            )
             self.assertEqual(delivery_dups, [])  # one ledger row per (job, channel)
 
-            delivery_total = conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+            delivery_total = db.fetchone("SELECT COUNT(*) FROM deliveries")[0]
             self.assertEqual(delivery_total, len(JOBS) * len(TARGETS))
         finally:
-            conn.close()
+            db.conn.close()
 
     def test_failed_target_retried_only_once_next_cycle(self):
         """Cycle 1: @qa fails. Cycle 2: only @qa is retried (B10 semantics)."""
@@ -185,10 +187,12 @@ class ConcurrentPublishPathTests(unittest.TestCase):
         self.assertTrue(db.claim_delivery(h, "@main"))
         self.assertFalse(db.claim_delivery(h, "@main"))  # fresh claim is held
         # Simulate an abandoned claim from 30 minutes ago.
-        db.execute(
-            "UPDATE deliveries SET updated_at = datetime('now', '-30 minutes') "
-            "WHERE job_hash = ? AND target_channel = ?", (h, "@main"),
+        stale_sql = (
+            "UPDATE deliveries SET updated_at = "
+            f"{db.backend.ts_ago(30)} "
+            "WHERE job_hash = ? AND target_channel = ?"
         )
+        db.execute(stale_sql, (h, "@main"))
         self.assertTrue(db.claim_delivery(h, "@main"))
         db.conn.close()
 
