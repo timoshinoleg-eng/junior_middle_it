@@ -17,6 +17,33 @@ class SecureHttpLoggingTests(unittest.TestCase):
             for name, level in previous.items():
                 logging.getLogger(name).setLevel(level)
 
+    def test_redacts_query_tokens_and_telegram_bot_paths(self):
+        message = (
+            "400 for https://api.example.test/run?token=super-secret-value&clean=true "
+            "and https://api.telegram.org/bot123456789:abcdefghijklmnopqrstuvwxyz_ABCDEF/getMe"
+        )
+        redacted = secure.redact_credentials(message)
+        self.assertNotIn("super-secret-value", redacted)
+        self.assertNotIn("123456789:abcdefghijklmnopqrstuvwxyz_ABCDEF", redacted)
+        self.assertIn("token=<redacted>", redacted)
+        self.assertIn("/bot<redacted>/getMe", redacted)
+
+    def test_filter_sanitizes_formatted_exception_message(self):
+        record = logging.LogRecord(
+            "channel_bot",
+            logging.ERROR,
+            __file__,
+            1,
+            "request failed: %s",
+            ("https://x.test?q=1&api_key=secret123",),
+            None,
+        )
+        filt = secure.CredentialRedactionFilter()
+        self.assertTrue(filt.filter(record))
+        rendered = record.getMessage()
+        self.assertNotIn("secret123", rendered)
+        self.assertIn("api_key=<redacted>", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
