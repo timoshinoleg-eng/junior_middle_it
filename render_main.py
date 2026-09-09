@@ -1,19 +1,9 @@
 """Render.com entrypoint for the interactive job bot.
 
-Render free web services must bind $PORT (HTTP) or they spin down / fail
-health checks. channel_bot.py is a pure long-polling worker with no HTTP
-surface, so this wrapper:
-
-1. Starts a minimal health HTTP server on $PORT in the main thread.
-2. Runs channel_bot.main() (interactive bot + collection loop) in a
-   worker thread.
-
-Crash visibility: if the bot dies (bad token, missing env var, network),
-the wrapper does NOT exit — the health endpoint stays up and reports the
-exception at /health, so the container doesn't crash-loop silently on
-Render Free. UptimeRobot keeps the free instance awake (5-min interval).
-
-Local run:  PORT=8080 python render_main.py
+The health HTTP server keeps Render healthy while the long-polling Telegram bot
+runs in a worker thread. Production bot imports go through ``channel_bot_v2`` so
+durable growth state, fail-closed admin auth and activation UX are installed
+without rewriting the mature ingestion core.
 """
 import json
 import os
@@ -22,12 +12,12 @@ import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# Render ephemeral FS: don't keep a bot.log file around (writes are lost
-# on spin-down anyway and waste I/O).
+# Render ephemeral FS: don't keep a bot.log file around.
 os.environ.setdefault("DISABLE_FILE_LOG", "true")
 
+
 def config_summary() -> dict:
-    """Presence flags for key env vars — safe to expose (no values)."""
+    """Presence flags for key env vars — safe to expose (no secret values)."""
     def present(*names):
         return any(os.getenv(n) for n in names)
 
@@ -36,6 +26,9 @@ def config_summary() -> dict:
         "TELEGRAM_BOT_ID": (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").split(":")[0] if present("TELEGRAM_BOT_TOKEN") else "",
         "CHANNEL_ID": present("CHANNEL_ID"),
         "CHANNEL_ID_VAL": os.getenv("CHANNEL_ID", "")[:30] if present("CHANNEL_ID") else "",
+        "ADMIN_USER_ID": present("ADMIN_USER_ID"),
+        "GROWTH_DATABASE": present("GROWTH_DATABASE_URL", "DATABASE_URL"),
+        "REQUIRE_DURABLE_GROWTH": os.getenv("REQUIRE_DURABLE_GROWTH", "false").lower() == "true",
         "APIFY_API_TOKEN": present("APIFY_API_TOKEN"),
         "TELEGRAM_API_ID": present("TELEGRAM_API_ID"),
         "TELEGRAM_API_HASH": present("TELEGRAM_API_HASH"),
@@ -65,18 +58,13 @@ class HealthHandler(BaseHTTPRequestHandler):
                     "ok": running,
                     "service": "junior_middle_it_bot",
                     "uptime_s": int(time.time() - STATE["started_at"]),
-                    "bot": (
-                        "running" if running
-                        else "crashed" if STATE["error"]
-                        else "starting"
-                    ),
+                    "bot": "running" if running else "crashed" if STATE["error"] else "starting",
                     "error": STATE["error"],
                     "config": config_summary(),
                     "cycle": None,
                 }
-            # pull live cycle telemetry from channel_bot if imported
             try:
-                import channel_bot as _cb
+                import channel_bot_v2 as _cb
                 if getattr(_cb, "CYCLE_TELEMETRY", None):
                     payload["cycle"] = dict(_cb.CYCLE_TELEMETRY)
             except Exception:
@@ -91,7 +79,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    def log_message(self, fmt, *args):  # silence per-request logs
+    def log_message(self, fmt, *args):
         pass
 
 
@@ -100,17 +88,15 @@ def run_bot() -> None:
         STATE["bot_thread_started"] = True
     try:
         import asyncio
-
-        import channel_bot
+        import channel_bot_v2
 
         with STATE_LOCK:
             STATE["bot_running"] = True
-        print("[render_main] channel_bot imported, entering main()", flush=True)
-        asyncio.run(channel_bot.main())
-        # main() should never return; if it does, treat as crash.
+        print("[render_main] channel_bot_v2 imported, entering main()", flush=True)
+        asyncio.run(channel_bot_v2.main())
         with STATE_LOCK:
             STATE["bot_running"] = False
-            STATE["error"] = "channel_bot.main() returned unexpectedly"
+            STATE["error"] = "channel_bot_v2.main() returned unexpectedly"
     except BaseException as e:
         tb = traceback.format_exc()
         print(f"[render_main] BOT CRASHED: {tb}", flush=True)

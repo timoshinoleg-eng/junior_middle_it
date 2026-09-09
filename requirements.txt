@@ -9,9 +9,10 @@ sentry-sdk>=2.0
 # Growth P0: fuzzy cross-source dedup
 rapidfuzz>=3.6.0
 
+# Growth P1: durable profiles, referrals and product analytics
+psycopg[binary]>=3.2,<4
+
 # Telegram channel parsing (optional)
-# Установите для работы с Telegram-каналами:
-# pip install telethon
 telethon>=1.28.5
 PySocks>=1.7.1
 
