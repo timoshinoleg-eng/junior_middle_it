@@ -26,9 +26,10 @@ jobs:
 
     steps:
       - name: Wait for current production contract
+        id: contract
         shell: bash
         run: |
-          set -euo pipefail
+          set -u
           rm -f /tmp/health.json
           for attempt in $(seq 1 18); do
             code=$(curl -sS --max-time 15 -o /tmp/health.json -w '%{http_code}' \
@@ -43,16 +44,58 @@ jobs:
           PY
             then
               echo "Current production contract detected (HTTP $code)"
+              echo "seen=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "Production has not picked up the current contract yet (attempt $attempt/18, HTTP $code)"
+            echo "Production contract mismatch (attempt $attempt/18, HTTP $code)"
             sleep 5
           done
-          echo "ERROR: current production contract was not observed"
-          cat /tmp/health.json || true
+          echo "seen=false" >> "$GITHUB_OUTPUT"
+          echo "Current production contract was not observed."
+
+      - name: Diagnose routing mismatch
+        if: steps.contract.outputs.seen != 'true'
+        shell: bash
+        run: |
+          set -u
+          echo '### DNS'
+          echo 'CNAME:'
+          dig +short CNAME junior-middle-it.vercel.app || true
+          echo 'A:'
+          dig +short A junior-middle-it.vercel.app || true
+          echo 'AAAA:'
+          dig +short AAAA junior-middle-it.vercel.app || true
+
+          paths=(
+            '/'
+            '/robots.txt'
+            '/api/health'
+            '/api/cron'
+            '/api/index?route=health'
+            '/api/index?route=robots'
+          )
+          for path in "${paths[@]}"; do
+            echo
+            echo "### $path"
+            rm -f /tmp/route.headers /tmp/route.body
+            curl -sS --max-time 20 -D /tmp/route.headers -o /tmp/route.body \
+              "$BASE_URL$path" || true
+            echo '--- headers ---'
+            sed -n '1,50p' /tmp/route.headers || true
+            echo '--- body (first 1500 bytes) ---'
+            head -c 1500 /tmp/route.body 2>/dev/null || true
+            echo
+          done
+
+      - name: Fail on routing mismatch
+        if: steps.contract.outputs.seen != 'true'
+        shell: bash
+        run: |
+          echo 'ERROR: canonical production domain is not serving the current routing contract.'
           exit 1
 
       - name: Verify sanitized readiness
+        if: steps.contract.outputs.seen == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -67,13 +110,13 @@ jobs:
           assert isinstance(data.get('durable_growth'), bool), data
           assert isinstance(data.get('public_acquisition_ready'), bool), data
           assert os.environ['HEALTH_CODE'] in {'200', '503'}
-          # The public response must never contain credential values/DSNs.
           rendered = json.dumps(data)
           for forbidden in ('postgresql://', 'Bearer ', 'TELEGRAM_BOT_TOKEN=', 'CRON_SECRET='):
               assert forbidden not in rendered, rendered
           PY
 
       - name: Verify public routes
+        if: steps.contract.outputs.seen == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -87,6 +130,7 @@ jobs:
           echo "Public routes: site=$site_code robots=$robots_code"
 
       - name: Verify cron fails closed without bearer auth
+        if: steps.contract.outputs.seen == 'true'
         shell: bash
         run: |
           set -euo pipefail
