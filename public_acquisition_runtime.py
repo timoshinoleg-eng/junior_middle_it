@@ -1,7 +1,7 @@
 """P7 production runtime: attribute public-site traffic and preserve deep-link intent.
 
 The public landing is read-only; attribution happens only after a user explicitly
-opens the Telegram bot.  This final runtime layer turns ``web_*`` and
+opens the Telegram bot. This final runtime layer turns ``web_*`` and
 ``resume_*`` start payloads into useful in-bot continuation without changing the
 existing P1-P6 behavior.
 """
@@ -11,10 +11,16 @@ from urllib.parse import urlsplit
 
 import channel_bot as core
 import referral_runtime as referral
+from p7_growth_metrics import compute_growth_stats
 
 
 class DatabaseConnection(referral.DatabaseConnection):
-    """P7 uses the canonical durable storage inherited from P1-P6."""
+    """P7 storage plus cohort-correct production growth metrics."""
+
+    def growth_stats(self, days: int = 7):
+        if self._growth_store is not None:
+            return compute_growth_stats(self._growth_store, days)
+        return super().growth_stats(days)
 
 
 class JobBot(referral.JobBot):
