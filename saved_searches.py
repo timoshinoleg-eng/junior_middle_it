@@ -1,8 +1,8 @@
 """Saved-search helpers for retention subscriptions.
 
-A saved search is deliberately the same shape as the existing profile matcher,
-so the realtime alert pipeline can reuse proven matching semantics instead of
-creating a second ranking implementation.
+A saved search deliberately uses the same profile shape as the existing matcher,
+so realtime alerts reuse proven matching semantics instead of creating a second
+ranking implementation.
 """
 from __future__ import annotations
 
@@ -73,6 +73,15 @@ def build_search_name(categories: List[str], skills: str, fallback: str = "Мо�
     return " · ".join(parts)[:80] or fallback[:80]
 
 
+def _canonical_skill_tokens(skills: str) -> List[str]:
+    """Canonical token set for identity; display order remains user-friendly."""
+    return sorted(
+        token.strip()
+        for token in normalize_skills(skills).split(",")
+        if token.strip()
+    )
+
+
 def search_fingerprint(
     categories: List[str],
     skills: str,
@@ -82,7 +91,7 @@ def search_fingerprint(
     payload = "|".join(
         [
             ",".join(sorted(normalize_categories(categories))),
-            normalize_skills(skills),
+            ",".join(_canonical_skill_tokens(skills)),
             str(int(min_salary_filter or 0)),
             "1" if hide_senior else "0",
         ]
