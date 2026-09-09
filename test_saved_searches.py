@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, patch
 import channel_bot as core
 import production_bot as prod
 from saved_searches import (
-    build_search_name,
     normalize_skills,
     search_fingerprint,
     suggested_search_from_resume,
@@ -15,14 +14,14 @@ from saved_searches import (
 
 class SavedSearchHelperTests(unittest.TestCase):
     def test_normalization_is_stable_and_deduplicated(self):
-        self.assertEqual(normalize_skills("Python, fastapi, PYTHON, postgres"), "python, fastapi, postgres")
+        self.assertEqual(
+            normalize_skills("Python, fastapi, PYTHON, postgres"),
+            "python, fastapi, postgres",
+        )
         a = search_fingerprint(["development"], "python, fastapi", 0, True)
         b = search_fingerprint(["development"], "fastapi, python", 0, True)
-        # Order inside a user-entered skill list is intentional input, so names may differ,
-        # but exact repeated saves remain stable.
-        self.assertEqual(a, search_fingerprint(["development"], "python, fastapi", 0, True))
+        self.assertEqual(a, b)
         self.assertNotEqual(a, "")
-        self.assertNotEqual(b, "")
 
     def test_resume_suggestion_uses_real_matched_skills(self):
         spec = suggested_search_from_resume(
@@ -57,7 +56,10 @@ class SavedSearchDatabaseTests(unittest.TestCase):
             "hide_senior": True,
         }
         first = self.db.create_saved_search(1, spec)
-        second = self.db.create_saved_search(1, spec)
+        second = self.db.create_saved_search(
+            1,
+            {**spec, "skills": "fastapi, python"},
+        )
         self.assertEqual(first.id, second.id)
         self.assertEqual(len(self.db.list_saved_searches(1)), 1)
         self.assertFalse(self.db.delete_saved_search(2, first.id))
@@ -142,7 +144,10 @@ class SavedSearchAlertTests(unittest.IsolatedAsyncioTestCase):
         ]
         sent = await self.bot.push_realtime_alerts(jobs)
         self.assertEqual(sent, 1)
-        payloads = [call.kwargs.get("text", "") for call in self.app.bot.send_message.await_args_list]
+        payloads = [
+            call.kwargs.get("text", "")
+            for call in self.app.bot.send_message.await_args_list
+        ]
         self.assertTrue(any("сохранённым поискам" in text for text in payloads))
         self.assertTrue(any("Python" in text for text in payloads))
         self.assertFalse(any("Junior QA" in text for text in payloads))
