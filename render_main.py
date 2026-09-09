@@ -1,9 +1,9 @@
 """Render.com entrypoint for the interactive job bot.
 
 The health HTTP server keeps Render healthy while the long-polling Telegram bot
-runs in a worker thread. Production imports go through ``interactive_runtime``
-so all growth layers, content magnets, product metrics and private PDF/DOCX
-Resume Match are installed without changing the Vercel ingestion runtime.
+runs in a worker thread. Production imports go through ``referral_runtime`` so
+all prior growth layers plus quality-weighted Referral 2.0 are installed without
+changing the Vercel ingestion runtime.
 """
 import json
 import os
@@ -33,6 +33,7 @@ def config_summary() -> dict:
         "SAVED_SEARCHES": True,
         "CONTENT_MAGNETS": True,
         "PRODUCT_UTILITY_METRICS": True,
+        "REFERRAL_2": True,
         "APIFY_API_TOKEN": present("APIFY_API_TOKEN"),
         "TELEGRAM_API_ID": present("TELEGRAM_API_ID"),
         "TELEGRAM_API_HASH": present("TELEGRAM_API_HASH"),
@@ -63,7 +64,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     "cycle": None,
                 }
             try:
-                import interactive_runtime as _cb
+                import referral_runtime as _cb
                 if getattr(_cb, "CYCLE_TELEMETRY", None):
                     payload["cycle"] = dict(_cb.CYCLE_TELEMETRY)
             except Exception:
@@ -87,15 +88,15 @@ def run_bot() -> None:
         STATE["bot_thread_started"] = True
     try:
         import asyncio
-        import interactive_runtime
+        import referral_runtime
 
         with STATE_LOCK:
             STATE["bot_running"] = True
-        print("[render_main] interactive_runtime imported, entering main()", flush=True)
-        asyncio.run(interactive_runtime.main())
+        print("[render_main] referral_runtime imported, entering main()", flush=True)
+        asyncio.run(referral_runtime.main())
         with STATE_LOCK:
             STATE["bot_running"] = False
-            STATE["error"] = "interactive_runtime.main() returned unexpectedly"
+            STATE["error"] = "referral_runtime.main() returned unexpectedly"
     except BaseException as e:
         tb = traceback.format_exc()
         print(f"[render_main] BOT CRASHED: {tb}", flush=True)
