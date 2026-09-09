@@ -12,6 +12,10 @@ rapidfuzz>=3.6.0
 # Growth P1: durable profiles, referrals and product analytics
 psycopg[binary]>=3.2,<4
 
+# Growth P5: in-memory Resume Match document parsing
+pypdf>=5.0,<7
+python-docx>=1.1,<2
+
 # Telegram channel parsing (optional)
 telethon>=1.28.5
 PySocks>=1.7.1
