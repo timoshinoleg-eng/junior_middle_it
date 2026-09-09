@@ -1,0 +1,101 @@
+name: Production Smoke
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-smoke
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    env:
+      BASE_URL: https://junior-middle-it.vercel.app
+
+    steps:
+      - name: Wait for current production contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f /tmp/health.json
+          for attempt in $(seq 1 18); do
+            code=$(curl -sS --max-time 15 -o /tmp/health.json -w '%{http_code}' \
+              "$BASE_URL/api/health" || true)
+            if python - <<'PY'
+          import json
+          try:
+              data = json.load(open('/tmp/health.json', encoding='utf-8'))
+          except Exception:
+              raise SystemExit(1)
+          raise SystemExit(0 if 'collector_ready' in data and 'durable_growth' in data else 1)
+          PY
+            then
+              echo "Current production contract detected (HTTP $code)"
+              exit 0
+            fi
+            echo "Production has not picked up the current contract yet (attempt $attempt/18, HTTP $code)"
+            sleep 5
+          done
+          echo "ERROR: current production contract was not observed"
+          cat /tmp/health.json || true
+          exit 1
+
+      - name: Verify sanitized readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          code=$(curl -sS --max-time 15 -o /tmp/health.json -w '%{http_code}' \
+            "$BASE_URL/api/health")
+          HEALTH_CODE="$code" python - <<'PY'
+          import json, os
+          data = json.load(open('/tmp/health.json', encoding='utf-8'))
+          print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+          assert data.get('service') == 'junior_middle_it'
+          assert data.get('collector_ready') is True, data
+          assert isinstance(data.get('durable_growth'), bool), data
+          assert isinstance(data.get('public_acquisition_ready'), bool), data
+          assert os.environ['HEALTH_CODE'] in {'200', '503'}
+          # The public response must never contain credential values/DSNs.
+          rendered = json.dumps(data)
+          for forbidden in ('postgresql://', 'Bearer ', 'TELEGRAM_BOT_TOKEN=', 'CRON_SECRET='):
+              assert forbidden not in rendered, rendered
+          PY
+
+      - name: Verify public routes
+        shell: bash
+        run: |
+          set -euo pipefail
+          site_code=$(curl -sS --max-time 20 -o /tmp/site.html -w '%{http_code}' "$BASE_URL/")
+          robots_code=$(curl -sS --max-time 15 -o /tmp/robots.txt -w '%{http_code}' "$BASE_URL/robots.txt")
+          test "$site_code" = "200"
+          test "$robots_code" = "200"
+          grep -q 'Junior' /tmp/site.html
+          grep -q 'User-agent:' /tmp/robots.txt
+          grep -q 'Disallow: /api/' /tmp/robots.txt
+          echo "Public routes: site=$site_code robots=$robots_code"
+
+      - name: Verify cron fails closed without bearer auth
+        shell: bash
+        run: |
+          set -euo pipefail
+          code=$(curl -sS --max-time 15 -o /tmp/cron-unauth.json -w '%{http_code}' \
+            "$BASE_URL/api/cron")
+          cat /tmp/cron-unauth.json
+          test "$code" = "401"
+          python - <<'PY'
+          import json
+          data = json.load(open('/tmp/cron-unauth.json', encoding='utf-8'))
+          assert data == {'ok': False, 'error': 'unauthorized'}, data
+          PY
