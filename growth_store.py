@@ -1,11 +1,8 @@
-"""Durable growth-state storage for junior_middle_it.
+"""Durable PostgreSQL growth-state storage for junior_middle_it.
 
-The vacancy ingestion pipeline can keep its existing SQLite cache/dedup tables,
-while user state that must survive deploys (profiles, referrals, events) is
-stored in PostgreSQL when GROWTH_DATABASE_URL/DATABASE_URL is configured.
-
-This split is deliberate: it removes the highest-risk ephemeral state first
-without rewriting the mature vacancy pipeline in one release.
+Vacancy ingestion/dedup remains on the existing SQLite cache for now. State
+that must survive deploys (profiles, referrals and growth events) lives here
+when GROWTH_DATABASE_URL/DATABASE_URL is configured.
 """
 from __future__ import annotations
 
@@ -20,26 +17,24 @@ try:
     from psycopg.types.json import Jsonb
 
     PSYCOPG_AVAILABLE = True
-except ImportError:  # pragma: no cover - exercised by fallback deployments
+except ImportError:  # pragma: no cover
     psycopg = None
     Jsonb = None
     PSYCOPG_AVAILABLE = False
 
 
 class GrowthStoreUnavailable(RuntimeError):
-    """Raised when durable growth storage was requested but cannot start."""
+    pass
 
 
 class PostgresGrowthStore:
-    """PostgreSQL store for user preferences, referrals and product events."""
+    """PostgreSQL store for profiles, referrals and product events."""
 
     def __init__(self, dsn: str, all_categories: Iterable[str]):
         if not dsn:
             raise GrowthStoreUnavailable("PostgreSQL DSN is empty")
         if not PSYCOPG_AVAILABLE:
-            raise GrowthStoreUnavailable(
-                "psycopg is not installed; install requirements.txt before enabling durable growth"
-            )
+            raise GrowthStoreUnavailable("psycopg is not installed")
         self.dsn = dsn
         self.all_categories = list(all_categories)
         self.conn = None
@@ -49,7 +44,7 @@ class PostgresGrowthStore:
     def _connect(self) -> None:
         try:
             self.conn = psycopg.connect(self.dsn, autocommit=True, connect_timeout=8)
-        except Exception as exc:  # pragma: no cover - depends on external DB
+        except Exception as exc:  # pragma: no cover - external service
             raise GrowthStoreUnavailable(f"PostgreSQL connection failed: {exc}") from exc
 
     def _ensure_conn(self):
@@ -101,8 +96,7 @@ class PostgresGrowthStore:
             "CREATE INDEX IF NOT EXISTS idx_growth_events_user_ts ON growth_events(user_id, ts)",
             "CREATE INDEX IF NOT EXISTS idx_growth_referrals_referrer ON growth_referrals(referrer_id)",
         ]
-        conn = self._ensure_conn()
-        with conn.cursor() as cur:
+        with self._ensure_conn().cursor() as cur:
             for statement in statements:
                 cur.execute(statement)
 
@@ -119,8 +113,7 @@ class PostgresGrowthStore:
         }
 
     def get_user_settings(self, user_id: int) -> Dict[str, Any]:
-        conn = self._ensure_conn()
-        with conn.cursor() as cur:
+        with self._ensure_conn().cursor() as cur:
             cur.execute(
                 """
                 SELECT enabled_categories, hide_senior, min_salary_filter,
@@ -128,7 +121,7 @@ class PostgresGrowthStore:
                        premium_unlocked
                 FROM growth_user_settings WHERE user_id = %s
                 """,
-                (user_id,),
+                (int(user_id),),
             )
             row = cur.fetchone()
         if not row:
@@ -150,15 +143,14 @@ class PostgresGrowthStore:
         current.update({k: v for k, v in (settings or {}).items() if v is not None})
         cats = current.get("enabled_categories") or list(self.all_categories)
         cats_str = cats if isinstance(cats, str) else ",".join(str(c) for c in cats if c)
-        conn = self._ensure_conn()
-        with conn.cursor() as cur:
+        with self._ensure_conn().cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO growth_user_settings (
                     user_id, enabled_categories, hide_senior, min_salary_filter,
                     skills, digest_enabled, onboarding_done, alerts_enabled,
                     premium_unlocked, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                 ON CONFLICT (user_id) DO UPDATE SET
                     enabled_categories=EXCLUDED.enabled_categories,
                     hide_senior=EXCLUDED.hide_senior,
@@ -171,18 +163,20 @@ class PostgresGrowthStore:
                     updated_at=NOW()
                 """,
                 (
-                    int(user_id),
-                    cats_str,
-                    bool(current.get("hide_senior", True)),
-                    int(current.get("min_salary_filter") or 0),
-                    str(current.get("skills") or ""),
-                    bool(current.get("digest_enabled")),
-                    bool(current.get("onboarding_done")),
-                    bool(current.get("alerts_enabled")),
-                    bool(current.get("premium_unlocked")),
+                    int(user_id), cats_str, bool(current.get("hide_senior", True)),
+                    int(current.get("min_salary_filter") or 0), str(current.get("skills") or ""),
+                    bool(current.get("digest_enabled")), bool(current.get("onboarding_done")),
+                    bool(current.get("alerts_enabled")), bool(current.get("premium_unlocked")),
                 ),
             )
         return True
+
+    def _list_subscribers(self, column: str) -> List[int]:
+        if column not in {"digest_enabled", "alerts_enabled"}:
+            raise ValueError("unsupported subscriber column")
+        with self._ensure_conn().cursor() as cur:
+            cur.execute(f"SELECT user_id FROM growth_user_settings WHERE {column} = TRUE")
+            return [int(row[0]) for row in cur.fetchall()]
 
     def list_digest_subscribers(self) -> List[int]:
         return self._list_subscribers("digest_enabled")
@@ -190,18 +184,8 @@ class PostgresGrowthStore:
     def list_alert_subscribers(self) -> List[int]:
         return self._list_subscribers("alerts_enabled")
 
-    def _list_subscribers(self, column: str) -> List[int]:
-        if column not in {"digest_enabled", "alerts_enabled"}:
-            raise ValueError("unsupported subscriber column")
-        conn = self._ensure_conn()
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT user_id FROM growth_user_settings WHERE {column} = TRUE")
-            rows = cur.fetchall()
-        return [int(row[0]) for row in rows]
-
     def log_event(self, user_id: Optional[int], name: str, props: Optional[Dict] = None) -> None:
-        conn = self._ensure_conn()
-        with conn.cursor() as cur:
+        with self._ensure_conn().cursor() as cur:
             cur.execute(
                 "INSERT INTO growth_events (user_id, name, props) VALUES (%s, %s, %s)",
                 (user_id, str(name), Jsonb(props or {})),
@@ -210,8 +194,7 @@ class PostgresGrowthStore:
     def register_referral(self, user_id: int, referrer_id: int) -> bool:
         if not user_id or not referrer_id or int(user_id) == int(referrer_id):
             return False
-        conn = self._ensure_conn()
-        with conn.cursor() as cur:
+        with self._ensure_conn().cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO growth_referrals (user_id, referrer_id)
@@ -229,8 +212,7 @@ class PostgresGrowthStore:
         return True
 
     def count_referrals(self, referrer_id: int) -> int:
-        conn = self._ensure_conn()
-        with conn.cursor() as cur:
+        with self._ensure_conn().cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) FROM growth_referrals WHERE referrer_id = %s",
                 (int(referrer_id),),
@@ -239,9 +221,10 @@ class PostgresGrowthStore:
         return int(row[0]) if row else 0
 
     def growth_stats(self, days: int = 7) -> Dict[str, Any]:
-        """Return unique-user funnel and basic retention, not raw command counts."""
+        """Unique-user acquisition/activation funnel with eligible D1/D7 cohorts."""
         days = max(1, int(days))
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=days)
         conn = self._ensure_conn()
 
         def unique_event(name: str) -> int:
@@ -256,27 +239,33 @@ class PostgresGrowthStore:
                 row = cur.fetchone()
             return int(row[0]) if row else 0
 
+        def event_count(name: str) -> int:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM growth_events WHERE name = %s AND ts >= %s",
+                    (name, cutoff),
+                )
+                row = cur.fetchone()
+            return int(row[0]) if row else 0
+
         starts = unique_event("start")
         setup_done = unique_event("setup_done")
         saves = unique_event("save_job")
         ref_views = unique_event("ref_view")
         personal_digests = unique_event("personal_digest_sent")
         realtime_alerts = unique_event("realtime_alert_sent")
+        high_intent = [
+            "save_job", "job_full", "personal_digest_sent",
+            "realtime_alert_sent", "first_value_delivered",
+        ]
 
-        high_intent = (
-            "save_job",
-            "job_full",
-            "personal_digest_sent",
-            "realtime_alert_sent",
-            "first_value_delivered",
-        )
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT COUNT(DISTINCT user_id) FROM growth_events
                 WHERE ts >= %s AND user_id IS NOT NULL AND name = ANY(%s)
                 """,
-                (cutoff, list(high_intent)),
+                (cutoff, high_intent),
             )
             activated = int((cur.fetchone() or [0])[0])
 
@@ -289,17 +278,12 @@ class PostgresGrowthStore:
             cur.execute("SELECT COUNT(*) FROM growth_user_settings WHERE premium_unlocked = TRUE")
             premium_users = int((cur.fetchone() or [0])[0])
 
-            cur.execute(
-                "SELECT COUNT(*) FROM growth_referrals WHERE created_at >= %s",
-                (cutoff,),
-            )
+            cur.execute("SELECT COUNT(*) FROM growth_referrals WHERE created_at >= %s", (cutoff,))
             referrals = int((cur.fetchone() or [0])[0])
-
             cur.execute(
                 """
-                SELECT referrer_id, COUNT(*) AS c
-                FROM growth_referrals WHERE created_at >= %s
-                GROUP BY referrer_id ORDER BY c DESC LIMIT 10
+                SELECT referrer_id, COUNT(*) AS c FROM growth_referrals
+                WHERE created_at >= %s GROUP BY referrer_id ORDER BY c DESC LIMIT 10
                 """,
                 (cutoff,),
             )
@@ -307,10 +291,9 @@ class PostgresGrowthStore:
 
             cur.execute(
                 """
-                SELECT DATE(ts) AS d, COUNT(DISTINCT user_id)
-                FROM growth_events
+                SELECT DATE(ts), COUNT(DISTINCT user_id) FROM growth_events
                 WHERE ts >= %s AND user_id IS NOT NULL
-                GROUP BY DATE(ts) ORDER BY d DESC LIMIT 14
+                GROUP BY DATE(ts) ORDER BY DATE(ts) DESC LIMIT 14
                 """,
                 (cutoff,),
             )
@@ -320,7 +303,7 @@ class PostgresGrowthStore:
                 """
                 SELECT COALESCE(props->>'payload', ''), COUNT(DISTINCT user_id)
                 FROM growth_events
-                WHERE name = 'start' AND ts >= %s AND user_id IS NOT NULL
+                WHERE name='start' AND ts >= %s AND user_id IS NOT NULL
                 GROUP BY COALESCE(props->>'payload', '')
                 ORDER BY COUNT(DISTINCT user_id) DESC LIMIT 12
                 """,
@@ -328,39 +311,51 @@ class PostgresGrowthStore:
             )
             acquisition = [(str(r[0] or "direct"), int(r[1])) for r in cur.fetchall()]
 
+            # Only users old enough to reach the milestone belong in its denominator.
             cur.execute(
                 """
                 WITH first_start AS (
-                    SELECT user_id, MIN(ts) AS first_ts
-                    FROM growth_events
-                    WHERE name = 'start' AND user_id IS NOT NULL
-                    GROUP BY user_id
+                    SELECT user_id, MIN(ts) AS first_ts FROM growth_events
+                    WHERE name='start' AND user_id IS NOT NULL GROUP BY user_id
                 )
                 SELECT
-                    COUNT(*) FILTER (WHERE EXISTS (
-                        SELECT 1 FROM growth_events e
-                        WHERE e.user_id = f.user_id
-                          AND e.ts >= f.first_ts + INTERVAL '1 day'
-                          AND e.ts <  f.first_ts + INTERVAL '2 days'
-                    )) AS d1,
-                    COUNT(*) FILTER (WHERE EXISTS (
-                        SELECT 1 FROM growth_events e
-                        WHERE e.user_id = f.user_id
-                          AND e.ts >= f.first_ts + INTERVAL '7 days'
-                          AND e.ts <  f.first_ts + INTERVAL '8 days'
-                    )) AS d7,
-                    COUNT(*) AS cohort
+                    COUNT(*) FILTER (
+                        WHERE first_ts >= %s AND first_ts <= %s
+                    ) AS d1_cohort,
+                    COUNT(*) FILTER (
+                        WHERE first_ts >= %s AND first_ts <= %s AND EXISTS (
+                            SELECT 1 FROM growth_events e
+                            WHERE e.user_id=f.user_id
+                              AND e.ts >= f.first_ts + INTERVAL '1 day'
+                              AND e.ts <  f.first_ts + INTERVAL '2 days'
+                        )
+                    ) AS d1_retained,
+                    COUNT(*) FILTER (
+                        WHERE first_ts >= %s AND first_ts <= %s
+                    ) AS d7_cohort,
+                    COUNT(*) FILTER (
+                        WHERE first_ts >= %s AND first_ts <= %s AND EXISTS (
+                            SELECT 1 FROM growth_events e
+                            WHERE e.user_id=f.user_id
+                              AND e.ts >= f.first_ts + INTERVAL '7 days'
+                              AND e.ts <  f.first_ts + INTERVAL '8 days'
+                        )
+                    ) AS d7_retained
                 FROM first_start f
-                WHERE f.first_ts >= %s
                 """,
-                (cutoff,),
+                (
+                    cutoff, now - timedelta(days=1),
+                    cutoff, now - timedelta(days=1),
+                    cutoff, now - timedelta(days=7),
+                    cutoff, now - timedelta(days=7),
+                ),
             )
-            retention_row = cur.fetchone() or (0, 0, 0)
+            retention = cur.fetchone() or (0, 0, 0, 0)
 
-        cohort = int(retention_row[2] or 0)
-        d1 = int(retention_row[0] or 0)
-        d7 = int(retention_row[1] or 0)
-        pct = lambda n, d: round((100.0 * n / d), 1) if d else 0.0
+        d1_cohort, d1_retained, d7_cohort, d7_retained = [int(v or 0) for v in retention]
+
+        def pct(n: int, d: int) -> float:
+            return round(100.0 * n / d, 1) if d else 0.0
 
         return {
             "days": days,
@@ -370,16 +365,17 @@ class PostgresGrowthStore:
             "referrals": referrals,
             "ref_views": ref_views,
             "personal_digests": personal_digests,
-            "channel_digests": unique_event("daily_digest_posted"),
+            "channel_digests": event_count("daily_digest_posted"),
             "realtime_alerts": realtime_alerts,
             "activated_users": activated,
             "setup_conversion_pct": pct(setup_done, starts),
             "activation_conversion_pct": pct(activated, starts),
-            "retention_cohort": cohort,
-            "d1_retained": d1,
-            "d7_retained": d7,
-            "d1_retention_pct": pct(d1, cohort),
-            "d7_retention_pct": pct(d7, cohort),
+            "d1_cohort": d1_cohort,
+            "d1_retained": d1_retained,
+            "d7_cohort": d7_cohort,
+            "d7_retained": d7_retained,
+            "d1_retention_pct": pct(d1_retained, d1_cohort),
+            "d7_retention_pct": pct(d7_retained, d7_cohort),
             "acquisition": acquisition,
             "top_referrers": top_referrers,
             "events_by_day": users_by_day,
