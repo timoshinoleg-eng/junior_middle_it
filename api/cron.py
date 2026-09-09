@@ -7,10 +7,9 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from channel_bot_v2 import Config, collect_and_post_once
+from production_bot import Config, collect_and_post_once
 from sentry_setup import init_sentry
 
-# Initialize Sentry once per serverless instance (import-time).
 init_sentry()
 
 
