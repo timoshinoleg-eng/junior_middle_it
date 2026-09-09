@@ -51,7 +51,10 @@ jobs:
             test_resume_documents \
             test_interactive_runtime \
             test_serverless_payload_runtime \
-            test_referral_runtime
+            test_referral_runtime \
+            test_public_site \
+            test_public_acquisition_runtime \
+            test_p7_growth_metrics
 
       - name: Run formatter regression script
         run: python test_formatter_fix.py
