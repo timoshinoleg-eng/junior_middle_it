@@ -1,16 +1,12 @@
 """Vercel runtime adapter for durable vacancy CTA payloads.
 
-Serverless collection intentionally runs with ``use_sqlite=False`` so cross-run
-dedup keeps using Telegram history instead of an ephemeral local database.
-That also means core ``post_job_with_bot`` normally receives ``db=None`` and
-cannot mirror a posted vacancy into ``growth_job_payloads``.
+Serverless collection runs without persistent SQLite.  Supabase Edge therefore
+acts as both the durable payload store and the atomic cross-run idempotency
+ledger for Vercel publication.
 
-This adapter fills only that gap. It prefers the existing PostgreSQL store when
-a raw DSN is configured. Otherwise it uses the narrow Supabase Edge writer,
-which authenticates the already-configured Telegram bot token with Telegram
-``getMe`` before allowing a single ``growth_job_payloads`` upsert. The original
-poster still gets the original ``db`` argument, so Vercel dedup/publication
-semantics are unchanged.
+Before Telegram publication the adapter claims the vacancy hash. Existing
+claims are skipped. If Telegram publication fails, the claim is released so a
+later cron run can retry safely.
 """
 from __future__ import annotations
 
@@ -21,7 +17,11 @@ from typing import Optional
 
 import channel_bot as core
 import content_runtime as runtime
-from edge_payload_writer import edge_writer_configured, save_job_payload_edge
+from edge_payload_writer import (
+    edge_writer_configured,
+    release_job_payload_edge,
+    save_job_payload_edge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +44,6 @@ def _payload_store() -> Optional[runtime.DatabaseConnection]:
 
     store = runtime.DatabaseConnection(":memory:")
     if getattr(store, "growth_backend", "sqlite") != "postgres":
-        # A configured but unavailable DSN may fall back to SQLite when
-        # REQUIRE_DURABLE_GROWTH=false. That fallback is useless for a
-        # serverless callback payload, so do not pretend it is durable.
         try:
             store.close()
         finally:
@@ -60,24 +57,47 @@ def _payload_store() -> Optional[runtime.DatabaseConnection]:
     return store
 
 
-async def post_job_with_durable_payload(bot, job, db=None) -> bool:
-    """Pre-save public-card context while preserving core posting semantics."""
-    if db is None:
-        job_hash = job.get("hash") or core.generate_job_hash(job)
-        job["hash"] = job_hash
+async def _release_edge_claim(job_hash: str) -> None:
+    """Best-effort compensation after a failed publication."""
+    try:
+        await asyncio.to_thread(release_job_payload_edge, job_hash)
+    except Exception as exc:
+        # Do not hide the original Telegram failure. A stale claim is safer than
+        # a duplicate post; operators can reconcile it explicitly if necessary.
+        logger.error(
+            "Failed to release durable job claim %s: %s",
+            job_hash,
+            type(exc).__name__,
+        )
 
+
+async def post_job_with_durable_payload(bot, job, db=None) -> bool:
+    """Publish a vacancy only after acquiring a durable cross-run claim."""
+    edge_claimed = False
+    job_hash = job.get("hash") or core.generate_job_hash(job)
+    job["hash"] = job_hash
+
+    if db is None:
         store = _payload_store()
         if store is not None:
+            # Direct Postgres deployments retain their historical behavior.
             store.save_job_payload(job_hash, job)
         elif edge_writer_configured():
-            # urllib is intentionally kept out of the event loop. Fail closed:
-            # do not publish a CTA whose Resume Match/share payload is known not
-            # to be durable.
-            await asyncio.to_thread(save_job_payload_edge, job_hash, job)
+            edge_claimed = await asyncio.to_thread(save_job_payload_edge, job_hash, job)
+            if not edge_claimed:
+                logger.info("Durable duplicate skipped: %s", job_hash)
+                return False
 
-    # Preserve core behavior exactly: do not pass the mirror DB into posting,
-    # registration, dedup or any other path.
-    return await _ORIGINAL_POST_JOB_WITH_BOT(bot, job, db=db)
+    try:
+        posted = await _ORIGINAL_POST_JOB_WITH_BOT(bot, job, db=db)
+    except BaseException:
+        if edge_claimed:
+            await _release_edge_claim(job_hash)
+        raise
+
+    if not posted and edge_claimed:
+        await _release_edge_claim(job_hash)
+    return bool(posted)
 
 
 # collect_and_post_once resolves this global at execution time, so patching the
