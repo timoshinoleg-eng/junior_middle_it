@@ -17,6 +17,19 @@ def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int
     return max(minimum, min(value, maximum))
 
 
+def _public_site_url() -> str:
+    """Return the explicit public URL, or Vercel's canonical production domain."""
+    explicit = (os.getenv("PUBLIC_SITE_URL") or "").strip()
+    if explicit:
+        return explicit
+    production_domain = (os.getenv("VERCEL_PROJECT_PRODUCTION_URL") or "").strip()
+    if not production_domain:
+        return ""
+    if production_domain.startswith(("http://", "https://")):
+        return production_domain
+    return f"https://{production_domain}"
+
+
 class handler(BaseHTTPRequestHandler):
     def _render(self) -> bytes:
         parsed = urlsplit(self.path)
@@ -34,7 +47,7 @@ class handler(BaseHTTPRequestHandler):
             channel_id=os.getenv("CHANNEL_ID", ""),
             category=category,
             level=level,
-            public_site_url=os.getenv("PUBLIC_SITE_URL", ""),
+            public_site_url=_public_site_url(),
         ).encode("utf-8")
 
     def _send_headers(self, content_length: int) -> None:
