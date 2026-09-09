@@ -1,8 +1,9 @@
 """Render.com entrypoint for the interactive job bot.
 
 The health HTTP server keeps Render healthy while the long-polling Telegram bot
-runs in a worker thread. Production imports go through ``content_runtime`` so
-all prior growth layers plus attributable weekly content magnets are installed.
+runs in a worker thread. Production imports go through ``interactive_runtime``
+so all growth layers, content magnets, product metrics and private PDF/DOCX
+Resume Match are installed without changing the Vercel ingestion runtime.
 """
 import json
 import os
@@ -28,8 +29,10 @@ def config_summary() -> dict:
         "GROWTH_DATABASE": present("GROWTH_DATABASE_URL", "DATABASE_URL"),
         "REQUIRE_DURABLE_GROWTH": os.getenv("REQUIRE_DURABLE_GROWTH", "false").lower() == "true",
         "RESUME_MATCH": True,
+        "RESUME_PDF_DOCX": True,
         "SAVED_SEARCHES": True,
         "CONTENT_MAGNETS": True,
+        "PRODUCT_UTILITY_METRICS": True,
         "APIFY_API_TOKEN": present("APIFY_API_TOKEN"),
         "TELEGRAM_API_ID": present("TELEGRAM_API_ID"),
         "TELEGRAM_API_HASH": present("TELEGRAM_API_HASH"),
@@ -60,7 +63,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     "cycle": None,
                 }
             try:
-                import content_runtime as _cb
+                import interactive_runtime as _cb
                 if getattr(_cb, "CYCLE_TELEMETRY", None):
                     payload["cycle"] = dict(_cb.CYCLE_TELEMETRY)
             except Exception:
@@ -84,15 +87,15 @@ def run_bot() -> None:
         STATE["bot_thread_started"] = True
     try:
         import asyncio
-        import content_runtime
+        import interactive_runtime
 
         with STATE_LOCK:
             STATE["bot_running"] = True
-        print("[render_main] content_runtime imported, entering main()", flush=True)
-        asyncio.run(content_runtime.main())
+        print("[render_main] interactive_runtime imported, entering main()", flush=True)
+        asyncio.run(interactive_runtime.main())
         with STATE_LOCK:
             STATE["bot_running"] = False
-            STATE["error"] = "content_runtime.main() returned unexpectedly"
+            STATE["error"] = "interactive_runtime.main() returned unexpectedly"
     except BaseException as e:
         tb = traceback.format_exc()
         print(f"[render_main] BOT CRASHED: {tb}", flush=True)
