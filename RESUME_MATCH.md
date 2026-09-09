@@ -20,7 +20,11 @@ the existing bot.
    - skills explicitly present in the vacancy but not found in the resume;
    - keyword overlap;
    - practical tailoring suggestions.
-5. Optionally enable realtime vacancy alerts or refine the profile.
+5. Optionally save a search based on the matched skills (`🔔 Сохранить такой поиск`) or refine the profile.
+
+The saved-search suggestion contains only the vacancy category and skills that
+were found in both texts. It never contains the resume body or extracted
+personal details. Saving it explicitly enables realtime alerts for that search.
 
 ## Privacy contract
 
@@ -33,6 +37,7 @@ It is **not** written to:
 - PostgreSQL;
 - analytics events;
 - job payload cache;
+- saved searches;
 - logs by the Resume Match code.
 
 The completion event contains only:

@@ -45,7 +45,8 @@ jobs:
             test_message_formatter_growth \
             test_growth_p1 \
             test_resume_matcher \
-            test_resume_flow
+            test_resume_flow \
+            test_saved_searches
 
       - name: Run formatter regression script
         run: python test_formatter_fix.py
