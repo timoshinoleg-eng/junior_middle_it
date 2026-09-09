@@ -1,6 +1,7 @@
 """Sanitized readiness helpers for the Vercel/serverless production surface."""
 from __future__ import annotations
 
+import hmac
 import os
 from typing import Dict, List
 
@@ -19,6 +20,15 @@ def missing_posting_env() -> List[str]:
 
 def durable_growth_configured() -> bool:
     return _present("GROWTH_DATABASE_URL") or _present("DATABASE_URL")
+
+
+def cron_authorized(authorization: str) -> bool:
+    """Require a configured CRON_SECRET and Authorization bearer header only."""
+    secret = (os.getenv("CRON_SECRET") or "").strip()
+    if not secret:
+        return False
+    supplied = str(authorization or "")
+    return hmac.compare_digest(supplied, f"Bearer {secret}")
 
 
 def readiness() -> Dict[str, object]:
