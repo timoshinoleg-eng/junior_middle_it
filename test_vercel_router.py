@@ -1,5 +1,7 @@
+import json
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from api.index import resolve_route
@@ -37,6 +39,23 @@ class VercelRouterTests(unittest.TestCase):
         self.assertTrue(state['collector_ready'])
         self.assertFalse(state['durable_growth'])
         self.assertFalse(state['ok'])
+
+    def test_vercel_uses_other_preset_and_file_based_python_routes(self):
+        config = json.loads(Path('vercel.json').read_text(encoding='utf-8'))
+        self.assertIsNone(config.get('framework'))
+
+        rewrites = {
+            item['source']: item['destination']
+            for item in config.get('rewrites', [])
+        }
+        self.assertEqual(rewrites.get('/'), '/api/site')
+        self.assertEqual(rewrites.get('/robots.txt'), '/api/robots')
+        self.assertNotIn('/api/health', rewrites)
+        self.assertNotIn('/api/cron', rewrites)
+
+        functions = config.get('functions', {})
+        self.assertIn('api/**/*.py', functions)
+        self.assertEqual(functions['api/**/*.py'].get('maxDuration'), 300)
 
 
 if __name__ == '__main__':
