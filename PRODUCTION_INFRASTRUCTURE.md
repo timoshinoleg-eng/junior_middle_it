@@ -5,9 +5,10 @@ No credentials belong in the repository.
 
 ## Topology
 
-- **Telegram interactive bot:** persistent Python process (`render_main.py`).
-- **Public acquisition + scheduled ingestion:** Vercel Python functions.
+- **Vacancy ingestion/publication:** Vercel Python function `/api/cron`, triggered by GitHub Actions.
+- **Public acquisition:** Vercel `/` -> `/api/site`.
 - **Durable growth/product state:** Supabase PostgreSQL.
+- **Telegram interactive bot:** long-polling runtime (`render_main.py`) only on an always-on host.
 - **Vacancy collection dedup/cache:** existing runtime-specific behavior remains unchanged.
 
 Supabase production project:
@@ -15,6 +16,19 @@ Supabase production project:
 - project: `junior-middle-it-growth`
 - project ref: `uucjptyqfsdzqsftgiro`
 - region: Frankfurt / `eu-central-1`
+
+## Current production state — 2026-09-09
+
+- Vercel collector is working: a verified scheduled run fetched 6866 vacancies,
+  selected 18 and posted all 18 with `failed=0`.
+- Vercel has the Telegram posting credentials required by the collector.
+- Supabase schema is applied and healthy, but no durable P7 rows are present yet;
+  `GROWTH_DATABASE_URL` still needs to be configured in the Vercel environment.
+- Render Free deployment is intentionally fail-closed because the required
+  `TELEGRAM_BOT_TOKEN` and `CHANNEL_ID` are not configured there.
+- A sleeping/free web service is not a production-safe home for Telegram long
+  polling. Use an always-on service for polling, or move the interactive bot to
+  a stateless/durable webhook architecture.
 
 ## Applied database migrations
 
@@ -41,16 +55,79 @@ tables are intentionally server-side only; no public Data API policy is required
 Use a Supabase PostgreSQL DSN in `GROWTH_DATABASE_URL`.
 
 For a persistent backend on infrastructure without guaranteed IPv6, prefer the
-project's Frankfurt Supavisor **session pooler** connection. For serverless
+project's Frankfurt Supavisor session-pooler connection. For serverless
 functions, use the supported pooler connection recommended by Supabase for that
 runtime. Keep SSL enabled and never commit the password or DSN.
 
 The application also accepts `DATABASE_URL` as a compatibility fallback, but
 `GROWTH_DATABASE_URL` is the canonical variable for this project.
 
+## Vercel variables
+
+The scheduled ingestion runtime and public P7 landing must use the same durable
+vacancy payload store:
+
+```text
+TELEGRAM_BOT_TOKEN=...
+CHANNEL_ID=...
+CRON_SECRET=...
+BOT_USERNAME=junior_jobs_channel_bot
+GROWTH_DATABASE_URL=postgresql://...
+PUBLIC_SITE_URL=https://<production-host>/
+```
+
+### Vercel readiness
+
+`/api/health` is deliberately strict:
+
+- `collector_ready=true` means Telegram posting + cron authorization are configured;
+- `durable_growth=true` means a PostgreSQL DSN is configured;
+- `public_acquisition_ready=true` requires the durable store plus `BOT_USERNAME`;
+- HTTP 200 / `ok=true` means the complete P7 serverless contract is configured;
+- incomplete P7 configuration returns HTTP 503 without exposing credential values.
+
+The cron endpoint remains usable while durable growth is being wired so existing
+vacancy publication is not interrupted. Its response includes
+`durable_growth: true|false` for observability.
+
+### Cron authorization
+
+`/api/cron` requires:
+
+```text
+Authorization: Bearer <CRON_SECRET>
+```
+
+Query-string secrets are not accepted. If `CRON_SECRET`, `TELEGRAM_BOT_TOKEN` or
+`CHANNEL_ID` is missing, the endpoint fails before running the expensive source
+collection. Internal exceptions are logged/Sentry-captured but the HTTP response
+contains only `internal_error`, never a traceback.
+
+## Single scheduler
+
+There must be exactly one production scheduler.
+
+The canonical scheduler is `.github/workflows/vercel-cron.yml`, four times daily:
+
+```text
+00:00 UTC
+06:00 UTC
+12:00 UTC
+18:00 UTC
+```
+
+It calls `https://junior-middle-it.vercel.app/api/cron` with the GitHub Actions
+`CRON_SECRET`. `vercel.json` contains routing only and must not also define a
+Vercel cron, otherwise 06:00 UTC can be triggered twice.
+
+`vercel.json` routes:
+
+- `/` -> `/api/site`
+- `/robots.txt` -> `/api/robots`
+
 ## Render / interactive bot variables
 
-Required production variables:
+If long polling is retained, the host must be always-on and have:
 
 ```text
 TELEGRAM_BOT_TOKEN=...
@@ -61,43 +138,19 @@ GROWTH_DATABASE_URL=postgresql://...
 REQUIRE_DURABLE_GROWTH=true
 ```
 
-`render.yaml` declares the sensitive values with `sync: false`; set them in the
-hosting environment. Enable `REQUIRE_DURABLE_GROWTH=true` only after the DSN has
-been verified, because this intentionally makes startup fail closed if durable
-storage cannot be reached.
+`render_main.py` fails closed:
 
-Health verification after deploy:
+- required Telegram env is checked before the HTTP port is bound;
+- worker crash/return terminates the process non-zero;
+- `/health` returns 200 only while the worker is actually running;
+- health output contains presence flags only, not token/channel/DSN values.
 
-- `/health` returns `ok: true`;
-- `config.GROWTH_DATABASE` is `true`;
-- `config.REQUIRE_DURABLE_GROWTH` is `true`;
-- `config.PUBLIC_ACQUISITION` is `true`;
-- no PostgreSQL connection error is present.
-
-## Vercel variables
-
-The scheduled ingestion runtime and the public P7 landing must use the same
-durable vacancy payload store:
-
-```text
-GROWTH_DATABASE_URL=postgresql://...
-BOT_USERNAME=junior_jobs_channel_bot
-CHANNEL_ID=...
-PUBLIC_SITE_URL=https://<production-host>/
-```
-
-Existing Telegram/cron variables remain required for `/api/cron`.
-
-`vercel.json` routes:
-
-- `/` -> `/api/site`
-- `/robots.txt` -> `/api/robots`
-- daily cron -> `/api/cron`
+Do not enable `REQUIRE_DURABLE_GROWTH=true` until the DSN is verified.
 
 ## Legacy SQLite migration
 
-If the live interactive host has historical `jobs.db` growth state, migrate it
-before enforcing durable-only mode:
+If an always-on interactive host has historical `jobs.db` growth state, migrate
+it before enforcing durable-only mode:
 
 ```bash
 GROWTH_DATABASE_URL='postgresql://...' \
@@ -113,21 +166,24 @@ settings, referrals and events before removing reliance on legacy growth state.
 
 ## P7 production smoke test
 
-1. Open `/` and confirm a 200 HTML page.
-2. Open `/robots.txt` and confirm `/` is allowed while `/api/` is disallowed.
-3. Confirm category and Junior/Middle filters render only publication-safe jobs.
-4. Open the landing's main Telegram CTA (`web_home`) and confirm the bot starts.
-5. Open an individual `web_<job_hash>` CTA and confirm the same vacancy is shown in Telegram.
-6. Open `resume_<job_hash>` and confirm Resume Match immediately requests resume text.
-7. Check `/stats_growth`: web starts appear in acquisition attribution and cohort metrics remain bounded by the first-start cohort.
-8. Confirm no resume text or user profile data is rendered by the public site.
+1. `/api/health` reports the expected collector/durable/public-acquisition flags.
+2. `/` returns the public vacancy landing and `/robots.txt` is present.
+3. Category and Junior/Middle filters render only publication-safe jobs.
+4. The GitHub Actions cron produces HTTP 200 and reports `durable_growth=true` after DSN activation.
+5. Supabase `growth_job_payloads` starts receiving rows after a collection run.
+6. `web_home` opens the bot with acquisition attribution.
+7. `web_<job_hash>` returns the same vacancy in Telegram.
+8. `resume_<job_hash>` enters Resume Match for that vacancy.
+9. `/stats_growth` uses first-start/activated mature cohorts.
+10. No resume text, credentials or private profile data appears on the public site.
 
 ## Rollout order
 
-1. Apply/verify Supabase migrations.
-2. Configure `GROWTH_DATABASE_URL` on the persistent bot host and Vercel.
-3. Run the legacy SQLite growth migration if historical state exists.
-4. Deploy the bot and verify PostgreSQL-backed health/runtime.
-5. Set `REQUIRE_DURABLE_GROWTH=true` on the persistent bot host.
-6. Deploy/verify Vercel public landing and cron.
-7. Run the P7 smoke test and inspect `/stats_growth` after real attributed starts.
+1. Apply/verify Supabase migrations. **Done.**
+2. Keep GitHub Actions as the only cron scheduler. **Done in code.**
+3. Configure `GROWTH_DATABASE_URL` in Vercel and verify `/api/health` becomes fully ready.
+4. Run one normal scheduled collection and verify `growth_job_payloads` is populated.
+5. Choose the interactive runtime: an always-on polling host or durable Vercel webhook.
+6. Configure interactive credentials only on that chosen runtime.
+7. If legacy growth data exists, migrate it before enforcing durable-only mode.
+8. Run the full P7 smoke test.
