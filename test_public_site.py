@@ -28,7 +28,10 @@ class PublicSiteTests(unittest.TestCase):
             "https://t.me/junior_jobs_channel_bot?start=web_abc-123",
         )
         self.assertEqual(public_site.bot_deep_link("bad name", "web_abc"), "")
-        self.assertEqual(public_site.bot_deep_link("valid_bot", "../../evil"), "")
+        self.assertEqual(
+            public_site.bot_deep_link("valid_bot", "../../evil"),
+            "https://t.me/valid_bot?start=evil",
+        )
 
     def test_only_junior_middle_quality_jobs_are_public(self):
         self.assertTrue(public_site.is_public_job(self._job()))
