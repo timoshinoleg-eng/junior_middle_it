@@ -1,6 +1,6 @@
 [project]
 name = "junior-middle-it"
-version = "0.2.0"
+version = "0.3.0"
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "python-telegram-bot==20.6",
@@ -11,6 +11,8 @@ dependencies = [
   "rapidfuzz>=3.6.0",
   "sentry-sdk>=2.0",
   "psycopg[binary]>=3.2,<4",
+  "pypdf>=5.0,<7",
+  "python-docx>=1.1,<2",
 ]
 
 [tool.vercel]
