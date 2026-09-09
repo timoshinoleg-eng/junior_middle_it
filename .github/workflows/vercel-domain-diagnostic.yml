@@ -1,0 +1,49 @@
+name: Vercel Domain Diagnostic
+
+on:
+  push:
+    branches:
+      - diag/vercel-production-domain
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    env:
+      BASE_URL: https://junior-middle-it.vercel.app
+    steps:
+      - name: DNS
+        shell: bash
+        run: |
+          set -u
+          echo '### CNAME'
+          dig +short CNAME junior-middle-it.vercel.app || true
+          echo '### A'
+          dig +short A junior-middle-it.vercel.app || true
+          echo '### AAAA'
+          dig +short AAAA junior-middle-it.vercel.app || true
+
+      - name: Probe routes and headers
+        shell: bash
+        run: |
+          set -u
+          paths=(
+            '/'
+            '/robots.txt'
+            '/api/health'
+            '/api/cron'
+            '/api/index?route=health'
+            '/api/index?route=robots'
+          )
+          for path in "${paths[@]}"; do
+            echo
+            echo "### ${path}"
+            rm -f /tmp/headers /tmp/body
+            curl -sS --max-time 20 -D /tmp/headers -o /tmp/body "$BASE_URL$path" || true
+            sed -n '1,40p' /tmp/headers || true
+            echo '--- body (first 1500 bytes) ---'
+            head -c 1500 /tmp/body 2>/dev/null || true
+            echo
+          done
