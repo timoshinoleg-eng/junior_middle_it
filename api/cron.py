@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import sys
 from http.server import BaseHTTPRequestHandler
@@ -7,9 +8,15 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from serverless_payload_runtime import Config, collect_and_post_once
+from serverless_health import (
+    cron_authorized,
+    durable_growth_configured,
+    missing_posting_env,
+)
+from serverless_payload_runtime import collect_and_post_once
 from sentry_setup import init_sentry
 
+logger = logging.getLogger(__name__)
 init_sentry()
 
 
@@ -18,22 +25,35 @@ class handler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path.split("?", 1)[0].rstrip("/") == "/api/health":
-            self._send_json(200, {"ok": True, "service": "junior_middle_it"})
+        missing = missing_posting_env()
+        if "CRON_SECRET" in missing:
+            self._send_json(503, {"ok": False, "error": "cron_not_configured"})
             return
 
-        secret = Config.CRON_SECRET
-        if secret:
-            auth = self.headers.get("authorization", "")
-            query = self.path.split("?", 1)[1] if "?" in self.path else ""
-            if auth != f"Bearer {secret}" and f"secret={secret}" not in query:
-                self._send_json(401, {"ok": False, "error": "unauthorized"})
-                return
+        if not cron_authorized(self.headers.get("authorization", "")):
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+
+        collector_missing = [
+            name for name in missing if name in {"TELEGRAM_BOT_TOKEN", "CHANNEL_ID"}
+        ]
+        if collector_missing:
+            self._send_json(
+                503,
+                {
+                    "ok": False,
+                    "error": "collector_not_configured",
+                    "missing_required": collector_missing,
+                },
+            )
+            return
 
         try:
             result = asyncio.run(
@@ -42,16 +62,18 @@ class handler(BaseHTTPRequestHandler):
                     source_budget_seconds=int(os.getenv("SOURCE_BUDGET_SECONDS", "480")),
                 )
             )
-        except Exception:
-            import traceback
-            exc = traceback.format_exc()
+            result = dict(result or {})
+            result["durable_growth"] = durable_growth_configured()
+        except Exception as exc:
+            logger.exception("Vercel cron collection failed")
             try:
                 import sentry_sdk
-                sentry_sdk.capture_exception()
+                sentry_sdk.capture_exception(exc)
             except Exception:
                 pass
-            self._send_json(500, {"ok": False, "error": exc[:2000]})
+            self._send_json(500, {"ok": False, "error": "internal_error"})
             return
+
         self._send_json(200 if result.get("ok") else 500, result)
 
     def do_POST(self):
