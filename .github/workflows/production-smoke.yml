@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BASE_URL: https://junior-middle-it.vercel.app
+      VERCEL_ORG_ID: team_szHwcCa6CdtVuEvDGWkvvbZ1
+      VERCEL_PROJECT_ID: prj_269y0sGpFXze7o7MqeDIfLakL5nR
 
     steps:
       - name: Wait for current production contract
@@ -87,15 +89,77 @@ jobs:
             echo
           done
 
-      - name: Fail on routing mismatch
+      - name: Checkout current main for repair
         if: steps.contract.outputs.seen != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Repair Vercel production traffic when token is available
+        if: steps.contract.outputs.seen != 'true'
+        id: repair
+        shell: bash
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -u
+          echo "repaired=false" >> "$GITHUB_OUTPUT"
+
+          if [ -z "${VERCEL_TOKEN:-}" ]; then
+            echo 'VERCEL_TOKEN is not configured in GitHub Actions; automatic production promotion is unavailable.'
+            exit 0
+          fi
+
+          mkdir -p .vercel
+          printf '{"orgId":"%s","projectId":"%s"}\n' \
+            "$VERCEL_ORG_ID" "$VERCEL_PROJECT_ID" > .vercel/project.json
+
+          echo 'A VERCEL_TOKEN is configured; deploying current main explicitly to production.'
+          if ! npx --yes vercel@latest deploy --prod --yes --token "$VERCEL_TOKEN" \
+              > /tmp/vercel-production-deploy.log 2>&1; then
+            echo 'Explicit Vercel production deploy failed.'
+            sed -n '1,120p' /tmp/vercel-production-deploy.log
+            exit 0
+          fi
+
+          echo 'Explicit production deploy completed. Verifying canonical alias.'
+          for attempt in $(seq 1 18); do
+            code=$(curl -sS --max-time 15 -o /tmp/repaired-health.json -w '%{http_code}' \
+              "$BASE_URL/api/health" || true)
+            if python - <<'PY'
+          import json
+          try:
+              data = json.load(open('/tmp/repaired-health.json', encoding='utf-8'))
+          except Exception:
+              raise SystemExit(1)
+          raise SystemExit(0 if 'collector_ready' in data and 'durable_growth' in data else 1)
+          PY
+            then
+              echo "Canonical production alias repaired (HTTP $code)."
+              echo "repaired=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Production alias not updated yet (attempt $attempt/18, HTTP $code)"
+            sleep 5
+          done
+
+          echo 'Explicit deploy did not move the canonical alias to the current contract.'
+
+      - name: Fail when production traffic is still stale
+        if: >-
+          always() &&
+          steps.contract.outputs.seen != 'true' &&
+          steps.repair.outputs.repaired != 'true'
         shell: bash
         run: |
           echo 'ERROR: canonical production domain is not serving the current routing contract.'
+          echo 'If VERCEL_TOKEN was absent, reconnect Vercel to team scope olegs-projects-bfc4e11a or add a scoped VERCEL_TOKEN.'
           exit 1
 
       - name: Verify sanitized readiness
-        if: steps.contract.outputs.seen == 'true'
+        if: >-
+          steps.contract.outputs.seen == 'true' ||
+          steps.repair.outputs.repaired == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -116,7 +180,9 @@ jobs:
           PY
 
       - name: Verify public routes
-        if: steps.contract.outputs.seen == 'true'
+        if: >-
+          steps.contract.outputs.seen == 'true' ||
+          steps.repair.outputs.repaired == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -130,7 +196,9 @@ jobs:
           echo "Public routes: site=$site_code robots=$robots_code"
 
       - name: Verify cron fails closed without bearer auth
-        if: steps.contract.outputs.seen == 'true'
+        if: >-
+          steps.contract.outputs.seen == 'true' ||
+          steps.repair.outputs.repaired == 'true'
         shell: bash
         run: |
           set -euo pipefail
