@@ -1,9 +1,8 @@
 """Render.com entrypoint for the interactive job bot.
 
-The health HTTP server keeps Render healthy while the long-polling Telegram bot
-runs in a worker thread. Production imports go through
-``public_acquisition_runtime`` so P1-P6 plus P7 public-site attribution/deep-link
-continuation are installed without changing the Vercel ingestion runtime.
+The HTTP endpoint is a truthful liveness/readiness probe for the persistent
+Telegram worker. Production imports go through ``public_acquisition_runtime`` so
+P1-P7 are installed without changing the Vercel ingestion runtime.
 """
 import json
 import os
@@ -11,20 +10,26 @@ import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable, List
 
 os.environ.setdefault("DISABLE_FILE_LOG", "true")
 
+REQUIRED_ENV = ("TELEGRAM_BOT_TOKEN", "CHANNEL_ID")
+
+
+def missing_required_env() -> List[str]:
+    """Return missing production-critical settings without exposing values."""
+    return [name for name in REQUIRED_ENV if not (os.getenv(name) or "").strip()]
+
 
 def config_summary() -> dict:
-    """Presence flags for key env vars — safe to expose (no secret values)."""
+    """Presence flags for operationally relevant env vars; never expose values."""
     def present(*names):
-        return any(os.getenv(n) for n in names)
+        return any((os.getenv(n) or "").strip() for n in names)
 
     return {
         "TELEGRAM_BOT_TOKEN": present("TELEGRAM_BOT_TOKEN"),
-        "TELEGRAM_BOT_ID": (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").split(":")[0] if present("TELEGRAM_BOT_TOKEN") else "",
         "CHANNEL_ID": present("CHANNEL_ID"),
-        "CHANNEL_ID_VAL": os.getenv("CHANNEL_ID", "")[:30] if present("CHANNEL_ID") else "",
         "ADMIN_USER_ID": present("ADMIN_USER_ID"),
         "GROWTH_DATABASE": present("GROWTH_DATABASE_URL", "DATABASE_URL"),
         "REQUIRE_DURABLE_GROWTH": os.getenv("REQUIRE_DURABLE_GROWTH", "false").lower() == "true",
@@ -46,33 +51,47 @@ def config_summary() -> dict:
     }
 
 
-STATE = {"started_at": time.time(), "bot_thread_started": False, "bot_running": False, "error": None}
+STATE = {
+    "started_at": time.time(),
+    "bot_thread_started": False,
+    "bot_running": False,
+    "error": None,
+}
 STATE_LOCK = threading.Lock()
+
+
+def health_snapshot() -> tuple[int, dict]:
+    """Build a sanitized readiness response and matching HTTP status."""
+    with STATE_LOCK:
+        running = bool(STATE["bot_running"] and not STATE["error"])
+        failed = bool(STATE["error"])
+        payload = {
+            "ok": running,
+            "service": "junior_middle_it_bot",
+            "uptime_s": int(time.time() - STATE["started_at"]),
+            "bot": "running" if running else "crashed" if failed else "starting",
+            "error": STATE["error"],
+            "config": config_summary(),
+            "cycle": None,
+        }
+    try:
+        import public_acquisition_runtime as runtime
+        if getattr(runtime, "CYCLE_TELEMETRY", None):
+            payload["cycle"] = dict(runtime.CYCLE_TELEMETRY)
+    except Exception:
+        pass
+    return (200 if running else 503), payload
 
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path in ("/health", "/healthz", "/"):
-            with STATE_LOCK:
-                running = STATE["bot_running"] and not STATE["error"]
-                payload = {
-                    "ok": running,
-                    "service": "junior_middle_it_bot",
-                    "uptime_s": int(time.time() - STATE["started_at"]),
-                    "bot": "running" if running else "crashed" if STATE["error"] else "starting",
-                    "error": STATE["error"],
-                    "config": config_summary(),
-                    "cycle": None,
-                }
-            try:
-                import public_acquisition_runtime as _cb
-                if getattr(_cb, "CYCLE_TELEMETRY", None):
-                    payload["cycle"] = dict(_cb.CYCLE_TELEMETRY)
-            except Exception:
-                pass
+        if self.path.split("?", 1)[0] in ("/health", "/healthz", "/"):
+            status, payload = health_snapshot()
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -84,7 +103,14 @@ class HealthHandler(BaseHTTPRequestHandler):
         pass
 
 
-def run_bot() -> None:
+def _set_runtime_failure(label: str) -> None:
+    with STATE_LOCK:
+        STATE["bot_running"] = False
+        STATE["error"] = label
+
+
+def run_bot(exit_fn: Callable[[int], None] = os._exit) -> None:
+    """Run the worker; any unexpected stop is fatal for the whole service."""
     with STATE_LOCK:
         STATE["bot_thread_started"] = True
     try:
@@ -93,23 +119,31 @@ def run_bot() -> None:
 
         with STATE_LOCK:
             STATE["bot_running"] = True
+            STATE["error"] = None
         print("[render_main] public_acquisition_runtime imported, entering main()", flush=True)
         asyncio.run(public_acquisition_runtime.main())
-        with STATE_LOCK:
-            STATE["bot_running"] = False
-            STATE["error"] = "public_acquisition_runtime.main() returned unexpectedly"
-    except BaseException as e:
+        _set_runtime_failure("bot_runtime_returned")
+        print("[render_main] BOT STOPPED: main() returned unexpectedly", flush=True)
+        exit_fn(1)
+    except BaseException as exc:
         tb = traceback.format_exc()
         print(f"[render_main] BOT CRASHED: {tb}", flush=True)
-        with STATE_LOCK:
-            STATE["bot_running"] = False
-            STATE["error"] = f"{type(e).__name__}: {e} | ...{tb[-400:]}"
+        _set_runtime_failure(f"bot_runtime_failed:{type(exc).__name__}")
+        exit_fn(1)
 
 
 def main() -> None:
+    missing = missing_required_env()
+    if missing:
+        print(
+            "[render_main] missing required environment: " + ", ".join(missing),
+            flush=True,
+        )
+        raise SystemExit(2)
+
     port = int(os.environ.get("PORT", "8080"))
-    t = threading.Thread(target=run_bot, name="bot-worker", daemon=False)
-    t.start()
+    worker = threading.Thread(target=run_bot, name="bot-worker", daemon=True)
+    worker.start()
     print(f"[render_main] health server on :{port}/health", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
     server.daemon_threads = True
