@@ -34,7 +34,7 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
         }
         with patch.dict(
             os.environ,
-            {"GROWTH_DATABASE_URL": "postgresql://example/db", "DATABASE_URL": ""},
+            {"GROWTH_DATABASE_URL": "postgresql://example/db", "DATABASE_URL": "", "GROWTH_PUBLIC_URL": ""},
             clear=False,
         ), patch.object(spr.runtime, "DatabaseConnection", return_value=fake_store) as ctor, patch.object(
             spr, "_ORIGINAL_POST_JOB_WITH_BOT", original
@@ -48,16 +48,36 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
         original.assert_awaited_once()
         self.assertIsNone(original.await_args.kwargs["db"])
 
-    async def test_no_growth_dsn_keeps_original_serverless_behavior(self):
+    async def test_edge_writer_presaves_when_raw_dsn_is_absent(self):
+        original = AsyncMock(return_value=True)
+        edge_save = MagicMock(return_value=True)
+        job = {"hash": "abc123", "title": "QA", "company": "Example"}
+        with patch.dict(
+            os.environ,
+            {"GROWTH_DATABASE_URL": "", "DATABASE_URL": "", "GROWTH_PUBLIC_URL": "https://project.supabase.co/functions/v1/growth-proxy"},
+            clear=False,
+        ), patch.object(spr, "edge_writer_configured", return_value=True), patch.object(
+            spr, "save_job_payload_edge", edge_save
+        ), patch.object(spr.runtime, "DatabaseConnection") as ctor, patch.object(
+            spr, "_ORIGINAL_POST_JOB_WITH_BOT", original
+        ):
+            result = await spr.post_job_with_durable_payload(SimpleNamespace(), job, db=None)
+
+        self.assertTrue(result)
+        ctor.assert_not_called()
+        edge_save.assert_called_once_with("abc123", job)
+        original.assert_awaited_once_with(ANY, job, db=None)
+
+    async def test_no_growth_backend_keeps_original_serverless_behavior(self):
         original = AsyncMock(return_value=True)
         job = {"hash": "abc123", "title": "QA", "company": "Example"}
         with patch.dict(
             os.environ,
-            {"GROWTH_DATABASE_URL": "", "DATABASE_URL": ""},
+            {"GROWTH_DATABASE_URL": "", "DATABASE_URL": "", "GROWTH_PUBLIC_URL": ""},
             clear=False,
-        ), patch.object(spr.runtime, "DatabaseConnection") as ctor, patch.object(
-            spr, "_ORIGINAL_POST_JOB_WITH_BOT", original
-        ):
+        ), patch.object(spr, "edge_writer_configured", return_value=False), patch.object(
+            spr.runtime, "DatabaseConnection"
+        ) as ctor, patch.object(spr, "_ORIGINAL_POST_JOB_WITH_BOT", original):
             result = await spr.post_job_with_durable_payload(SimpleNamespace(), job, db=None)
 
         self.assertTrue(result)
@@ -71,7 +91,7 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
         job = {"hash": "abc123", "title": "QA", "company": "Example"}
         with patch.dict(
             os.environ,
-            {"GROWTH_DATABASE_URL": "postgresql://example/db"},
+            {"GROWTH_DATABASE_URL": "postgresql://example/db", "GROWTH_PUBLIC_URL": ""},
             clear=False,
         ), patch.object(spr.runtime, "DatabaseConnection") as ctor, patch.object(
             spr, "_ORIGINAL_POST_JOB_WITH_BOT", original
@@ -84,19 +104,22 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ctor.assert_not_called()
         original.assert_awaited_once_with(ANY, job, db=interactive_db)
 
-    async def test_unavailable_optional_postgres_fallback_is_not_mistaken_for_durable(self):
+    async def test_unavailable_optional_postgres_can_fall_back_to_edge(self):
         fake_store = SimpleNamespace(
             growth_backend="sqlite",
             save_job_payload=MagicMock(),
             close=MagicMock(),
         )
         original = AsyncMock(return_value=True)
+        edge_save = MagicMock(return_value=True)
         job = {"hash": "abc123", "title": "QA", "company": "Example"}
         with patch.dict(
             os.environ,
-            {"GROWTH_DATABASE_URL": "postgresql://example/db", "DATABASE_URL": ""},
+            {"GROWTH_DATABASE_URL": "postgresql://example/db", "DATABASE_URL": "", "GROWTH_PUBLIC_URL": "https://project.supabase.co/functions/v1/growth-proxy"},
             clear=False,
         ), patch.object(spr.runtime, "DatabaseConnection", return_value=fake_store), patch.object(
+            spr, "edge_writer_configured", return_value=True
+        ), patch.object(spr, "save_job_payload_edge", edge_save), patch.object(
             spr, "_ORIGINAL_POST_JOB_WITH_BOT", original
         ):
             result = await spr.post_job_with_durable_payload(SimpleNamespace(), job, db=None)
@@ -104,6 +127,7 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
         fake_store.close.assert_called_once()
         fake_store.save_job_payload.assert_not_called()
+        edge_save.assert_called_once_with("abc123", job)
         original.assert_awaited_once()
 
 

@@ -51,6 +51,7 @@ jobs:
             test_resume_documents \
             test_interactive_runtime \
             test_serverless_payload_runtime \
+            test_edge_payload_writer \
             test_referral_runtime \
             test_public_site \
             test_public_growth_client \
