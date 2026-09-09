@@ -42,7 +42,8 @@ jobs:
             test_job_sources_extra \
             test_publication_policy \
             test_stage0_post_fixes \
-            test_message_formatter_growth
+            test_message_formatter_growth \
+            test_growth_p1
 
       - name: Run formatter regression script
         run: python test_formatter_fix.py
