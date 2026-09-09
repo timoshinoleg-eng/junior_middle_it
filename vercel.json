@@ -1,13 +1,28 @@
 {
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
   "rewrites": [
     {
       "source": "/",
-      "destination": "/api/site"
+      "destination": "/api/index?route=site"
     },
     {
       "source": "/robots.txt",
-      "destination": "/api/robots"
+      "destination": "/api/index?route=robots"
+    },
+    {
+      "source": "/api/health",
+      "destination": "/api/index?route=health"
+    },
+    {
+      "source": "/api/cron",
+      "destination": "/api/index?route=cron"
     }
-  ]
+  ],
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 800,
+      "excludeFiles": "{tests/**,__tests__/**,**/*.test.py,**/test_*.py,fixtures/**,__fixtures__/**,testdata/**,sample-data/**,static/**,assets/**}"
+    }
+  }
 }
