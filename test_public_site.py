@@ -1,6 +1,9 @@
+import os
 import unittest
+from unittest.mock import patch
 
 import public_site
+from api.site import _public_site_url
 
 
 class PublicSiteTests(unittest.TestCase):
@@ -70,6 +73,32 @@ class PublicSiteTests(unittest.TestCase):
         )
         self.assertIn("web_home", page)
         self.assertIn("Подборка обновляется", page)
+
+    def test_runtime_public_url_prefers_explicit_override(self):
+        with patch.dict(
+            os.environ,
+            {
+                "PUBLIC_SITE_URL": "https://jobs.example.com",
+                "VERCEL_PROJECT_PRODUCTION_URL": "junior-middle-it.vercel.app",
+            },
+            clear=True,
+        ):
+            self.assertEqual(_public_site_url(), "https://jobs.example.com")
+
+    def test_runtime_public_url_falls_back_to_vercel_production_domain(self):
+        with patch.dict(
+            os.environ,
+            {"VERCEL_PROJECT_PRODUCTION_URL": "junior-middle-it.vercel.app"},
+            clear=True,
+        ):
+            self.assertEqual(
+                _public_site_url(),
+                "https://junior-middle-it.vercel.app",
+            )
+
+    def test_runtime_public_url_is_empty_without_explicit_or_vercel_domain(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_public_site_url(), "")
 
 
 if __name__ == "__main__":
