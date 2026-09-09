@@ -19,7 +19,13 @@ def missing_posting_env() -> List[str]:
 
 
 def durable_growth_configured() -> bool:
-    return _present("GROWTH_DATABASE_URL") or _present("DATABASE_URL")
+    # Vercel may either connect to Postgres directly or consume the public,
+    # read-only Supabase Edge projection produced by the persistent Render bot.
+    return (
+        _present("GROWTH_DATABASE_URL")
+        or _present("DATABASE_URL")
+        or _present("GROWTH_PUBLIC_URL")
+    )
 
 
 def cron_authorized(authorization: str) -> bool:

@@ -53,6 +53,20 @@ class ServerlessHealthTests(unittest.TestCase):
         with patch.dict(os.environ, {"DATABASE_URL": "postgresql://x"}, clear=True):
             self.assertTrue(health.durable_growth_configured())
 
+    def test_public_edge_projection_counts_as_durable_for_vercel(self):
+        env = {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "CHANNEL_ID": "@channel",
+            "CRON_SECRET": "cron",
+            "BOT_USERNAME": "junior_jobs_channel_bot",
+            "GROWTH_PUBLIC_URL": "https://project.supabase.co/functions/v1/growth-proxy",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            state = health.readiness()
+        self.assertTrue(state["durable_growth"])
+        self.assertTrue(state["public_acquisition_ready"])
+        self.assertTrue(state["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

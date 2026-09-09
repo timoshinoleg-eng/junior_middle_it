@@ -2,6 +2,10 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
   "version": 2,
+  "env": {
+    "GROWTH_PUBLIC_URL": "https://uucjptyqfsdzqsftgiro.supabase.co/functions/v1/growth-proxy",
+    "BOT_USERNAME": "junior_jobs_channel_bot"
+  },
   "rewrites": [
     {
       "source": "/",

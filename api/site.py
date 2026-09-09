@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlsplit
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from public_growth_client import load_recent_public_jobs_http
 from public_site import load_recent_public_jobs, render_landing
 
 
@@ -36,11 +37,16 @@ class handler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
         category = (params.get("category") or [""])[0]
         level = (params.get("level") or [""])[0]
+        days = _bounded_env_int("PUBLIC_JOBS_DAYS", 14, 1, 45)
+        source_limit = _bounded_env_int("PUBLIC_JOBS_SOURCE_LIMIT", 120, 1, 300)
 
-        jobs = load_recent_public_jobs(
-            days=_bounded_env_int("PUBLIC_JOBS_DAYS", 14, 1, 45),
-            limit=_bounded_env_int("PUBLIC_JOBS_SOURCE_LIMIT", 120, 1, 300),
-        )
+        jobs = load_recent_public_jobs(days=days, limit=source_limit)
+        if not jobs:
+            jobs = load_recent_public_jobs_http(
+                os.getenv("GROWTH_PUBLIC_URL", ""),
+                days=days,
+                limit=source_limit,
+            )
         return render_landing(
             jobs,
             bot_username=os.getenv("BOT_USERNAME", ""),

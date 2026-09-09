@@ -53,8 +53,10 @@ jobs:
             test_serverless_payload_runtime \
             test_referral_runtime \
             test_public_site \
+            test_public_growth_client \
             test_public_acquisition_runtime \
             test_p7_growth_metrics \
+            test_http_growth_patch \
             test_render_main \
             test_serverless_health \
             test_vercel_router
