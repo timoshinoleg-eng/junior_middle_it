@@ -9,18 +9,26 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from public_site import load_recent_public_jobs, render_landing
 
 
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
 class handler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def _render(self) -> bytes:
         parsed = urlsplit(self.path)
         params = parse_qs(parsed.query)
         category = (params.get("category") or [""])[0]
         level = (params.get("level") or [""])[0]
 
         jobs = load_recent_public_jobs(
-            days=int(os.getenv("PUBLIC_JOBS_DAYS", "14")),
-            limit=int(os.getenv("PUBLIC_JOBS_SOURCE_LIMIT", "120")),
+            days=_bounded_env_int("PUBLIC_JOBS_DAYS", 14, 1, 45),
+            limit=_bounded_env_int("PUBLIC_JOBS_SOURCE_LIMIT", 120, 1, 300),
         )
-        body = render_landing(
+        return render_landing(
             jobs,
             bot_username=os.getenv("BOT_USERNAME", ""),
             channel_id=os.getenv("CHANNEL_ID", ""),
@@ -29,9 +37,10 @@ class handler(BaseHTTPRequestHandler):
             public_site_url=os.getenv("PUBLIC_SITE_URL", ""),
         ).encode("utf-8")
 
+    def _send_headers(self, content_length: int) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(content_length))
         self.send_header("Cache-Control", "public, s-maxage=300, stale-while-revalidate=3600")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -42,7 +51,12 @@ class handler(BaseHTTPRequestHandler):
             "connect-src 'none'; font-src 'none'",
         )
         self.end_headers()
+
+    def do_GET(self):
+        body = self._render()
+        self._send_headers(len(body))
         self.wfile.write(body)
 
     def do_HEAD(self):
-        self.do_GET()
+        body = self._render()
+        self._send_headers(len(body))
