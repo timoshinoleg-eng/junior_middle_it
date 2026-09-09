@@ -1,7 +1,7 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import serverless_payload_runtime as spr
 
@@ -82,7 +82,7 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result)
         ctor.assert_not_called()
-        original.assert_awaited_once_with(unittest.mock.ANY, job, db=interactive_db)
+        original.assert_awaited_once_with(ANY, job, db=interactive_db)
 
     async def test_unavailable_optional_postgres_fallback_is_not_mistaken_for_durable(self):
         fake_store = SimpleNamespace(
