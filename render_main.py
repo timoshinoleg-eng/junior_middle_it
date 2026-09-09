@@ -32,6 +32,7 @@ def config_summary() -> dict:
         "CHANNEL_ID": present("CHANNEL_ID"),
         "ADMIN_USER_ID": present("ADMIN_USER_ID"),
         "GROWTH_DATABASE": present("GROWTH_DATABASE_URL", "DATABASE_URL"),
+        "GROWTH_HTTP_KEY": present("GROWTH_HTTP_KEY"),
         "REQUIRE_DURABLE_GROWTH": os.getenv("REQUIRE_DURABLE_GROWTH", "false").lower() == "true",
         "RESUME_MATCH": True,
         "RESUME_PDF_DOCX": True,
@@ -115,6 +116,9 @@ def run_bot(exit_fn: Callable[[int], None] = os._exit) -> None:
         STATE["bot_thread_started"] = True
     try:
         import asyncio
+        # Install the authenticated HTTP-backed PostgreSQL transport before the
+        # P1-P7 runtime modules bind PostgresGrowthStore into their classes.
+        import http_growth_patch  # noqa: F401
         import public_acquisition_runtime
 
         with STATE_LOCK:
