@@ -1,7 +1,11 @@
 import unittest
 from urllib.parse import parse_qs, urlparse
 
-from message_formatter import JobMessageFormatter, build_telegram_share_url
+from message_formatter import (
+    JobMessageFormatter,
+    build_resume_match_url,
+    build_telegram_share_url,
+)
 
 
 class TelegramShareGrowthTests(unittest.TestCase):
@@ -41,7 +45,7 @@ class TelegramShareGrowthTests(unittest.TestCase):
             shared_text,
         )
 
-    def test_resume_match_cta_is_present_and_attributable(self):
+    def test_resume_match_cta_opens_private_deeplink(self):
         formatter = JobMessageFormatter()
         keyboard = formatter.create_inline_keyboard(self.job, bot_username="junior_middle_bot")
         resume = next(
@@ -50,7 +54,27 @@ class TelegramShareGrowthTests(unittest.TestCase):
             for button in row
             if button.get("text") == "📄 Проверить резюме"
         )
+        self.assertEqual(
+            resume["url"],
+            "https://t.me/junior_middle_bot?start=resume_abc123def4567890",
+        )
+        self.assertNotIn("callback_data", resume)
+        self.assertEqual(
+            build_resume_match_url(self.job, "@junior_middle_bot"),
+            "https://t.me/junior_middle_bot?start=resume_abc123def4567890",
+        )
+
+    def test_resume_match_falls_back_to_callback_without_username(self):
+        formatter = JobMessageFormatter()
+        keyboard = formatter.create_inline_keyboard(self.job, bot_username="")
+        resume = next(
+            button
+            for row in keyboard["inline_keyboard"]
+            for button in row
+            if button.get("text") == "📄 Проверить резюме"
+        )
         self.assertEqual(resume["callback_data"], "resume_match:abc123def4567890")
+        self.assertNotIn("url", resume)
 
     def test_share_url_works_without_bot_username(self):
         share_url = build_telegram_share_url(self.job)

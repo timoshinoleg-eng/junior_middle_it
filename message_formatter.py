@@ -41,6 +41,20 @@ def build_telegram_share_url(job: dict, bot_username: str = "") -> str:
     )
 
 
+def build_resume_match_url(job: dict, bot_username: str = "") -> str:
+    """Open Resume Match in the user's private bot chat.
+
+    A callback button on a public channel post does not establish a private bot
+    conversation.  A Telegram ``start`` deep link does, and also gives us an
+    attributable acquisition payload.
+    """
+    username = str(bot_username or "").strip().lstrip("@")
+    job_id = str(job.get("hash") or job.get("content_hash") or "")[:40]
+    if not username or not job_id:
+        return ""
+    return f"https://t.me/{username}?start=resume_{job_id}"
+
+
 class JobMessageFormatter(_BaseJobMessageFormatter):
     """Base formatter with working share and Resume Match actions."""
 
@@ -68,14 +82,17 @@ class JobMessageFormatter(_BaseJobMessageFormatter):
 
         job_id = str(job.get("hash") or job.get("content_hash") or "")[:40]
         if job_id:
-            resume_button = {
-                "text": "📄 Проверить резюме",
-                "callback_data": f"resume_match:{job_id}",
-            }
-            # Keep the utility CTA prominent but on its own row for mobile taps.
+            resume_url = build_resume_match_url(job, bot_username=bot_username)
+            resume_button = {"text": "📄 Проверить резюме"}
+            if resume_url:
+                resume_button["url"] = resume_url
+            else:
+                # Local/dev fallback for bot cards when BOT_USERNAME is absent.
+                resume_button["callback_data"] = f"resume_match:{job_id}"
+
             insert_at = 1 if rows else 0
             if not any(
-                button.get("callback_data") == f"resume_match:{job_id}"
+                button.get("text") == "📄 Проверить резюме"
                 for row in rows
                 for button in row
             ):

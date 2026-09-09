@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from content_runtime import Config, collect_and_post_once
+from serverless_payload_runtime import Config, collect_and_post_once
 from sentry_setup import init_sentry
 
 init_sentry()
