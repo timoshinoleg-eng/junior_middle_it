@@ -22,9 +22,7 @@ class TelegramShareGrowthTests(unittest.TestCase):
 
     def test_share_button_uses_official_telegram_url(self):
         formatter = JobMessageFormatter()
-        keyboard = formatter.create_inline_keyboard(
-            self.job, bot_username="junior_middle_bot"
-        )
+        keyboard = formatter.create_inline_keyboard(self.job, bot_username="junior_middle_bot")
         share = next(
             button
             for row in keyboard["inline_keyboard"]
@@ -33,7 +31,6 @@ class TelegramShareGrowthTests(unittest.TestCase):
         )
         self.assertNotIn("switch_inline_query", share)
         self.assertTrue(share["url"].startswith("https://t.me/share/url?"))
-
         params = parse_qs(urlparse(share["url"]).query)
         self.assertEqual(params["url"][0], self.job["url"])
         shared_text = params["text"][0]
@@ -43,6 +40,17 @@ class TelegramShareGrowthTests(unittest.TestCase):
             "https://t.me/junior_middle_bot?start=share_abc123def4567890",
             shared_text,
         )
+
+    def test_resume_match_cta_is_present_and_attributable(self):
+        formatter = JobMessageFormatter()
+        keyboard = formatter.create_inline_keyboard(self.job, bot_username="junior_middle_bot")
+        resume = next(
+            button
+            for row in keyboard["inline_keyboard"]
+            for button in row
+            if button.get("text") == "📄 Проверить резюме"
+        )
+        self.assertEqual(resume["callback_data"], "resume_match:abc123def4567890")
 
     def test_share_url_works_without_bot_username(self):
         share_url = build_telegram_share_url(self.job)
