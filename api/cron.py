@@ -8,6 +8,12 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+# Configure sensitive third-party loggers before importing the Telegram runtime.
+# httpx INFO logs include the full Bot API URL, whose path embeds the bot token.
+from secure_http_logging import configure_sensitive_http_logging
+
+configure_sensitive_http_logging()
+
 from serverless_health import (
     cron_authorized,
     durable_growth_configured,
