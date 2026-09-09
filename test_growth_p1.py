@@ -1,10 +1,11 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import channel_bot as core
 import channel_bot_v2 as v2
+import growth_store
 
 
 class FakeMessage:
@@ -28,6 +29,24 @@ class FakeQuery:
 
     async def edit_message_text(self, text, **kwargs):
         self.edits.append((text, kwargs))
+
+
+class PostgresGrowthStoreConnectionTests(unittest.TestCase):
+    def test_psycopg_auto_prepare_is_disabled_for_supavisor_transaction_pooler(self):
+        fake_connection = MagicMock()
+        with patch.object(growth_store.psycopg, "connect", return_value=fake_connection) as connect:
+            store = growth_store.PostgresGrowthStore.__new__(growth_store.PostgresGrowthStore)
+            store.dsn = "postgresql://postgres.project:secret@pooler.example:6543/postgres"
+            store.conn = None
+            store._connect()
+
+        self.assertIs(store.conn, fake_connection)
+        connect.assert_called_once_with(
+            store.dsn,
+            autocommit=True,
+            connect_timeout=8,
+            prepare_threshold=None,
+        )
 
 
 class GrowthPersistenceFallbackTests(unittest.TestCase):
