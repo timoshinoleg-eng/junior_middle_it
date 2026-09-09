@@ -50,7 +50,8 @@ jobs:
             test_content_magnets \
             test_resume_documents \
             test_interactive_runtime \
-            test_serverless_payload_runtime
+            test_serverless_payload_runtime \
+            test_referral_runtime
 
       - name: Run formatter regression script
         run: python test_formatter_fix.py
