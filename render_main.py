@@ -1,8 +1,8 @@
 """Render.com entrypoint for the interactive job bot.
 
 The health HTTP server keeps Render healthy while the long-polling Telegram bot
-runs in a worker thread. Production imports go through ``production_bot`` so the
-P1 growth foundation and P2 Resume Match extensions are both installed.
+runs in a worker thread. Production imports go through ``content_runtime`` so
+all prior growth layers plus attributable weekly content magnets are installed.
 """
 import json
 import os
@@ -28,6 +28,8 @@ def config_summary() -> dict:
         "GROWTH_DATABASE": present("GROWTH_DATABASE_URL", "DATABASE_URL"),
         "REQUIRE_DURABLE_GROWTH": os.getenv("REQUIRE_DURABLE_GROWTH", "false").lower() == "true",
         "RESUME_MATCH": True,
+        "SAVED_SEARCHES": True,
+        "CONTENT_MAGNETS": True,
         "APIFY_API_TOKEN": present("APIFY_API_TOKEN"),
         "TELEGRAM_API_ID": present("TELEGRAM_API_ID"),
         "TELEGRAM_API_HASH": present("TELEGRAM_API_HASH"),
@@ -58,7 +60,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     "cycle": None,
                 }
             try:
-                import production_bot as _cb
+                import content_runtime as _cb
                 if getattr(_cb, "CYCLE_TELEMETRY", None):
                     payload["cycle"] = dict(_cb.CYCLE_TELEMETRY)
             except Exception:
@@ -82,15 +84,15 @@ def run_bot() -> None:
         STATE["bot_thread_started"] = True
     try:
         import asyncio
-        import production_bot
+        import content_runtime
 
         with STATE_LOCK:
             STATE["bot_running"] = True
-        print("[render_main] production_bot imported, entering main()", flush=True)
-        asyncio.run(production_bot.main())
+        print("[render_main] content_runtime imported, entering main()", flush=True)
+        asyncio.run(content_runtime.main())
         with STATE_LOCK:
             STATE["bot_running"] = False
-            STATE["error"] = "production_bot.main() returned unexpectedly"
+            STATE["error"] = "content_runtime.main() returned unexpectedly"
     except BaseException as e:
         tb = traceback.format_exc()
         print(f"[render_main] BOT CRASHED: {tb}", flush=True)
