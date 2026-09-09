@@ -55,7 +55,8 @@ jobs:
             test_public_site \
             test_public_acquisition_runtime \
             test_p7_growth_metrics \
-            test_render_main
+            test_render_main \
+            test_serverless_health
 
       - name: Run formatter regression script
         run: python test_formatter_fix.py
