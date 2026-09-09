@@ -43,7 +43,18 @@ class PostgresGrowthStore:
 
     def _connect(self) -> None:
         try:
-            self.conn = psycopg.connect(self.dsn, autocommit=True, connect_timeout=8)
+            # Vercel is a serverless runtime, so production should use Supabase's
+            # Supavisor transaction pooler (port 6543). Transaction pooling does
+            # not support prepared statements; psycopg otherwise starts preparing
+            # frequently executed statements automatically after a small number of
+            # executions. Disable auto-prepare so a warm function remains safe when
+            # the underlying server connection changes between transactions.
+            self.conn = psycopg.connect(
+                self.dsn,
+                autocommit=True,
+                connect_timeout=8,
+                prepare_threshold=None,
+            )
         except Exception as exc:  # pragma: no cover - external service
             raise GrowthStoreUnavailable(f"PostgreSQL connection failed: {exc}") from exc
 
