@@ -18,9 +18,13 @@ class VercelWebhookSurfaceTests(unittest.TestCase):
         self.assertIn("/api/delivery?kind=$KIND", text)
         self.assertIn("secrets.CRON_SECRET", text)
 
-    def test_webhook_admin_is_manual_only_and_protected(self):
+    def test_webhook_admin_reconciles_only_after_green_production_smoke(self):
         text = Path(".github/workflows/webhook-admin.yml").read_text(encoding="utf-8")
         self.assertIn("workflow_dispatch:", text)
+        self.assertIn('workflows: ["Production Smoke"]', text)
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", text)
+        self.assertIn("github.event.workflow_run.head_branch == 'main'", text)
+        self.assertIn('action="enable"', text)
         self.assertNotIn("schedule:", text)
         self.assertIn("/api/webhook-admin?action=$ACTION", text)
         self.assertIn("secrets.CRON_SECRET", text)
