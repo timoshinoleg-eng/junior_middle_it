@@ -12,6 +12,7 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.old_store = spr._payload_store_instance
         spr._payload_store_instance = None
         self.duplicate_token = spr._durable_duplicate_skips.set(0)
+        self.old_telegram_sources = spr.core.Config.ENABLE_TELEGRAM_CHANNELS
 
     def tearDown(self):
         store = spr._payload_store_instance
@@ -22,6 +23,25 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 pass
         spr._payload_store_instance = self.old_store
         spr._durable_duplicate_skips.reset(self.duplicate_token)
+        spr.core.Config.ENABLE_TELEGRAM_CHANNELS = self.old_telegram_sources
+
+    def test_vercel_disables_stateful_telegram_sources_by_default(self):
+        spr.core.Config.ENABLE_TELEGRAM_CHANNELS = True
+        with patch.dict(os.environ, {"VERCEL": "1", "VERCEL_ENABLE_TELEGRAM_SOURCES": ""}, clear=False):
+            spr._configure_serverless_source_policy()
+        self.assertFalse(spr.core.Config.ENABLE_TELEGRAM_CHANNELS)
+
+    def test_vercel_can_explicitly_opt_in_telegram_sources(self):
+        spr.core.Config.ENABLE_TELEGRAM_CHANNELS = False
+        with patch.dict(os.environ, {"VERCEL": "1", "VERCEL_ENABLE_TELEGRAM_SOURCES": "true"}, clear=False):
+            spr._configure_serverless_source_policy()
+        self.assertTrue(spr.core.Config.ENABLE_TELEGRAM_CHANNELS)
+
+    def test_non_vercel_runtime_preserves_telegram_source_setting(self):
+        spr.core.Config.ENABLE_TELEGRAM_CHANNELS = True
+        with patch.dict(os.environ, {"VERCEL": "", "VERCEL_ENABLE_TELEGRAM_SOURCES": ""}, clear=False):
+            spr._configure_serverless_source_policy()
+        self.assertTrue(spr.core.Config.ENABLE_TELEGRAM_CHANNELS)
 
     async def test_serverless_post_presaves_payload_but_preserves_none_db_argument(self):
         fake_store = SimpleNamespace(

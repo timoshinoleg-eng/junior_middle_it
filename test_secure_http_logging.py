@@ -44,6 +44,51 @@ class SecureHttpLoggingTests(unittest.TestCase):
         self.assertNotIn("secret123", rendered)
         self.assertIn("api_key=<redacted>", rendered)
 
+    def test_expected_ats_404_is_demoted_to_info(self):
+        record = logging.LogRecord(
+            "channel_bot",
+            logging.ERROR,
+            __file__,
+            1,
+            "❌ Greenhouse hashicorp error: 404 Client Error: Not Found",
+            (),
+            None,
+        )
+        filt = secure.CredentialRedactionFilter()
+        self.assertTrue(filt.filter(record))
+        self.assertEqual(record.levelno, logging.INFO)
+        self.assertEqual(record.levelname, "INFO")
+
+    def test_optional_devitjobs_403_is_demoted_to_warning(self):
+        record = logging.LogRecord(
+            "channel_bot",
+            logging.ERROR,
+            __file__,
+            1,
+            "❌ DevITJobs error: 403 Client Error: Forbidden",
+            (),
+            None,
+        )
+        filt = secure.CredentialRedactionFilter()
+        self.assertTrue(filt.filter(record))
+        self.assertEqual(record.levelno, logging.WARNING)
+        self.assertEqual(record.levelname, "WARNING")
+
+    def test_actionable_source_error_stays_error(self):
+        record = logging.LogRecord(
+            "channel_bot",
+            logging.ERROR,
+            __file__,
+            1,
+            "❌ Apify USAJobs error: 500 Server Error",
+            (),
+            None,
+        )
+        filt = secure.CredentialRedactionFilter()
+        self.assertTrue(filt.filter(record))
+        self.assertEqual(record.levelno, logging.ERROR)
+        self.assertEqual(record.levelname, "ERROR")
+
 
 if __name__ == "__main__":
     unittest.main()
