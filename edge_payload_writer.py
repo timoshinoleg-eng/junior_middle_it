@@ -95,6 +95,14 @@ def _compact_list(value: object, *, max_items: int, item_limit: int) -> list[str
 
 def compact_job_payload(job_hash: str, job: Dict) -> Dict:
     """Return the bounded public/CTA payload persisted by the Edge ledger."""
+    source_published = (
+        job.get("published")
+        or job.get("created")
+        or job.get("publication_date")
+        or job.get("date_published")
+        or job.get("posted_at")
+        or job.get("posted_date")
+    )
     return {
         "hash": job_hash,
         "title": _clean_text(job.get("title"), 300),
@@ -107,6 +115,7 @@ def compact_job_payload(job_hash: str, job: Dict) -> Dict:
         "description": _clean_text(job.get("description"), 1200),
         "url": _clean_text(job.get("url"), 2000),
         "source": _clean_text(job.get("source"), 160),
+        "source_published_at": _clean_text(source_published, 100),
         "tags": _compact_list(job.get("tags"), max_items=12, item_limit=80),
         "quality_gate_status": _clean_text(job.get("quality_gate_status"), 30),
         "url_preflight_status": _clean_text(job.get("url_preflight_status"), 30),
