@@ -19,6 +19,11 @@ from serverless_health import (
     durable_growth_configured,
     missing_posting_env,
 )
+from serverless_publication_policy import (
+    install_serverless_publication_policy,
+    publication_policy_snapshot,
+    reset_publication_policy_stats,
+)
 from serverless_payload_runtime import collect_and_post_once
 from sentry_setup import init_sentry
 
@@ -62,6 +67,8 @@ class handler(BaseHTTPRequestHandler):
             return
 
         try:
+            install_serverless_publication_policy()
+            reset_publication_policy_stats()
             result = asyncio.run(
                 collect_and_post_once(
                     use_sqlite=False,
@@ -70,6 +77,7 @@ class handler(BaseHTTPRequestHandler):
             )
             result = dict(result or {})
             result["durable_growth"] = durable_growth_configured()
+            result["publication_policy"] = publication_policy_snapshot()
         except Exception as exc:
             logger.exception("Vercel cron collection failed")
             try:
