@@ -3,6 +3,11 @@ import postgres from "postgres";
 const DB_URL = Deno.env.get("SUPABASE_DB_URL") ?? "";
 const EXPECTED_BOT_USERNAME = "junior_jobs_channel_bot";
 const PROTOCOL_V2 = 2;
+// SHA-256 of the dedicated high-entropy Render -> Edge bridge key. The raw key
+// exists only in Render environment variables and is never committed or sent to Vercel.
+const RENDER_BRIDGE_KEY_SHA256 = "263c5bc11824a5a9b24954d1a7b7b95cb4112acaad42b9c7c18e89ab2c5e4a24";
+const MAX_PRIVATE_SQL_BYTES = 40_000;
+const MAX_PRIVATE_SQL_PARAMS = 80;
 const sql = postgres(DB_URL, { prepare: false, max: 1, idle_timeout: 20, connect_timeout: 10 });
 const telegramAuthCache = new Map<string, number>();
 
@@ -33,6 +38,19 @@ function jsonSafe(value: unknown): unknown {
 async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  let diff = 0;
+  for (let i = 0; i < left.length; i += 1) diff |= left.charCodeAt(i) ^ right.charCodeAt(i);
+  return diff === 0;
+}
+
+async function renderBridgeAuthorized(req: Request): Promise<boolean> {
+  const key = (req.headers.get("x-growth-key") ?? "").trim();
+  if (!key || key.length > 256 || !RENDER_BRIDGE_KEY_SHA256) return false;
+  return constantTimeEqual(await sha256Hex(key), RENDER_BRIDGE_KEY_SHA256);
 }
 
 async function telegramBotAuthorized(token: string): Promise<boolean> {
@@ -66,6 +84,84 @@ function parseJobHash(value: unknown): string {
 function parseClaimToken(value: unknown): string {
   const token = typeof value === "string" ? value.trim() : "";
   return /^[0-9a-fA-F-]{36}$/.test(token) ? token : "";
+}
+
+function validatePrivateGrowthSql(value: unknown): string {
+  const query = typeof value === "string" ? value.trim() : "";
+  if (!query || new TextEncoder().encode(query).length > MAX_PRIVATE_SQL_BYTES) return "";
+  if (/--|\/\*|\*\//.test(query)) return "";
+  const withoutTrailingSemicolon = query.replace(/;\s*$/, "");
+  if (withoutTrailingSemicolon.includes(";")) return "";
+
+  const normalized = withoutTrailingSemicolon.replace(/\s+/g, " ").trim();
+  const lower = normalized.toLowerCase();
+  if (!/^(select\b|with\b|insert\b|update\b|delete\b|create table if not exists\b|create index if not exists\b)/i.test(normalized)) return "";
+
+  // Defense in depth for a backend-only bridge key. Even with the key, this
+  // endpoint cannot reach Supabase/Auth/system schemas or execute privileged SQL.
+  const forbidden = /\b(pg_catalog|information_schema|auth\.|storage\.|vault\.|extensions\.|realtime\.|graphql\.|supabase_|create\s+(extension|function|procedure|schema|role|view)|alter\b|drop\b|truncate\b|grant\b|revoke\b|copy\b|call\b|do\s+\$|prepare\b|execute\b|deallocate\b|listen\b|notify\b|vacuum\b|set_config\b|pg_sleep\b|pg_read_file\b|pg_ls_dir\b|dblink\b|lo_import\b|lo_export\b)/i;
+  if (forbidden.test(lower)) return "";
+
+  const ctes = new Set<string>();
+  for (const match of normalized.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(/gi)) {
+    ctes.add(match[1].toLowerCase());
+  }
+
+  const relations: string[] = [];
+  const relationPatterns = [
+    /\bFROM\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
+    /\bJOIN\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
+    /\bINTO\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
+    /\bUPDATE\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
+    /\bDELETE\s+FROM\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
+    /\bCREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
+    /\bCREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+[A-Za-z_][A-Za-z0-9_]*\s+ON\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
+  ];
+  for (const pattern of relationPatterns) {
+    for (const match of normalized.matchAll(pattern)) relations.push(match[1].toLowerCase());
+  }
+  if (!relations.length) return "";
+
+  for (const relation of relations) {
+    const parts = relation.split(".");
+    if (parts.length > 2) return "";
+    if (parts.length === 2 && parts[0] !== "public") return "";
+    const name = parts.at(-1) ?? "";
+    if (!name.startsWith("growth_") && !ctes.has(name)) return "";
+  }
+  return withoutTrailingSemicolon;
+}
+
+async function privateGrowthSql(req: Request): Promise<Response> {
+  if (!(await renderBridgeAuthorized(req))) {
+    return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: jsonHeaders });
+  }
+  let body: { query?: unknown; params?: unknown };
+  try {
+    body = await req.json() as { query?: unknown; params?: unknown };
+  } catch {
+    return new Response(JSON.stringify({ error: "invalid json" }), { status: 400, headers: jsonHeaders });
+  }
+  const query = validatePrivateGrowthSql(body.query);
+  const params = Array.isArray(body.params) ? body.params : [];
+  if (!query || params.length > MAX_PRIVATE_SQL_PARAMS) {
+    return new Response(JSON.stringify({ error: "query rejected" }), { status: 400, headers: jsonHeaders });
+  }
+
+  try {
+    const result = await sql.unsafe(query, params);
+    const columns = (result.columns ?? []).map((column: { name: string }) => String(column.name));
+    const fallbackColumns = columns.length ? columns : (result.length ? Object.keys(result[0] as Record<string, unknown>) : []);
+    const rows = result.map((row: Record<string, unknown>) => fallbackColumns.map((name) => jsonSafe(row[name])));
+    return new Response(JSON.stringify({
+      rows,
+      columns: fallbackColumns,
+      rowcount: Number(result.count ?? result.length ?? 0),
+    }), { status: 200, headers: jsonHeaders });
+  } catch (error) {
+    console.error("private growth SQL failed", error instanceof Error ? error.name : "unknown");
+    return new Response(JSON.stringify({ error: "query failed" }), { status: 503, headers: jsonHeaders });
+  }
 }
 
 async function publicJobs(url: URL): Promise<Response> {
@@ -296,12 +392,18 @@ async function releaseJobPayload(req: Request): Promise<Response> {
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
   if (req.method === "GET" && url.pathname.endsWith("/health")) {
-    return new Response(JSON.stringify({ ok: Boolean(DB_URL), service: "growth-proxy", protocol: PROTOCOL_V2 }), { status: DB_URL ? 200 : 503, headers: jsonHeaders });
+    return new Response(JSON.stringify({
+      ok: Boolean(DB_URL),
+      service: "growth-proxy",
+      protocol: PROTOCOL_V2,
+      render_bridge: Boolean(RENDER_BRIDGE_KEY_SHA256),
+    }), { status: DB_URL ? 200 : 503, headers: jsonHeaders });
   }
   if (req.method === "GET" && url.pathname.endsWith("/public-jobs")) return publicJobs(url);
   if (req.method === "POST" && url.pathname.endsWith("/job-payloads/sending")) return beginSending(req);
   if (req.method === "POST" && url.pathname.endsWith("/job-payloads/published")) return markPublished(req);
   if (req.method === "POST" && url.pathname.endsWith("/job-payloads/release")) return releaseJobPayload(req);
   if (req.method === "POST" && url.pathname.endsWith("/job-payloads")) return claimJobPayload(req);
+  if (req.method === "POST" && /\/growth-proxy\/?$/.test(url.pathname)) return privateGrowthSql(req);
   return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: jsonHeaders });
 });
