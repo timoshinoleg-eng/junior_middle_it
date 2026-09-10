@@ -63,7 +63,6 @@ function validateGrowthSql(value: unknown): string {
   const normalized = statement.replace(/\s+/g, " ").trim();
   const lower = normalized.toLowerCase();
 
-  // Bot-token mode is intentionally data-only. Production migrations own DDL.
   if (!/^(select\b|with\b|insert\b|update\b|delete\b)/i.test(normalized)) return "";
   const forbidden = /\b(pg_catalog|information_schema|auth\.|storage\.|vault\.|extensions\.|realtime\.|graphql\.|supabase_|create\b|alter\b|drop\b|truncate\b|grant\b|revoke\b|copy\b|call\b|do\s+\$|prepare\b|execute\b|deallocate\b|listen\b|notify\b|vacuum\b|set_config\b|pg_sleep\b|pg_read_file\b|pg_ls_dir\b|dblink\b|lo_import\b|lo_export\b)/i;
   if (forbidden.test(lower)) return "";
@@ -79,8 +78,6 @@ function validateGrowthSql(value: unknown): string {
     /\bJOIN\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
     /\bINTO\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
     /\bDELETE\s+FROM\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
-    // Match UPDATE targets everywhere (including after WITH), but never the
-    // `UPDATE SET` fragment inside `ON CONFLICT DO UPDATE SET`.
     /\bUPDATE\s+(?!SET\b)((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
   ];
   for (const pattern of relationPatterns) {
