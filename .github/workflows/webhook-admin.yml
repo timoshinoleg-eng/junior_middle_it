@@ -1,0 +1,34 @@
+name: Telegram Webhook Admin
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Webhook action
+        required: true
+        default: status
+        type: choice
+        options:
+          - status
+          - enable
+          - disable
+
+permissions:
+  contents: read
+
+jobs:
+  webhook:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call protected webhook admin endpoint
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          ACTION: ${{ inputs.action }}
+        shell: bash
+        run: |
+          test -n "$CRON_SECRET"
+          curl --fail-with-body --silent --show-error \
+            --connect-timeout 20 --max-time 120 \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            -X POST \
+            "https://junior-middle-it.vercel.app/api/webhook-admin?action=$ACTION"
