@@ -1,8 +1,9 @@
 """Render.com entrypoint for the interactive job bot.
 
 The HTTP endpoint is a truthful liveness/readiness probe for the persistent
-Telegram worker. Production imports go through ``public_acquisition_runtime`` so
-P1-P7 are installed without changing the Vercel ingestion runtime.
+Telegram worker. Production imports go through ``durable_product_state`` so the
+full P1-P7 runtime, restart-safe workflow state, favorites and digest reads are
+installed without changing the Vercel ingestion runtime.
 """
 import json
 import os
@@ -37,6 +38,8 @@ def config_summary() -> dict:
         "RESUME_MATCH": True,
         "RESUME_PDF_DOCX": True,
         "SAVED_SEARCHES": True,
+        "DURABLE_FAVORITES": True,
+        "DURABLE_DIGEST_SOURCE": True,
         "CONTENT_MAGNETS": True,
         "PRODUCT_UTILITY_METRICS": True,
         "REFERRAL_2": True,
@@ -104,7 +107,7 @@ def health_snapshot() -> tuple[int, dict]:
             "cycle": None,
         }
     try:
-        import public_acquisition_runtime as runtime
+        import durable_product_state as runtime
         if getattr(runtime, "CYCLE_TELEMETRY", None):
             payload["cycle"] = dict(runtime.CYCLE_TELEMETRY)
     except Exception:
@@ -147,13 +150,13 @@ def run_bot(exit_fn: Callable[[int], None] = os._exit) -> None:
         # Install the authenticated HTTP-backed PostgreSQL transport before the
         # P1-P7 runtime modules bind PostgresGrowthStore into their classes.
         import http_growth_patch  # noqa: F401
-        import public_acquisition_runtime
+        import durable_product_state
 
         with STATE_LOCK:
             STATE["bot_running"] = True
             STATE["error"] = None
-        print("[render_main] public_acquisition_runtime imported, entering main()", flush=True)
-        asyncio.run(public_acquisition_runtime.main())
+        print("[render_main] durable_product_state imported, entering main()", flush=True)
+        asyncio.run(durable_product_state.main())
         _set_runtime_failure("bot_runtime_returned")
         print("[render_main] BOT STOPPED: main() returned unexpectedly", flush=True)
         exit_fn(1)
