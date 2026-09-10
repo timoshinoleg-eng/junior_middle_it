@@ -8,6 +8,11 @@ Before Telegram publication the adapter claims the vacancy hash. Existing
 claims are skipped. If Telegram publication fails, the claim is released so a
 later cron run can retry safely. Durable duplicate skips are tracked per
 collector invocation so they are reported as duplicates, never as failed posts.
+
+Telethon source collection is stateful and is therefore disabled on Vercel by
+default. It may be explicitly re-enabled only with
+``VERCEL_ENABLE_TELEGRAM_SOURCES=true`` when a serverless-safe session strategy
+has been provisioned.
 """
 from __future__ import annotations
 
@@ -34,11 +39,20 @@ _durable_duplicate_skips: ContextVar[int] = ContextVar(
     "durable_duplicate_skips",
     default=0,
 )
+_TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 def _durable_dsn_configured() -> bool:
     value = (os.getenv("GROWTH_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
     return value.startswith(("postgresql://", "postgres://"))
+
+
+def _configure_serverless_source_policy() -> None:
+    """Disable stateful Telethon source collection on Vercel unless opted in."""
+    if not (os.getenv("VERCEL") or "").strip():
+        return
+    opt_in = (os.getenv("VERCEL_ENABLE_TELEGRAM_SOURCES") or "").strip().lower()
+    core.Config.ENABLE_TELEGRAM_CHANNELS = opt_in in _TRUE_VALUES
 
 
 def _payload_store() -> Optional[runtime.DatabaseConnection]:
@@ -110,6 +124,7 @@ async def post_job_with_durable_payload(bot, job, db=None) -> bool:
 
 async def collect_and_post_once(*args, **kwargs):
     """Run the core collector and reconcile durable duplicate telemetry."""
+    _configure_serverless_source_policy()
     token = _durable_duplicate_skips.set(0)
     try:
         result = await _ORIGINAL_COLLECT_AND_POST_ONCE(*args, **kwargs)
