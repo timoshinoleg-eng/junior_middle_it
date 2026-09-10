@@ -79,10 +79,10 @@ function validateGrowthSql(value: unknown): string {
     /\bJOIN\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
     /\bINTO\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
     /\bDELETE\s+FROM\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
-    /^UPDATE\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/i,
+    /^UPDATE\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
   ];
   for (const pattern of relationPatterns) {
-    for (const match of normalized.matchAll(pattern as RegExp)) relations.push(match[1].toLowerCase());
+    for (const match of normalized.matchAll(pattern)) relations.push(match[1].toLowerCase());
   }
   if (!relations.length) return "";
 
