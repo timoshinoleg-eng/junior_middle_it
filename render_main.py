@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, List
+from typing import Callable, List, Tuple
 
 os.environ.setdefault("DISABLE_FILE_LOG", "true")
 
@@ -50,6 +50,34 @@ def config_summary() -> dict:
         "DEDUP_MODE": os.getenv("DEDUP_MODE", "sqlite"),
         "CHECK_INTERVAL": os.getenv("CHECK_INTERVAL", "1800"),
     }
+
+
+def durable_growth_preflight() -> Tuple[bool, str]:
+    """Validate the private HTTPS growth bridge without exposing endpoint/key.
+
+    Direct PostgreSQL DSNs are validated by the normal runtime constructor. This
+    preflight exists specifically for Render's passwordless HTTPS bridge and can
+    therefore run even while Telegram credentials are still being provisioned.
+    """
+    endpoint = (os.getenv("GROWTH_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
+    if not endpoint.startswith("https://"):
+        return True, "not_http_bridge"
+    try:
+        from http_growth_patch import RemoteGrowthConnection
+
+        conn = RemoteGrowthConnection(
+            endpoint,
+            (os.getenv("GROWTH_HTTP_KEY") or "").strip(),
+            timeout=10.0,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM growth_user_settings LIMIT 0")
+        finally:
+            conn.close()
+        return True, "ok"
+    except Exception as exc:
+        return False, type(exc).__name__
 
 
 STATE = {
@@ -137,6 +165,17 @@ def run_bot(exit_fn: Callable[[int], None] = os._exit) -> None:
 
 
 def main() -> None:
+    require_durable = os.getenv("REQUIRE_DURABLE_GROWTH", "false").lower() == "true"
+    growth_ok, growth_status = durable_growth_preflight()
+    if (os.getenv("GROWTH_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip().startswith("https://"):
+        print(
+            "[render_main] durable growth bridge preflight: "
+            + ("ok" if growth_ok else f"failed:{growth_status}"),
+            flush=True,
+        )
+    if require_durable and not growth_ok:
+        raise SystemExit(3)
+
     missing = missing_required_env()
     if missing:
         print(
