@@ -1,8 +1,7 @@
 import io
 import json
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from api import webhook as api_webhook
 
@@ -31,8 +30,8 @@ class WebhookApiContractTests(unittest.TestCase):
         self.assertEqual(fake.status, 401)
         process.assert_not_called()
 
-    def test_busy_update_returns_503_for_telegram_retry(self):
-        body = json.dumps({"update_id": 2}).encode()
+    def _run_state(self, state, update_id=2):
+        body = json.dumps({"update_id": update_id}).encode()
         fake = FakeHandler(
             body=body,
             headers={
@@ -40,27 +39,24 @@ class WebhookApiContractTests(unittest.TestCase):
                 "X-Telegram-Bot-Api-Secret-Token": "secret",
             },
         )
+        sentinel = object()
+        process = MagicMock(return_value=sentinel)
         with patch.object(api_webhook, "webhook_secret_valid", return_value=True), patch.object(
-            api_webhook.asyncio, "run", return_value="busy"
-        ):
+            api_webhook, "process_update_payload", process
+        ), patch.object(api_webhook.asyncio, "run", return_value=state) as run:
             api_webhook.handler.do_POST(fake)
+        process.assert_called_once()
+        run.assert_called_once_with(sentinel)
+        return fake
+
+    def test_busy_update_returns_503_for_telegram_retry(self):
+        fake = self._run_state("busy", update_id=2)
         self.assertEqual(fake.status, 503)
         self.assertEqual(fake.payload["error"], "update_busy")
 
     def test_processed_and_duplicate_updates_acknowledge_with_200(self):
         for state in ("processed", "duplicate"):
-            body = json.dumps({"update_id": 3}).encode()
-            fake = FakeHandler(
-                body=body,
-                headers={
-                    "content-length": str(len(body)),
-                    "X-Telegram-Bot-Api-Secret-Token": "secret",
-                },
-            )
-            with patch.object(api_webhook, "webhook_secret_valid", return_value=True), patch.object(
-                api_webhook.asyncio, "run", return_value=state
-            ):
-                api_webhook.handler.do_POST(fake)
+            fake = self._run_state(state, update_id=3)
             self.assertEqual(fake.status, 200)
             self.assertEqual(fake.payload["status"], state)
 
@@ -73,10 +69,13 @@ class WebhookApiContractTests(unittest.TestCase):
                 "X-Telegram-Bot-Api-Secret-Token": "secret",
             },
         )
+        sentinel = object()
+        process = MagicMock(return_value=sentinel)
         with patch.object(api_webhook, "webhook_secret_valid", return_value=True), patch.object(
-            api_webhook.asyncio, "run", side_effect=RuntimeError("boom")
-        ):
+            api_webhook, "process_update_payload", process
+        ), patch.object(api_webhook.asyncio, "run", side_effect=RuntimeError("boom")):
             api_webhook.handler.do_POST(fake)
+        process.assert_called_once()
         self.assertEqual(fake.status, 503)
         self.assertEqual(fake.payload["error"], "temporarily_unavailable")
 
