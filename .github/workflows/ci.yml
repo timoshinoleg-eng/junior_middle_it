@@ -59,6 +59,7 @@ jobs:
             test_durable_runtime_state \
             test_durable_product_state \
             test_interactive_webhook_runtime \
+            test_api_webhook_contract \
             test_scheduled_delivery_runtime \
             test_telegram_webhook_admin \
             test_p7_growth_metrics \
