@@ -25,13 +25,21 @@ class VercelWebhookSurfaceTests(unittest.TestCase):
         self.assertIn("/api/webhook-admin?action=$ACTION", text)
         self.assertIn("secrets.CRON_SECRET", text)
 
-    def test_webhook_runtime_never_calls_polling_main_or_application_start(self):
+    def test_webhook_runtime_never_starts_background_runtime(self):
         text = Path("interactive_webhook_runtime.py").read_text(encoding="utf-8")
         self.assertNotIn("run_polling(", text)
         self.assertNotIn("run_webhook(", text)
-        self.assertNotIn("core.main()", text.replace("``core.main()``", ""))
+        self.assertNotIn("core.main()", text)
         self.assertNotIn("await application.start()", text)
         self.assertIn("await application.process_update(update)", text)
+
+    def test_interactive_edge_validator_catches_cte_update_targets_without_rejecting_upsert(self):
+        text = Path("supabase/functions/interactive-growth-proxy/index.ts").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(r"/\bUPDATE\s+(?!SET\b)", text)
+        self.assertNotIn(r"/^UPDATE\s+", text)
+        self.assertIn("ON CONFLICT DO UPDATE SET", text)
 
 
 if __name__ == "__main__":
