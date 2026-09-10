@@ -1,9 +1,10 @@
-"""Authenticated HTTP transport for the durable growth store on Render.
+"""Authenticated HTTP transport for durable growth state.
 
-Render may use the Supabase ``growth-proxy`` Edge Function instead of receiving
-raw PostgreSQL credentials. The private bridge key exists only in Render. This
-adapter preserves the cursor API expected by the P1-P7 runtime while pinning the
-remote endpoint to HTTPS Supabase hosts and bounding request/response sizes.
+Render uses the private ``growth-proxy`` with a dedicated ``X-Growth-Key``.
+The Vercel interactive webhook uses a separate ``interactive-growth-proxy`` and
+its already-secret Telegram bot token. In webhook mode schema bootstrap DDL is
+handled as a local no-op because production migrations own the schema; the
+remote endpoint only accepts data/query operations on ``growth_*`` relations.
 """
 from __future__ import annotations
 
@@ -22,12 +23,21 @@ from growth_store import GrowthStoreUnavailable, PostgresGrowthStore
 
 
 _PLACEHOLDER_RE = re.compile(r"%s")
+_SCHEMA_BOOTSTRAP_RE = re.compile(
+    r"^\s*(?:"
+    r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(?:public\.)?growth_[A-Za-z0-9_]+\b"
+    r"|CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+[A-Za-z_][A-Za-z0-9_]*\s+ON\s+(?:public\.)?growth_[A-Za-z0-9_]+\b"
+    r")",
+    re.IGNORECASE,
+)
 MAX_REQUEST_BYTES = 40_000
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_PARAMS = 80
+_RENDER_MODE = "render"
+_TELEGRAM_MODE = "telegram"
 
 
-def _safe_growth_proxy_url(value: str) -> str:
+def _safe_proxy_url(value: str, expected_suffix: str) -> str:
     raw = str(value or "").strip().rstrip("/")
     try:
         parsed = urlsplit(raw)
@@ -36,11 +46,18 @@ def _safe_growth_proxy_url(value: str) -> str:
     host = (parsed.hostname or "").lower()
     if parsed.scheme != "https" or not host.endswith(".supabase.co"):
         return ""
-    expected_suffix = "/functions/v1/growth-proxy"
     path = parsed.path.rstrip("/")
     if path != expected_suffix:
         return ""
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _safe_growth_proxy_url(value: str) -> str:
+    return _safe_proxy_url(value, "/functions/v1/growth-proxy")
+
+
+def _safe_interactive_proxy_url(value: str) -> str:
+    return _safe_proxy_url(value, "/functions/v1/interactive-growth-proxy")
 
 
 def _json_value(value: Any) -> Any:
@@ -79,6 +96,16 @@ def _convert_placeholders(query: str, params: Iterable[Any]) -> tuple[str, list[
     return converted, [_json_value(v) for v in values]
 
 
+def _is_schema_bootstrap(query: str) -> bool:
+    """Recognize only idempotent growth schema bootstrap issued by constructors."""
+    normalized = str(query or "").strip().rstrip(";").strip()
+    if not _SCHEMA_BOOTSTRAP_RE.match(normalized):
+        return False
+    if ";" in normalized or "--" in normalized or "/*" in normalized:
+        return False
+    return True
+
+
 class RemoteGrowthCursor:
     def __init__(self, connection: "RemoteGrowthConnection"):
         self.connection = connection
@@ -95,6 +122,16 @@ class RemoteGrowthCursor:
 
     def execute(self, query: str, params=()):
         converted, values = _convert_placeholders(query, params or ())
+        if self.connection.auth_mode == _TELEGRAM_MODE and _is_schema_bootstrap(converted):
+            # Production schema is migration-owned. Constructors still issue
+            # CREATE IF NOT EXISTS for legacy direct-Postgres compatibility;
+            # never forward DDL through a bot-token endpoint.
+            self._rows = []
+            self._index = 0
+            self.rowcount = 0
+            self.columns = []
+            return self
+
         payload = json.dumps(
             {"query": converted, "params": values},
             ensure_ascii=False,
@@ -109,8 +146,8 @@ class RemoteGrowthCursor:
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "X-Growth-Key": self.connection.key,
-                "User-Agent": "junior-middle-it-render/2.0",
+                "User-Agent": "junior-middle-it-growth/3.0",
+                self.connection.auth_header: self.connection.credential,
             },
         )
         try:
@@ -160,20 +197,39 @@ class RemoteGrowthCursor:
 
 
 class RemoteGrowthConnection:
-    def __init__(self, url: str, key: str, timeout: float = 15.0):
-        safe_url = _safe_growth_proxy_url(url)
+    def __init__(
+        self,
+        url: str,
+        credential: str,
+        timeout: float = 15.0,
+        *,
+        auth_mode: str = _RENDER_MODE,
+    ):
+        mode = str(auth_mode or _RENDER_MODE).strip().lower()
+        if mode not in {_RENDER_MODE, _TELEGRAM_MODE}:
+            raise GrowthStoreUnavailable("Unsupported growth proxy auth mode")
+        safe_url = (
+            _safe_interactive_proxy_url(url)
+            if mode == _TELEGRAM_MODE
+            else _safe_growth_proxy_url(url)
+        )
         if not safe_url:
+            expected = "interactive-growth-proxy" if mode == _TELEGRAM_MODE else "growth-proxy"
             raise GrowthStoreUnavailable(
-                "Growth proxy must be the HTTPS Supabase growth-proxy endpoint"
+                f"Growth proxy must be the HTTPS Supabase {expected} endpoint"
             )
+        secret = str(credential or "").strip()
+        if not secret or len(secret) > 256:
+            raise GrowthStoreUnavailable("Growth proxy credential is missing or invalid")
         self.url = safe_url
-        self.key = str(key or "").strip()
+        self.credential = secret
+        self.key = secret  # backward-compatible alias for Render callers/tests
         self.timeout = float(timeout)
+        self.auth_mode = mode
+        self.auth_header = (
+            "X-Telegram-Bot-Token" if mode == _TELEGRAM_MODE else "X-Growth-Key"
+        )
         self.closed = False
-        if not self.key:
-            raise GrowthStoreUnavailable("GROWTH_HTTP_KEY is missing")
-        if len(self.key) > 256:
-            raise GrowthStoreUnavailable("GROWTH_HTTP_KEY is invalid")
 
     def cursor(self):
         if self.closed:
@@ -185,17 +241,28 @@ class RemoteGrowthConnection:
 
 
 class HttpPostgresGrowthStore(PostgresGrowthStore):
-    """PostgresGrowthStore using the authenticated Edge transport."""
+    """PostgresGrowthStore using one of the authenticated Edge transports."""
 
     def _connect(self) -> None:
-        key = (os.getenv("GROWTH_HTTP_KEY") or "").strip()
-        self.conn = RemoteGrowthConnection(self.dsn, key)
+        mode = (os.getenv("GROWTH_HTTP_AUTH_MODE") or _RENDER_MODE).strip().lower()
+        credential = (
+            (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+            if mode == _TELEGRAM_MODE
+            else (os.getenv("GROWTH_HTTP_KEY") or "").strip()
+        )
+        self.conn = RemoteGrowthConnection(self.dsn, credential, auth_mode=mode)
 
 
 def install() -> bool:
-    """Patch the later runtime layers only for the exact HTTPS Edge endpoint."""
+    """Patch the store only for the exact endpoint matching the selected auth mode."""
     endpoint = (os.getenv("GROWTH_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
-    if not _safe_growth_proxy_url(endpoint):
+    mode = (os.getenv("GROWTH_HTTP_AUTH_MODE") or _RENDER_MODE).strip().lower()
+    valid = (
+        bool(_safe_interactive_proxy_url(endpoint))
+        if mode == _TELEGRAM_MODE
+        else bool(_safe_growth_proxy_url(endpoint))
+    )
+    if not valid:
         return False
     growth_store.PostgresGrowthStore = HttpPostgresGrowthStore
     return True
