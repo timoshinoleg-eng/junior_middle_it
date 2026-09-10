@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 from urllib.parse import urlsplit, urlunsplit
 
 from secure_http_logging import configure_sensitive_http_logging
@@ -112,8 +112,8 @@ def _runtime():
 
     if not http_growth_patch.install():
         raise RuntimeError("interactive growth transport refused endpoint")
-    # Defensive support for test/warm-process import order. DatabaseConnection
-    # resolves this module global when instantiated.
+    # Defensive support for warm/test import order. DatabaseConnection resolves
+    # this module global when instantiated.
     import channel_bot_v2
 
     channel_bot_v2.PostgresGrowthStore = http_growth_patch.HttpPostgresGrowthStore
@@ -123,8 +123,8 @@ def _runtime():
     return runtime, core
 
 
-def build_application():
-    """Build handlers without polling, collector loop, or PTB JobQueue startup."""
+def build_runtime():
+    """Build handlers and durable DB without starting polling or PTB JobQueue."""
     runtime, core = _runtime()
     from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
@@ -173,6 +173,12 @@ def build_application():
             job_bot.handle_setup_text,
         )
     )
+    return application, db, job_bot
+
+
+def build_application():
+    """Compatibility helper used by tests and narrow callers."""
+    application, db, _job_bot = build_runtime()
     return application, db
 
 
@@ -185,7 +191,8 @@ class TelegramUpdateLedger:
             raise RuntimeError("update ledger requires durable growth backend")
         self.store = store
 
-    def claim(self, update_id: int) -> bool:
+    def claim(self, update_id: int) -> str:
+        """Return ``claimed``, ``processed`` or ``busy`` for one update id."""
         uid = int(update_id)
         with self.store._ensure_conn().cursor() as cur:
             cur.execute(
@@ -204,13 +211,20 @@ class TelegramUpdateLedger:
                 """,
                 (uid,),
             )
-            claimed = bool(cur.fetchone())
-            if claimed:
+            if cur.fetchone():
                 cur.execute(
                     "DELETE FROM growth_telegram_updates "
                     "WHERE state='processed' AND processed_at < NOW() - INTERVAL '30 days'"
                 )
-            return claimed
+                return "claimed"
+            cur.execute(
+                "SELECT state FROM growth_telegram_updates WHERE update_id=%s LIMIT 1",
+                (uid,),
+            )
+            row = cur.fetchone()
+        if row and str(row[0]) == "processed":
+            return "processed"
+        return "busy"
 
     def complete(self, update_id: int) -> None:
         with self.store._ensure_conn().cursor() as cur:
@@ -238,18 +252,29 @@ def _parse_update_id(payload: Dict[str, Any]) -> int:
 
 
 async def process_update_payload(payload: Dict[str, Any]) -> str:
-    """Process one Telegram update. Returns ``processed`` or ``duplicate``."""
+    """Process one Telegram update and preserve retryability on handler failure."""
     if not isinstance(payload, dict):
         raise ValueError("Telegram update must be an object")
     update_id = _parse_update_id(payload)
-    application, db = build_application()
+    application, db, _job_bot = build_runtime()
     ledger = TelegramUpdateLedger(db)
-    if not ledger.claim(update_id):
+    claim_state = ledger.claim(update_id)
+    if claim_state == "processed":
         db.close()
         return "duplicate"
+    if claim_state == "busy":
+        db.close()
+        return "busy"
 
     from telegram import Update
 
+    handler_errors: list[BaseException] = []
+
+    async def capture_error(_update, context):
+        error = getattr(context, "error", None)
+        handler_errors.append(error if isinstance(error, BaseException) else RuntimeError("handler failed"))
+
+    application.add_error_handler(capture_error)
     try:
         update = Update.de_json(payload, application.bot)
         if update is None:
@@ -257,6 +282,8 @@ async def process_update_payload(payload: Dict[str, Any]) -> str:
         async with application:
             # Deliberately no application.start(): start() would launch JobQueue.
             await application.process_update(update)
+        if handler_errors:
+            raise RuntimeError("Telegram update handler failed") from handler_errors[0]
         ledger.complete(update_id)
         return "processed"
     finally:
