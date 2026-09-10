@@ -1,0 +1,53 @@
+name: Telegram Delivery
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+    - cron: "15 10 * * 1"
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Delivery kind
+        required: true
+        default: daily
+        type: choice
+        options:
+          - daily
+          - weekly
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-delivery-${{ github.event.schedule || inputs.kind || 'manual' }}
+  cancel-in-progress: false
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve delivery kind
+        id: kind
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            kind="${{ inputs.kind }}"
+          elif [[ "${{ github.event.schedule }}" == "15 10 * * 1" ]]; then
+            kind="weekly"
+          else
+            kind="daily"
+          fi
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+
+      - name: Run protected production delivery
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          KIND: ${{ steps.kind.outputs.kind }}
+        shell: bash
+        run: |
+          test -n "$CRON_SECRET"
+          curl --fail-with-body --silent --show-error \
+            --connect-timeout 20 --max-time 290 \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            -X POST \
+            "https://junior-middle-it.vercel.app/api/delivery?kind=$KIND"
