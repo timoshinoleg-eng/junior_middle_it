@@ -1,7 +1,8 @@
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import public_acquisition_runtime as p7
 
@@ -139,6 +140,35 @@ class DurableRuntimeStateTests(unittest.TestCase):
                 )
         finally:
             db.close()
+
+
+class DurableRuntimeStateAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_successful_saved_search_callback_consumes_pending_state(self):
+        db = FakeStateDB()
+        bot = p7.JobBot(object(), db)
+        bot.pending_saved_searches[77] = {
+            "name": "Python junior",
+            "categories": ["backend"],
+            "skills": "python",
+            "min_salary_filter": 0,
+            "hide_senior": True,
+        }
+        update = SimpleNamespace(
+            callback_query=SimpleNamespace(data="saved_search_from_resume"),
+            effective_user=SimpleNamespace(id=77),
+        )
+        context = SimpleNamespace()
+
+        with patch.object(
+            p7.referral.JobBot,
+            "handle_callback",
+            new=AsyncMock(return_value=None),
+        ) as parent:
+            await bot.handle_callback(update, context)
+
+        parent.assert_awaited_once_with(update, context)
+        self.assertNotIn(77, bot.pending_saved_searches)
+        self.assertNotIn((77, "pending_saved_search"), db.rows)
 
 
 if __name__ == "__main__":
