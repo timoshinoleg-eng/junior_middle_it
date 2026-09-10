@@ -1,113 +1,153 @@
 # Production infrastructure — P7
 
-This runbook describes the production topology for `junior_middle_it` after P7.
-No credentials belong in the repository.
+This runbook records the verified production topology for `junior_middle_it`.
+No credentials, database passwords, Telegram tokens or private bridge keys belong in the repository.
 
 ## Topology
 
-- **Vacancy ingestion/publication:** Vercel Python function `/api/cron`, triggered by GitHub Actions.
+- **Vacancy ingestion/publication:** Vercel Python `/api/cron`, triggered only by GitHub Actions.
 - **Public acquisition:** Vercel `/` -> `/api/site`.
-- **Durable growth/product state:** Supabase PostgreSQL.
-- **Telegram interactive bot:** long-polling runtime (`render_main.py`) only on an always-on host.
-- **Vacancy collection dedup/cache:** existing runtime-specific behavior remains unchanged.
+- **Durable state:** Supabase PostgreSQL, exposed through narrowly scoped Edge contracts.
+- **Vercel -> Supabase writes:** `growth-proxy` job-payload API authenticated with the production Telegram bot identity.
+- **Public site reads:** read-only `growth-proxy/public-jobs` projection.
+- **Interactive Telegram bot:** long-polling `render_main.py`; requires an always-on host.
+- **Render -> Supabase interactive state:** authenticated private `growth-proxy` SQL bridge restricted to `growth_*` relations.
 
 Supabase production project:
 
 - project: `junior-middle-it-growth`
-- project ref: `uucjptyqfsdzqsftgiro`
+- ref: `uucjptyqfsdzqsftgiro`
 - region: Frankfurt / `eu-central-1`
 
-## Current production state — 2026-09-09
+Canonical web production:
 
-- Vercel collector is working: a verified scheduled run fetched 6866 vacancies,
-  selected 18 and posted all 18 with `failed=0`.
-- Vercel has the Telegram posting credentials required by the collector.
-- Supabase schema is applied and healthy, but no durable P7 rows are present yet;
-  `GROWTH_DATABASE_URL` still needs to be configured in the Vercel environment.
-- Render Free deployment is intentionally fail-closed because the required
-  `TELEGRAM_BOT_TOKEN` and `CHANNEL_ID` are not configured there.
-- A sleeping/free web service is not a production-safe home for Telegram long
-  polling. Use an always-on service for polling, or move the interactive bot to
-  a stateless/durable webhook architecture.
+- `https://junior-middle-it.vercel.app`
 
-## Applied database migrations
+## Verified production state — 2026-09-10
 
-The following migrations are already applied to the production Supabase project
-and are committed under `supabase/migrations/`:
+### Vercel
 
-1. `20260909120448_p7_growth_production_foundation.sql`
-2. `20260909121036_p7_product_runtime_tables.sql`
+- canonical `/` and `/robots.txt` serve the current application;
+- `/api/cron` is Bearer-protected;
+- GitHub Actions is the single scheduler at 00/06/12/18 UTC;
+- routing uses file-based Python functions with `framework: null`;
+- public vacancy landing reads published payloads from Supabase Edge;
+- the durable publication protocol v2 has completed a real production cycle with a new vacancy:
+  `posted=1`, `failed=0`, and all durable protocol failure counters were zero;
+- after that run Supabase contained 20 `published`, 0 `pending`, 0 `sending` job payloads.
 
-They create durable backend-only state for:
+### Supabase
+
+Backend-only growth tables cover:
 
 - user settings;
 - referrals;
-- product/growth events;
+- growth/product events;
 - migration metadata;
-- public vacancy payloads;
-- saved searches.
+- vacancy payloads;
+- saved searches;
+- short-lived interactive runtime state.
 
-RLS is enabled and `anon` / `authenticated` receive no table privileges. These
-tables are intentionally server-side only; no public Data API policy is required.
+RLS is enabled and `anon` / `authenticated` have no DML privileges on backend-only growth tables.
 
-## PostgreSQL connection
+`growth_runtime_state` stores only expiring workflow metadata:
 
-Use a Supabase PostgreSQL DSN in `GROWTH_DATABASE_URL`.
+- `setup_step`: 24 hours;
+- `resume_session`: 2 hours, **job hash only**;
+- `pending_saved_search`: 24 hours, normalized search filters only.
 
-For a persistent backend on infrastructure without guaranteed IPv6, prefer the
-project's Frankfurt Supavisor session-pooler connection. For serverless
-functions, use the supported pooler connection recommended by Supabase for that
-runtime. Keep SSL enabled and never commit the password or DSN.
+Resume text and PDF/DOCX bytes are never persisted by this runtime-state layer.
 
-The application also accepts `DATABASE_URL` as a compatibility fallback, but
-`GROWTH_DATABASE_URL` is the canonical variable for this project.
+### Supabase Edge `growth-proxy`
 
-## Vercel variables
+The production Edge function is protocol v2 and has four separate responsibilities:
 
-The scheduled ingestion runtime and public P7 landing must use the same durable
-vacancy payload store:
+1. read-only public `/public-jobs` projection;
+2. Telegram-identity-authenticated durable job-payload publication API;
+3. protocol-v2 `pending -> sending -> published` state transitions;
+4. a private Render growth-state bridge authenticated by a dedicated bridge key.
+
+The private bridge stores only a SHA-256 verifier in source. The raw key exists only in Render environment configuration. Its SQL surface is restricted to `growth_*` relations/local CTEs, one bounded statement per request, with system/Auth/Storage/Vault schemas and privileged SQL rejected.
+
+### Render interactive runtime
+
+Current service:
+
+- service: `junior-middle-it-bot`;
+- region: Frankfurt;
+- plan: Free;
+- branch: `main`;
+- start: `python render_main.py`.
+
+Verified startup sequence:
 
 ```text
-TELEGRAM_BOT_TOKEN=...
-CHANNEL_ID=...
-CRON_SECRET=...
+[render_main] durable growth bridge preflight: ok
+[render_main] missing required environment: TELEGRAM_BOT_TOKEN
+```
+
+Therefore the Render -> Supabase durable bridge is production-proven. `CHANNEL_ID`, `BOT_USERNAME`, durable growth endpoint/key and `REQUIRE_DURABLE_GROWTH=true` are configured. The remaining credential blocker is the interactive runtime's `TELEGRAM_BOT_TOKEN`.
+
+The service is intentionally fail-closed while that token is absent.
+
+**Important:** Render Free sleeps and is not a production-safe long-polling host. Do not treat the interactive bot as live until an always-on polling host is selected or the architecture is intentionally moved to a durable webhook runtime.
+
+## Applied Supabase migrations
+
+Production migration history includes:
+
+1. `20260909120448_p7_growth_production_foundation.sql`
+2. `20260909121036_p7_product_runtime_tables.sql`
+3. `20260910093335_p7_durable_publication_state.sql`
+4. `20260910103116_p7_runtime_state_foundation.sql`
+5. `20260910103148_noop_check.sql` — historical no-op marker
+6. `20260910103205_p7_runtime_state_cleanup_guard.sql` — historical harmless guard
+
+The two marker migrations are retained in the repository only to keep migration history aligned with production.
+
+## Vercel contract
+
+Production uses the hosted Edge projection rather than exporting a Supabase database password to Vercel.
+
+Operational settings include:
+
+```text
+TELEGRAM_BOT_TOKEN=<secret>
+CHANNEL_ID=<channel>
+CRON_SECRET=<secret>
 BOT_USERNAME=junior_jobs_channel_bot
-GROWTH_DATABASE_URL=postgresql://...
-PUBLIC_SITE_URL=https://<production-host>/
+GROWTH_PUBLIC_URL=https://uucjptyqfsdzqsftgiro.supabase.co/functions/v1/growth-proxy
 ```
 
-### Vercel readiness
+`PUBLIC_SITE_URL` is optional: the site derives the canonical production URL from Vercel system environment when no explicit override is set.
 
-`/api/health` is deliberately strict:
+## Render interactive contract
 
-- `collector_ready=true` means Telegram posting + cron authorization are configured;
-- `durable_growth=true` means a PostgreSQL DSN is configured;
-- `public_acquisition_ready=true` requires the durable store plus `BOT_USERNAME`;
-- HTTP 200 / `ok=true` means the complete P7 serverless contract is configured;
-- incomplete P7 configuration returns HTTP 503 without exposing credential values.
-
-The cron endpoint remains usable while durable growth is being wired so existing
-vacancy publication is not interrupted. Its response includes
-`durable_growth: true|false` for observability.
-
-### Cron authorization
-
-`/api/cron` requires:
+The persistent polling runtime needs:
 
 ```text
-Authorization: Bearer <CRON_SECRET>
+TELEGRAM_BOT_TOKEN=<secret>
+CHANNEL_ID=@junior_middle_it
+BOT_USERNAME=junior_jobs_channel_bot
+GROWTH_DATABASE_URL=https://uucjptyqfsdzqsftgiro.supabase.co/functions/v1/growth-proxy
+GROWTH_HTTP_KEY=<private secret>
+REQUIRE_DURABLE_GROWTH=true
+ADMIN_USER_ID=<optional admin id>
 ```
 
-Query-string secrets are not accepted. If `CRON_SECRET`, `TELEGRAM_BOT_TOKEN` or
-`CHANNEL_ID` is missing, the endpoint fails before running the expensive source
-collection. Internal exceptions are logged/Sentry-captured but the HTTP response
-contains only `internal_error`, never a traceback.
+`render_main.py` fails closed:
 
-## Single scheduler
+- private durable growth is preflighted before polling starts;
+- missing required Telegram configuration prevents startup;
+- worker crash/return terminates the service non-zero;
+- `/health` is 200 only while the Telegram worker is actually running;
+- health/config output contains presence flags only, never secret values.
 
-There must be exactly one production scheduler.
+## Scheduler
 
-The canonical scheduler is `.github/workflows/vercel-cron.yml`, four times daily:
+There must be exactly one production vacancy scheduler.
+
+`.github/workflows/vercel-cron.yml` runs at:
 
 ```text
 00:00 UTC
@@ -116,74 +156,38 @@ The canonical scheduler is `.github/workflows/vercel-cron.yml`, four times daily
 18:00 UTC
 ```
 
-It calls `https://junior-middle-it.vercel.app/api/cron` with the GitHub Actions
-`CRON_SECRET`. `vercel.json` contains routing only and must not also define a
-Vercel cron, otherwise 06:00 UTC can be triggered twice.
+It calls the canonical `/api/cron` with `Authorization: Bearer <CRON_SECRET>`.
+`vercel.json` must not define a second cron schedule.
 
-`vercel.json` routes:
+## Production smoke gates
 
-- `/` -> `/api/site`
-- `/robots.txt` -> `/api/robots`
+Serverless/public gates:
 
-## Render / interactive bot variables
+1. canonical `/` returns the vacancy landing;
+2. `/robots.txt` is present;
+3. `/api/health` reflects collector/public readiness without exposing secrets;
+4. unauthenticated `/api/cron` returns 401;
+5. authenticated collector runs return 200;
+6. durable protocol ends with no stranded `pending`/`sending` rows;
+7. public landing displays only `published` payloads;
+8. `web_home`, `web_<hash>` and `resume_<hash>` links are generated correctly.
 
-If long polling is retained, the host must be always-on and have:
+Interactive gates, to run once an always-on Telegram runtime is enabled:
 
-```text
-TELEGRAM_BOT_TOKEN=...
-CHANNEL_ID=...
-BOT_USERNAME=junior_jobs_channel_bot
-ADMIN_USER_ID=...
-GROWTH_DATABASE_URL=postgresql://...
-REQUIRE_DURABLE_GROWTH=true
-```
+1. `web_home` records acquisition attribution;
+2. `web_<hash>` reconstructs the same durable vacancy;
+3. `resume_<hash>` starts Resume Match exactly once;
+4. text/PDF/DOCX Resume Match works without persisting resume contents;
+5. `/setup` resumes after a worker restart;
+6. selected Resume Match vacancy resumes after restart via `job_hash`;
+7. pending Saved Search remains available after restart and is consumed after save;
+8. `/stats_growth` continues using mature first-start/activation cohorts.
 
-`render_main.py` fails closed:
+## Remaining production decision
 
-- required Telegram env is checked before the HTTP port is bound;
-- worker crash/return terminates the process non-zero;
-- `/health` returns 200 only while the worker is actually running;
-- health output contains presence flags only, not token/channel/DSN values.
+Serverless ingestion, public acquisition and durable storage are operational. The remaining P7 rollout decision is the interactive Telegram runtime:
 
-Do not enable `REQUIRE_DURABLE_GROWTH=true` until the DSN is verified.
+- keep long polling and move it to an always-on service, **or**
+- intentionally redesign it as a durable webhook runtime.
 
-## Legacy SQLite migration
-
-If an always-on interactive host has historical `jobs.db` growth state, migrate
-it before enforcing durable-only mode:
-
-```bash
-GROWTH_DATABASE_URL='postgresql://...' \
-python migrate_growth_to_postgres.py --sqlite jobs.db
-```
-
-The migration is transactional and idempotent. Event rows use deterministic
-`migration_key` values; a deliberate `--force` retry cannot duplicate migrated
-analytics events.
-
-Verification in PostgreSQL should compare source/destination counts for user
-settings, referrals and events before removing reliance on legacy growth state.
-
-## P7 production smoke test
-
-1. `/api/health` reports the expected collector/durable/public-acquisition flags.
-2. `/` returns the public vacancy landing and `/robots.txt` is present.
-3. Category and Junior/Middle filters render only publication-safe jobs.
-4. The GitHub Actions cron produces HTTP 200 and reports `durable_growth=true` after DSN activation.
-5. Supabase `growth_job_payloads` starts receiving rows after a collection run.
-6. `web_home` opens the bot with acquisition attribution.
-7. `web_<job_hash>` returns the same vacancy in Telegram.
-8. `resume_<job_hash>` enters Resume Match for that vacancy.
-9. `/stats_growth` uses first-start/activated mature cohorts.
-10. No resume text, credentials or private profile data appears on the public site.
-
-## Rollout order
-
-1. Apply/verify Supabase migrations. **Done.**
-2. Keep GitHub Actions as the only cron scheduler. **Done in code.**
-3. Configure `GROWTH_DATABASE_URL` in Vercel and verify `/api/health` becomes fully ready.
-4. Run one normal scheduled collection and verify `growth_job_payloads` is populated.
-5. Choose the interactive runtime: an always-on polling host or durable Vercel webhook.
-6. Configure interactive credentials only on that chosen runtime.
-7. If legacy growth data exists, migrate it before enforcing durable-only mode.
-8. Run the full P7 smoke test.
+Until that decision is made and the interactive bot token is provisioned on the chosen host, do not claim the Telegram interactive bot is production-live.
