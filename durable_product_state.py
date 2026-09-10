@@ -2,7 +2,8 @@
 
 This module removes the remaining user-visible dependence on ephemeral SQLite:
 - favorites live in Supabase when durable growth storage is configured;
-- personal digests read published vacancy payloads from the durable ledger.
+- personal digests read published vacancy payloads from the durable ledger;
+- weekly salary reports read the same published durable ledger.
 
 SQLite behavior remains unchanged for local development and explicit fallback.
 """
@@ -110,6 +111,39 @@ class DatabaseConnection(p7.DatabaseConnection):
             if payload:
                 out.append(payload)
         return out
+
+    def jobs_with_salary_for_report(self, days: int = 14, limit: int = 500) -> List[Dict]:
+        """Use published durable payloads for the weekly salary content magnet."""
+        if self._growth_store is None:
+            return super().jobs_with_salary_for_report(days=days, limit=limit)
+        days = max(1, min(int(days), 45))
+        limit = max(1, min(int(limit), 1000))
+        # Pull a bounded superset because some published payloads have no parsed
+        # salary. Filtering in Python avoids database casts on untrusted source text.
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        with self._growth_store._ensure_conn().cursor() as cur:
+            cur.execute(
+                """
+                SELECT hash, payload
+                FROM growth_job_payloads
+                WHERE publication_state = 'published'
+                  AND COALESCE(published_at, updated_at) >= %s
+                ORDER BY COALESCE(published_at, updated_at) DESC
+                LIMIT %s
+                """,
+                (cutoff, min(2000, max(limit, limit * 2))),
+            )
+            rows = cur.fetchall()
+        jobs: List[Dict] = []
+        for job_hash, raw in rows:
+            payload = self._payload_dict(raw, str(job_hash))
+            salary = payload.get("salary_min_usd")
+            if isinstance(salary, bool) or not isinstance(salary, (int, float)) or salary <= 0:
+                continue
+            jobs.append(payload)
+            if len(jobs) >= limit:
+                break
+        return jobs
 
 
 class JobBot(p7.JobBot):
