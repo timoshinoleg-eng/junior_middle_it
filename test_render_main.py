@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import render_main
 
@@ -55,7 +55,8 @@ class RenderMainTests(unittest.TestCase):
             {
                 "TELEGRAM_BOT_TOKEN": "123456:super-secret",
                 "CHANNEL_ID": "@private-ish-channel",
-                "GROWTH_DATABASE_URL": "postgresql://secret:password@example/db",
+                "GROWTH_DATABASE_URL": "https://project.supabase.co/functions/v1/growth-proxy",
+                "GROWTH_HTTP_KEY": "bridge-secret",
             },
             clear=True,
         ):
@@ -64,9 +65,64 @@ class RenderMainTests(unittest.TestCase):
         self.assertTrue(summary["TELEGRAM_BOT_TOKEN"])
         self.assertTrue(summary["CHANNEL_ID"])
         self.assertTrue(summary["GROWTH_DATABASE"])
+        self.assertTrue(summary["GROWTH_HTTP_KEY"])
         self.assertNotIn("super-secret", rendered)
         self.assertNotIn("private-ish-channel", rendered)
-        self.assertNotIn("postgresql://", rendered)
+        self.assertNotIn("project.supabase.co", rendered)
+        self.assertNotIn("bridge-secret", rendered)
+
+    def test_direct_postgres_skips_http_bridge_preflight(self):
+        with patch.dict(
+            os.environ,
+            {"GROWTH_DATABASE_URL": "postgresql://example/db"},
+            clear=True,
+        ):
+            self.assertEqual(render_main.durable_growth_preflight(), (True, "not_http_bridge"))
+
+    def test_http_bridge_preflight_executes_bounded_read_only_probe(self):
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        with patch.dict(
+            os.environ,
+            {
+                "GROWTH_DATABASE_URL": "https://project.supabase.co/functions/v1/growth-proxy",
+                "GROWTH_HTTP_KEY": "secret",
+            },
+            clear=True,
+        ), patch("http_growth_patch.RemoteGrowthConnection", return_value=conn) as ctor:
+            ok, status = render_main.durable_growth_preflight()
+
+        self.assertTrue(ok)
+        self.assertEqual(status, "ok")
+        ctor.assert_called_once_with(
+            "https://project.supabase.co/functions/v1/growth-proxy",
+            "secret",
+            timeout=10.0,
+        )
+        cursor.execute.assert_called_once_with(
+            "SELECT user_id FROM growth_user_settings LIMIT 0"
+        )
+        conn.close.assert_called_once()
+
+    def test_http_bridge_preflight_sanitizes_failure_type(self):
+        with patch.dict(
+            os.environ,
+            {
+                "GROWTH_DATABASE_URL": "https://project.supabase.co/functions/v1/growth-proxy",
+                "GROWTH_HTTP_KEY": "secret",
+            },
+            clear=True,
+        ), patch(
+            "http_growth_patch.RemoteGrowthConnection",
+            side_effect=RuntimeError("do not expose this detail"),
+        ):
+            self.assertEqual(
+                render_main.durable_growth_preflight(),
+                (False, "RuntimeError"),
+            )
 
 
 if __name__ == "__main__":
