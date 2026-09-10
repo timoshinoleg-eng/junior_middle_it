@@ -1,10 +1,9 @@
 """Request-driven Telegram runtime for Vercel.
 
-This module deliberately does *not* call ``core.main()``, ``Application.start()``,
-``run_polling()`` or ``run_webhook()``. Each HTTPS request processes exactly one
-Telegram Update. User/product state is durable in Supabase, while PTB itself is
-initialized only for the duration of the request. This prevents the Vercel
-interactive path from starting a second vacancy collector or in-process JobQueue.
+Each HTTPS request processes exactly one Telegram Update. The module never
+starts a persistent Telegram updater, a PTB scheduler, or the vacancy collector.
+User/product state is durable in Supabase and the PTB application is initialized
+only for the lifetime of the request.
 """
 from __future__ import annotations
 
@@ -124,7 +123,7 @@ def _runtime():
 
 
 def build_runtime():
-    """Build handlers and durable DB without starting polling or PTB JobQueue."""
+    """Build handlers and durable DB without starting persistent background work."""
     runtime, core = _runtime()
     from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
@@ -280,7 +279,6 @@ async def process_update_payload(payload: Dict[str, Any]) -> str:
         if update is None:
             raise ValueError("invalid Telegram update")
         async with application:
-            # Deliberately no application.start(): start() would launch JobQueue.
             await application.process_update(update)
         if handler_errors:
             raise RuntimeError("Telegram update handler failed") from handler_errors[0]
