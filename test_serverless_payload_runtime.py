@@ -1,3 +1,4 @@
+import copy
 import os
 import unittest
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.old_store = spr._payload_store_instance
         spr._payload_store_instance = None
+        self.duplicate_token = spr._durable_duplicate_skips.set(0)
 
     def tearDown(self):
         store = spr._payload_store_instance
@@ -19,6 +21,7 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
             except Exception:
                 pass
         spr._payload_store_instance = self.old_store
+        spr._durable_duplicate_skips.reset(self.duplicate_token)
 
     async def test_serverless_post_presaves_payload_but_preserves_none_db_argument(self):
         fake_store = SimpleNamespace(
@@ -85,6 +88,7 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result)
         edge_claim.assert_called_once_with("abc123", job)
         original.assert_not_awaited()
+        self.assertEqual(spr._durable_duplicate_skips.get(), 1)
 
     async def test_failed_telegram_post_releases_edge_claim(self):
         original = AsyncMock(return_value=False)
@@ -121,6 +125,30 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 await spr.post_job_with_durable_payload(SimpleNamespace(), job, db=None)
 
         release.assert_called_once_with("abc123")
+
+    async def test_collect_reclassifies_durable_duplicate_skips(self):
+        old_telemetry = copy.deepcopy(spr.core.CYCLE_TELEMETRY)
+
+        async def fake_collect(*args, **kwargs):
+            spr._durable_duplicate_skips.set(2)
+            spr.core.CYCLE_TELEMETRY["failed_posts"] = 3
+            spr.core.CYCLE_TELEMETRY.setdefault("funnel", {})["duplicates"] = 4
+            return {"ok": True, "posted": 1, "duplicates": 4, "failed": 3}
+
+        try:
+            with patch.object(spr, "_ORIGINAL_COLLECT_AND_POST_ONCE", side_effect=fake_collect):
+                result = await spr.collect_and_post_once(use_sqlite=False)
+
+            self.assertEqual(result["posted"], 1)
+            self.assertEqual(result["failed"], 1)
+            self.assertEqual(result["duplicates"], 6)
+            self.assertEqual(result["durable_duplicates"], 2)
+            self.assertEqual(spr.core.CYCLE_TELEMETRY["failed_posts"], 1)
+            self.assertEqual(spr.core.CYCLE_TELEMETRY["funnel"]["duplicates"], 6)
+            self.assertEqual(spr.core.CYCLE_TELEMETRY["funnel"]["durable_duplicates"], 2)
+        finally:
+            spr.core.CYCLE_TELEMETRY.clear()
+            spr.core.CYCLE_TELEMETRY.update(old_telemetry)
 
     async def test_no_growth_backend_keeps_original_serverless_behavior(self):
         original = AsyncMock(return_value=True)
