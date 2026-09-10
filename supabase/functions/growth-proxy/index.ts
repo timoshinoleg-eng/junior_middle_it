@@ -5,7 +5,7 @@ const EXPECTED_BOT_USERNAME = "junior_jobs_channel_bot";
 const PROTOCOL_V2 = 2;
 // SHA-256 of the dedicated high-entropy Render -> Edge bridge key. The raw key
 // exists only in Render environment variables and is never committed or sent to Vercel.
-const RENDER_BRIDGE_KEY_SHA256 = "263c5bc11824a5a9b24954d1a7b7b95cb4112acaad42b9c7c18e89ab2c5e4a24";
+const RENDER_BRIDGE_KEY_SHA256 = "cbd26e6af077ca9b8ccb7baae4555ab5a90e2b4a8c824a3df9c5c174e720b213";
 const MAX_PRIVATE_SQL_BYTES = 40_000;
 const MAX_PRIVATE_SQL_PARAMS = 80;
 const sql = postgres(DB_URL, { prepare: false, max: 1, idle_timeout: 20, connect_timeout: 10 });
