@@ -1,0 +1,53 @@
+name: Telegram Webhook Admin
+
+on:
+  workflow_run:
+    workflows: ["Production Smoke"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Webhook action
+        required: true
+        default: status
+        type: choice
+        options:
+          - status
+          - enable
+          - disable
+
+permissions:
+  contents: read
+
+jobs:
+  webhook:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve webhook action
+        id: action
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            action="enable"
+          else
+            action="${{ inputs.action }}"
+          fi
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+
+      - name: Call protected webhook admin endpoint
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          ACTION: ${{ steps.action.outputs.action }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CRON_SECRET"
+          curl --fail-with-body --silent --show-error \
+            --connect-timeout 20 --max-time 120 \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            -X POST \
+            "https://junior-middle-it.vercel.app/api/webhook-admin?action=$ACTION"

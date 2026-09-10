@@ -70,11 +70,24 @@ class FakeGrowthStore:
         self.jobs = {
             "pub1": {
                 "publication_state": "published",
-                "payload": {"title": "Junior Python", "company": "Example", "hash": "pub1"},
+                "payload": {
+                    "title": "Junior Python",
+                    "company": "Example",
+                    "hash": "pub1",
+                    "salary_min_usd": 1800,
+                },
+            },
+            "pub_no_salary": {
+                "publication_state": "published",
+                "payload": {"title": "Junior QA", "hash": "pub_no_salary"},
             },
             "pending1": {
                 "publication_state": "pending",
-                "payload": {"title": "Do not expose", "hash": "pending1"},
+                "payload": {
+                    "title": "Do not expose",
+                    "hash": "pending1",
+                    "salary_min_usd": 9000,
+                },
             },
         }
         self.favorites = {}
@@ -119,8 +132,14 @@ class DurableProductStateTests(unittest.TestCase):
     def test_digest_reads_only_published_durable_payloads(self):
         db = self.make_db()
         jobs = db.recent_jobs_for_digest(hours=36, limit=80)
-        self.assertEqual([job["hash"] for job in jobs], ["pub1"])
+        self.assertEqual([job["hash"] for job in jobs], ["pub1", "pub_no_salary"])
         self.assertEqual(jobs[0]["company"], "Example")
+
+    def test_salary_report_reads_only_published_jobs_with_numeric_salary(self):
+        db = self.make_db()
+        jobs = db.jobs_with_salary_for_report(days=14, limit=500)
+        self.assertEqual([job["hash"] for job in jobs], ["pub1"])
+        self.assertEqual(jobs[0]["salary_min_usd"], 1800)
 
     def test_payload_parser_rejects_non_object_json(self):
         self.assertEqual(dps.DatabaseConnection._payload_dict("[]", "x"), {})
