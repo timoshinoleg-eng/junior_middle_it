@@ -41,7 +41,23 @@ class JobBot(referral.JobBot):
         payload = context.args[0] if context.args else ""
         payload = str(payload or "")[:64]
 
-        # Keep all canonical P1-P6 registration/onboarding semantics first.
+        # P5 already owns the complete resume_* deep-link lifecycle: canonical
+        # start analytics, resume attribution, session creation, stale-card UX,
+        # PDF/DOCX-aware prompt, and resume_match_started. P7 must only add the
+        # public-site attribution and delegate once. Calling super() first and
+        # then handling resume_* again caused duplicate prompts and session init.
+        if user_id and payload.startswith("resume_"):
+            job_hash = payload[7:]
+            if job_hash:
+                self.db.log_event(
+                    user_id,
+                    "web_resume_start",
+                    {"surface": "public_site", "hash": job_hash},
+                )
+            return await super().cmd_start(update, context)
+
+        # Keep canonical P1-P6 registration/onboarding semantics for all other
+        # start payloads before adding P7 landing-page continuation.
         await super().cmd_start(update, context)
 
         if not user_id or not payload:
@@ -98,32 +114,6 @@ class JobBot(referral.JobBot):
                 disable_web_page_preview=True,
             )
             return
-
-        if payload.startswith("resume_"):
-            job_hash = payload[7:]
-            if not job_hash:
-                return
-            self.db.log_event(
-                user_id,
-                "web_resume_start",
-                {"surface": "public_site", "hash": job_hash},
-            )
-            job = self.db.get_job_payload(job_hash)
-            if not job:
-                await update.message.reply_text(
-                    "Эта вакансия уже устарела. Открой свежую карточку и запусти Resume Match оттуда."
-                )
-                return
-            self.resume_sessions[user_id] = {"job_hash": job_hash, "job": job}
-            await update.message.reply_text(
-                "📄 Пришли текст резюме одним сообщением.\n\n"
-                "Сравню его именно с вакансией, которую ты открыл на сайте. "
-                "Текст резюме не записывается в БД и удаляется из сессии после расчёта.\n\n"
-                "Важно: это эвристический помощник, а не официальный ATS-score.",
-                reply_markup=core.InlineKeyboardMarkup([[
-                    core.InlineKeyboardButton("❌ Отмена", callback_data="resume_cancel")
-                ]]),
-            )
 
 
 core.DatabaseConnection = DatabaseConnection
