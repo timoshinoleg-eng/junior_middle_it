@@ -16,6 +16,9 @@ class FakeDB:
     def get_job_payload(self, job_hash):
         return self.job if self.job and self.job.get("hash") == job_hash else None
 
+    def maybe_unlock_premium(self, _user_id):
+        return False
+
 
 class FakeMessage:
     def __init__(self):
@@ -72,7 +75,7 @@ class PublicAcquisitionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🚀 Откликнуться", labels)
         self.assertIn("📄 Проверить резюме", labels)
 
-    async def test_resume_deep_link_starts_ephemeral_resume_session(self):
+    async def test_resume_deep_link_is_dispatched_once_to_p5_handler(self):
         job = {
             "hash": "abc123",
             "title": "Junior Python Developer",
@@ -82,12 +85,41 @@ class PublicAcquisitionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         bot = self.make_bot(job)
         message = FakeMessage()
         update = self.make_update(message)
-        context = SimpleNamespace(args=["resume_abc123"])
-        with patch.object(p7.referral.JobBot, "cmd_start", new=AsyncMock()):
-            await bot.cmd_start(update, context)
+        context = SimpleNamespace(args=["resume_abc123"], bot=AsyncMock())
+
+        await bot.cmd_start(update, context)
+
         self.assertEqual(bot.resume_sessions[77]["job_hash"], "abc123")
-        self.assertEqual(bot.db.events[0][1], "web_resume_start")
-        self.assertIn("Пришли текст резюме", message.calls[-1][0])
+        self.assertEqual(len(message.calls), 1)
+        prompt = message.calls[0][0]
+        self.assertIn("Resume Match", prompt)
+        self.assertIn("PDF или DOCX", prompt)
+        event_names = [name for _uid, name, _props in bot.db.events]
+        self.assertEqual(event_names.count("web_resume_start"), 1)
+        self.assertEqual(event_names.count("start"), 1)
+        self.assertEqual(event_names.count("resume_attributed_start"), 1)
+        self.assertEqual(event_names.count("resume_match_started"), 1)
+        self.assertEqual(
+            bot.db.events[0],
+            (77, "web_resume_start", {"surface": "public_site", "hash": "abc123"}),
+        )
+
+    async def test_stale_resume_deep_link_replies_once_and_does_not_create_session(self):
+        bot = self.make_bot()
+        message = FakeMessage()
+        update = self.make_update(message)
+        context = SimpleNamespace(args=["resume_missing"], bot=AsyncMock())
+
+        await bot.cmd_start(update, context)
+
+        self.assertNotIn(77, bot.resume_sessions)
+        self.assertEqual(len(message.calls), 1)
+        self.assertIn("устарела", message.calls[0][0])
+        event_names = [name for _uid, name, _props in bot.db.events]
+        self.assertEqual(event_names.count("web_resume_start"), 1)
+        self.assertEqual(event_names.count("start"), 1)
+        self.assertEqual(event_names.count("resume_attributed_start"), 1)
+        self.assertEqual(event_names.count("resume_match_started"), 0)
 
     async def test_invalid_apply_url_is_not_exposed(self):
         job = {
