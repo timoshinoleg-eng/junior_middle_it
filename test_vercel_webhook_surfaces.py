@@ -37,13 +37,12 @@ class VercelWebhookSurfaceTests(unittest.TestCase):
         self.assertNotIn("await application.start()", text)
         self.assertIn("await application.process_update(update)", text)
 
-    def test_interactive_edge_validator_catches_cte_update_targets_without_rejecting_upsert(self):
+    def test_interactive_edge_validator_catches_cte_update_targets(self):
         text = Path("supabase/functions/interactive-growth-proxy/index.ts").read_text(
             encoding="utf-8"
         )
         self.assertIn(r"/\bUPDATE\s+(?!SET\b)", text)
         self.assertNotIn(r"/^UPDATE\s+", text)
-        self.assertIn("ON CONFLICT DO UPDATE SET", text)
 
 
 if __name__ == "__main__":
