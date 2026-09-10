@@ -57,6 +57,7 @@ jobs:
             test_public_growth_client \
             test_public_acquisition_runtime \
             test_durable_runtime_state \
+            test_durable_product_state \
             test_p7_growth_metrics \
             test_http_growth_patch \
             test_render_main \
