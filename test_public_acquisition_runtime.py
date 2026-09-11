@@ -9,6 +9,16 @@ class FakeDB:
     def __init__(self, job=None):
         self.job = job
         self.events = []
+        self.settings = {
+            "enabled_categories": [],
+            "min_salary_filter": 0,
+            "skills": "",
+            "hide_senior": True,
+            "digest_enabled": False,
+            "onboarding_done": False,
+            "premium_unlocked": False,
+        }
+        self.preview_jobs = []
 
     def log_event(self, user_id, name, props=None):
         self.events.append((user_id, name, props or {}))
@@ -18,6 +28,16 @@ class FakeDB:
 
     def maybe_unlock_premium(self, _user_id):
         return False
+
+    def get_user_settings(self, _user_id):
+        return dict(self.settings)
+
+    def save_user_settings(self, _user_id, values):
+        self.settings.update(values)
+        return True
+
+    def recent_jobs_for_digest(self, hours=36, limit=80):
+        return list(self.preview_jobs)[:limit]
 
 
 class FakeMessage:
@@ -29,11 +49,27 @@ class FakeMessage:
         return SimpleNamespace()
 
 
+class FakeQuery:
+    def __init__(self, data, message):
+        self.data = data
+        self.message = message
+        self.answers = []
+        self.edits = []
+
+    async def answer(self, text=None, **kwargs):
+        self.answers.append((text, kwargs))
+
+    async def edit_message_text(self, text, **kwargs):
+        self.edits.append((text, kwargs))
+
+
 class PublicAcquisitionRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def make_bot(self, job=None):
         bot = object.__new__(p7.JobBot)
         bot.db = FakeDB(job)
         bot.resume_sessions = {}
+        bot.setup_steps = {}
+        bot.pending_saved_searches = {}
         return bot
 
     @staticmethod
@@ -140,6 +176,56 @@ class PublicAcquisitionRuntimeTests(unittest.IsolatedAsyncioTestCase):
             for button in row
         ]
         self.assertNotIn("🚀 Откликнуться", labels)
+
+    async def test_first_value_selection_is_capped_at_three(self):
+        bot = self.make_bot()
+        bot.db.preview_jobs = [
+            {"hash": f"job{i}", "title": f"Job {i}"}
+            for i in range(5)
+        ]
+        with patch.object(p7.core, "GROWTH_UTILS_AVAILABLE", False):
+            _settings, jobs = bot._select_first_value_jobs(77)
+        self.assertEqual([job["hash"] for job in jobs], ["job0", "job1", "job2"])
+        self.assertEqual(len(jobs), p7.FIRST_VALUE_PREVIEW_MAX)
+
+    async def test_quick_fresh_uses_three_job_preview_and_prompts_for_setup(self):
+        bot = self.make_bot()
+        bot._send_first_value_preview = AsyncMock(return_value=3)
+        message = FakeMessage()
+        query = FakeQuery("growth_quick_fresh", message)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=77),
+        )
+        context = SimpleNamespace(bot=AsyncMock())
+
+        await bot.handle_callback(update, context)
+
+        bot._send_first_value_preview.assert_awaited_once_with(77, source="quick_fresh")
+        self.assertEqual(query.answers[0][0], "Ищу 3 свежих совпадения")
+        self.assertTrue(any("30 секунд" in text for text, _kwargs in message.calls))
+        self.assertIn((77, "fresh_preview", {"count": 3}), bot.db.events)
+
+    async def test_onboarding_completion_delivers_three_job_preview(self):
+        bot = self.make_bot()
+        bot.setup_steps[77] = "digest"
+        bot._send_first_value_preview = AsyncMock(return_value=3)
+        message = FakeMessage()
+        query = FakeQuery("setup_digest_on", message)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=77),
+        )
+        context = SimpleNamespace(bot=AsyncMock())
+
+        await bot.handle_callback(update, context)
+
+        self.assertTrue(bot.db.settings["onboarding_done"])
+        self.assertTrue(bot.db.settings["digest_enabled"])
+        bot._send_first_value_preview.assert_awaited_once_with(77, source="onboarding")
+        self.assertIn("3 первых", query.edits[0][0])
+        self.assertIn((77, "first_value_delivered", {"count": 3}), bot.db.events)
+        self.assertTrue(any("Resume Match" in text for text, _kwargs in message.calls))
 
 
 if __name__ == "__main__":

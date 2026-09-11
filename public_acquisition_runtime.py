@@ -20,6 +20,7 @@ from p7_growth_metrics import compute_growth_stats
 SETUP_STATE_TTL_SECONDS = 24 * 60 * 60
 RESUME_STATE_TTL_SECONDS = 2 * 60 * 60
 PENDING_SEARCH_TTL_SECONDS = 24 * 60 * 60
+FIRST_VALUE_PREVIEW_MAX = 3
 
 
 class DatabaseConnection(referral.DatabaseConnection):
@@ -256,6 +257,67 @@ class JobBot(referral.JobBot):
             return ""
         return raw if parsed.scheme in {"http", "https"} and parsed.netloc else ""
 
+    def _select_first_value_jobs(self, user_id: int):
+        """Return at most three profile matches for a low-friction first preview."""
+        settings = self._effective_profile(user_id)
+        jobs = self.db.recent_jobs_for_digest(
+            hours=core.Config.PERSONAL_DIGEST_LOOKBACK_HOURS,
+            limit=80,
+        )
+        matched = []
+        for job in jobs:
+            if core.GROWTH_UTILS_AVAILABLE and not core.job_matches_profile(job, settings):
+                continue
+            matched.append(job)
+            if len(matched) >= FIRST_VALUE_PREVIEW_MAX:
+                break
+        return settings, matched
+
+    async def _send_first_value_preview(self, user_id: int, *, source: str) -> int:
+        settings, matched = self._select_first_value_jobs(user_id)
+        if not matched:
+            return 0
+
+        header = (
+            f"⚡ Первые {len(matched)} совпадения — короткий preview.\n"
+            "В карточке можно сохранить вакансию или запустить Resume Match."
+        )
+        try:
+            await self.application.bot.send_message(chat_id=user_id, text=header)
+        except Exception:
+            return 0
+
+        sent = 0
+        for job in matched:
+            try:
+                if core.Config.ENABLE_MARKDOWN_V2 and self.formatter:
+                    formatted = self.formatter.format_job(
+                        job,
+                        view_mode="compact",
+                        bot_username=core.Config.BOT_USERNAME,
+                    )
+                    await self.application.bot.send_message(
+                        chat_id=user_id,
+                        text=formatted.text,
+                        parse_mode=core.ParseMode.MARKDOWN_V2,
+                        reply_markup=core.InlineKeyboardMarkup(
+                            formatted.reply_markup["inline_keyboard"]
+                        ),
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    await self.application.bot.send_message(
+                        chat_id=user_id,
+                        text=core.format_job_message_legacy(job),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                sent += 1
+            except Exception:
+                continue
+        self.db.log_event(user_id, "first_value_preview_sent", {"count": sent, "source": source})
+        return sent
+
     async def cmd_start(self, update, context):
         user = update.effective_user
         user_id = user.id if user else None
@@ -334,8 +396,64 @@ class JobBot(referral.JobBot):
             return
 
     async def handle_callback(self, update, context):
-        data = (update.callback_query.data or "") if update.callback_query else ""
+        query = update.callback_query
+        data = (query.data or "") if query else ""
         user_id = update.effective_user.id if update.effective_user else None
+
+        if data == "growth_quick_fresh" and user_id:
+            await query.answer("Ищу 3 свежих совпадения")
+            n = await self._send_first_value_preview(user_id, source="quick_fresh")
+            self.db.log_event(user_id, "fresh_preview", {"count": n})
+            if not n:
+                await query.message.reply_text(
+                    "Пока нет свежих совпадений. Настрой профиль — так поиск станет точнее.",
+                    reply_markup=core.InlineKeyboardMarkup([[
+                        core.InlineKeyboardButton(
+                            "🎯 Настроить профиль",
+                            callback_data="growth_quick_setup",
+                        )
+                    ]]),
+                )
+            else:
+                settings = self.db.get_user_settings(user_id)
+                if not settings.get("onboarding_done"):
+                    await query.message.reply_text(
+                        "Хочешь точнее? Настрой стек и зарплату — займёт около 30 секунд.",
+                        reply_markup=core.InlineKeyboardMarkup([[
+                            core.InlineKeyboardButton(
+                                "🎯 Настроить подборку",
+                                callback_data="growth_quick_setup",
+                            )
+                        ]]),
+                    )
+            return
+
+        if data in {"setup_digest_on", "setup_digest_off"} and user_id:
+            enabled = data == "setup_digest_on"
+            await query.answer("Готово")
+            self.db.save_user_settings(
+                user_id,
+                {"digest_enabled": enabled, "onboarding_done": True},
+            )
+            self.setup_steps.pop(user_id, None)
+            self.db.log_event(user_id, "setup_done", {"digest": enabled})
+            await query.edit_message_text(
+                "✅ Профиль готов. Уже ищу 3 первых подходящих вакансии…"
+            )
+            n = await self._send_first_value_preview(user_id, source="onboarding")
+            if n:
+                self.db.log_event(user_id, "first_value_delivered", {"count": n})
+                await query.message.reply_text(
+                    "Готово. Полную подборку можно запросить командой /digest now; "
+                    "понравившуюся вакансию — сохранить или проверить через Resume Match."
+                )
+            else:
+                await query.message.reply_text(
+                    "Под свежий профиль пока нет совпадений. Я продолжу искать; "
+                    "фильтры можно изменить через /setup."
+                )
+            return
+
         if data == "saved_search_from_resume" and user_id:
             had_pending = user_id in self.pending_saved_searches
             result = await super().handle_callback(update, context)

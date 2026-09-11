@@ -10,11 +10,25 @@ SQLite behavior remains unchanged for local development and explicit fallback.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List
 
 import channel_bot as core
 import public_acquisition_runtime as p7
+from serverless_publication_policy import parse_source_datetime
+
+
+_MAX_REASONABLE_FUTURE_SKEW = timedelta(hours=6)
+
+
+def _max_job_age_days() -> int:
+    raw = str(os.getenv("SERVERLESS_MAX_JOB_AGE_DAYS", "7") or "7").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 7
+    return max(1, min(value, 30))
 
 
 class DatabaseConnection(p7.DatabaseConnection):
@@ -34,6 +48,21 @@ class DatabaseConnection(p7.DatabaseConnection):
         if job_hash:
             payload.setdefault("hash", str(job_hash))
         return payload
+
+    @staticmethod
+    def _is_source_fresh(payload: Dict, *, now=None) -> bool:
+        """Use the original source timestamp, never ledger write time, for freshness."""
+        source_date = parse_source_datetime(payload)
+        if source_date is None:
+            return False
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        else:
+            current = current.astimezone(timezone.utc)
+        if source_date - current > _MAX_REASONABLE_FUTURE_SKEW:
+            return False
+        return current - source_date <= timedelta(days=_max_job_age_days())
 
     def add_favorite(self, user_id: int, job_hash: str) -> bool:
         if self._growth_store is None:
@@ -86,12 +115,15 @@ class DatabaseConnection(p7.DatabaseConnection):
         return out
 
     def recent_jobs_for_digest(self, hours: int = 36, limit: int = 80) -> List[Dict]:
-        """Read published durable payloads so digests survive cold starts/redeploys."""
+        """Read only published, source-fresh durable payloads for personal digests."""
         if self._growth_store is None:
             return super().recent_jobs_for_digest(hours=hours, limit=limit)
         hours = max(1, min(int(hours), 24 * 45))
         limit = max(1, min(int(limit), 500))
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        # Pull a bounded superset because historical rows created before
+        # source_published_at was persisted must be filtered in Python.
+        query_limit = min(2000, max(limit, limit * 3))
         with self._growth_store._ensure_conn().cursor() as cur:
             cur.execute(
                 """
@@ -102,24 +134,27 @@ class DatabaseConnection(p7.DatabaseConnection):
                 ORDER BY COALESCE(published_at, updated_at) DESC
                 LIMIT %s
                 """,
-                (cutoff, limit),
+                (cutoff, query_limit),
             )
             rows = cur.fetchall()
         out: List[Dict] = []
         for job_hash, raw in rows:
             payload = self._payload_dict(raw, str(job_hash))
-            if payload:
-                out.append(payload)
+            if not payload or not self._is_source_fresh(payload):
+                continue
+            out.append(payload)
+            if len(out) >= limit:
+                break
         return out
 
     def jobs_with_salary_for_report(self, days: int = 14, limit: int = 500) -> List[Dict]:
-        """Use published durable payloads for the weekly salary content magnet."""
+        """Use published, source-fresh durable payloads for the weekly salary content magnet."""
         if self._growth_store is None:
             return super().jobs_with_salary_for_report(days=days, limit=limit)
         days = max(1, min(int(days), 45))
         limit = max(1, min(int(limit), 1000))
         # Pull a bounded superset because some published payloads have no parsed
-        # salary. Filtering in Python avoids database casts on untrusted source text.
+        # salary or a source timestamp that cannot pass the production policy.
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         with self._growth_store._ensure_conn().cursor() as cur:
             cur.execute(
@@ -131,12 +166,14 @@ class DatabaseConnection(p7.DatabaseConnection):
                 ORDER BY COALESCE(published_at, updated_at) DESC
                 LIMIT %s
                 """,
-                (cutoff, min(2000, max(limit, limit * 2))),
+                (cutoff, min(2000, max(limit, limit * 3))),
             )
             rows = cur.fetchall()
         jobs: List[Dict] = []
         for job_hash, raw in rows:
             payload = self._payload_dict(raw, str(job_hash))
+            if not payload or not self._is_source_fresh(payload):
+                continue
             salary = payload.get("salary_min_usd")
             if isinstance(salary, bool) or not isinstance(salary, (int, float)) or salary <= 0:
                 continue

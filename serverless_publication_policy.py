@@ -41,7 +41,8 @@ def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
 def parse_source_datetime(job: Dict) -> Optional[datetime]:
     """Parse heterogeneous source timestamps into an aware UTC datetime."""
     raw = (
-        job.get("published")
+        job.get("source_published_at")
+        or job.get("published")
         or job.get("created")
         or job.get("publication_date")
         or job.get("date_published")
