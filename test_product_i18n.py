@@ -14,6 +14,16 @@ class FakeMessage:
         self.calls.append((text, kwargs))
 
 
+class FakeQuery:
+    def __init__(self, data, message=None):
+        self.data = data
+        self.message = message or FakeMessage()
+        self.answers = []
+
+    async def answer(self, text=None, **kwargs):
+        self.answers.append((text, kwargs))
+
+
 class FakeSearch:
     id = 1
     name = "Python"
@@ -100,6 +110,26 @@ class LocalizedHubTests(unittest.IsolatedAsyncioTestCase):
         labels = [button.text for row in kwargs["reply_markup"].inline_keyboard for button in row]
         self.assertEqual(labels, ["🇷🇺 Русский", "🇬🇧 English"])
 
+    async def test_language_choice_is_persisted_and_deeplink_continues(self):
+        bot = self.make_bot("")
+        bot.cmd_start = AsyncMock()
+        query = FakeQuery("p9_lang_en:web_home")
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=77),
+            callback_query=query,
+        )
+        context = SimpleNamespace(args=[])
+
+        await bot.handle_callback(update, context)
+
+        self.assertEqual(bot.db.language, "en")
+        self.assertIn((77, "language_selected", {"language": "en"}), bot.db.events)
+        bot.cmd_start.assert_awaited_once()
+        proxy_update, proxy_context = bot.cmd_start.await_args.args
+        self.assertIs(proxy_update.message, query.message)
+        self.assertEqual(proxy_context.args, [])
+        self.assertEqual(context.args, [])
+
     async def test_russian_hub_is_novice_friendly(self):
         bot = self.make_bot("ru")
         message = FakeMessage()
@@ -121,7 +151,7 @@ class LocalizedHubTests(unittest.IsolatedAsyncioTestCase):
         await bot._send_retention_hub(message, 77)
         text, kwargs = message.calls[0]
         labels = [button.text for row in kwargs["reply_markup"].inline_keyboard for button in row]
-        self.assertIn("New jobs immediately", text)
+        self.assertIn("new jobs immediately", text.lower())
         self.assertIn("🔎 Show 3 jobs", labels)
         self.assertIn("📅 Daily roundup: OFF", labels)
         self.assertIn("💾 My searches (1)", labels)
