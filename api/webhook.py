@@ -67,7 +67,16 @@ class handler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "invalid_update"})
             return
         except Exception as exc:
-            logger.error("Telegram webhook processing failed: %s", type(exc).__name__)
+            cause = exc.__cause__
+            if cause is not None:
+                logger.error(
+                    "Telegram webhook processing failed: %s caused by %s: %s",
+                    type(exc).__name__,
+                    type(cause).__name__,
+                    str(cause)[:240],
+                )
+            else:
+                logger.error("Telegram webhook processing failed: %s", type(exc).__name__)
             self._send_json(503, {"ok": False, "error": "temporarily_unavailable"})
             return
 
