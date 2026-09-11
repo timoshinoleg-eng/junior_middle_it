@@ -50,6 +50,7 @@ class VercelRouterTests(unittest.TestCase):
         }
         self.assertEqual(rewrites.get('/'), '/api/site')
         self.assertEqual(rewrites.get('/robots.txt'), '/api/robots')
+        self.assertEqual(rewrites.get('/api/webhook-admin'), '/api/webhook_admin')
         self.assertNotIn('/api/health', rewrites)
         self.assertNotIn('/api/cron', rewrites)
 

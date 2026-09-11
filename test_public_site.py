@@ -1,9 +1,10 @@
 import os
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import public_site
-from api.site import _public_site_url
+from api.site import _is_fresh_public_job, _public_site_url
 
 
 class PublicSiteTests(unittest.TestCase):
@@ -41,6 +42,47 @@ class PublicSiteTests(unittest.TestCase):
         self.assertFalse(public_site.is_public_job(self._job(level="Senior")))
         self.assertFalse(public_site.is_public_job(self._job(quality_gate_status="failed")))
         self.assertFalse(public_site.is_public_job(self._job(url="javascript:alert(1)")))
+
+    def test_public_landing_requires_verified_fresh_source_date(self):
+        now = datetime(2026, 9, 11, 12, 0, tzinfo=timezone.utc)
+        self.assertTrue(
+            _is_fresh_public_job(
+                self._job(source_published_at="2026-09-10T18:30:00Z"),
+                max_age_days=7,
+                now=now,
+            )
+        )
+        self.assertFalse(_is_fresh_public_job(self._job(), max_age_days=7, now=now))
+        self.assertFalse(
+            _is_fresh_public_job(
+                self._job(source_published_at="2026-09-01T11:00:00Z"),
+                max_age_days=7,
+                now=now,
+            )
+        )
+        self.assertFalse(
+            _is_fresh_public_job(
+                self._job(source_published_at="2026-09-12T12:00:00Z"),
+                max_age_days=7,
+                now=now,
+            )
+        )
+
+    def test_public_landing_accepts_epoch_and_rfc2822_source_dates(self):
+        now = datetime(2026, 9, 11, 12, 0, tzinfo=timezone.utc)
+        self.assertTrue(
+            _is_fresh_public_job(
+                self._job(source_published_at="Thu, 10 Sep 2026 12:00:00 +0000"),
+                now=now,
+            )
+        )
+        epoch_ms = int(datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        self.assertTrue(
+            _is_fresh_public_job(
+                self._job(source_published_at=str(epoch_ms)),
+                now=now,
+            )
+        )
 
     def test_selection_applies_filters_and_company_diversity(self):
         jobs = [self._job(hash=f"a{i}") for i in range(4)]
