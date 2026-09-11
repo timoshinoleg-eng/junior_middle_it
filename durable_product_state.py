@@ -84,7 +84,7 @@ class DatabaseConnection(p7.DatabaseConnection):
         with self._growth_store._ensure_conn().cursor() as cur:
             cur.execute(
                 "DELETE FROM growth_favorites WHERE user_id=%s AND job_hash=%s RETURNING job_hash",
-                (int(search_id), int(user_id)),
+                (int(user_id), str(job_hash)),
             )
             return bool(cur.fetchone())
 
