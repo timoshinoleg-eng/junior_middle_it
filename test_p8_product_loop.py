@@ -1,9 +1,10 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import durable_product_state as p8
 from message_formatter import JobMessageFormatter
+from p7_growth_metrics import HIGH_INTENT_EVENTS
 
 
 class FakeMessage:
@@ -244,6 +245,11 @@ class P8RetentionHubTests(unittest.IsolatedAsyncioTestCase):
 
 
 class P8FunnelTests(unittest.TestCase):
+    def test_activation_events_include_p8_first_value_and_retention_actions(self):
+        self.assertIn("first_value_preview_sent", HIGH_INTENT_EVENTS)
+        self.assertIn("resume_match_completed", HIGH_INTENT_EVENTS)
+        self.assertIn("saved_search_created", HIGH_INTENT_EVENTS)
+
     def test_funnel_composes_existing_cohort_and_utility_metrics(self):
         db = object.__new__(p8.DatabaseConnection)
         db.growth_stats = MagicMock(return_value={
