@@ -52,6 +52,7 @@ class FakeDB:
             "digest_enabled": False,
         }
         self.events = []
+        self.referrals = []
         self.jobs = [{
             "hash": "abc123",
             "title": "Junior Python Developer",
@@ -86,6 +87,10 @@ class FakeDB:
 
     def recent_jobs_for_digest(self, **_kwargs):
         return list(self.jobs)
+
+    def register_referral(self, user_id, referrer_id):
+        self.referrals.append((user_id, referrer_id))
+        return True
 
     def log_event(self, uid, name, props=None):
         self.events.append((uid, name, props or {}))
@@ -133,6 +138,17 @@ class LocalizedHubTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Выберите язык", text)
         labels = [button.text for row in kwargs["reply_markup"].inline_keyboard for button in row]
         self.assertEqual(labels, ["🇷🇺 Русский", "🇬🇧 English"])
+
+    async def test_referral_is_attributed_before_language_event(self):
+        bot = self.make_bot("")
+        message = FakeMessage()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=77), message=message)
+        context = SimpleNamespace(args=["ref_123"])
+        with patch.object(runtime.core, "GROWTH_UTILS_AVAILABLE", True):
+            await bot.cmd_start(update, context)
+        self.assertEqual(bot.db.referrals, [(77, 123)])
+        self.assertEqual(len(message.calls), 1)
+        self.assertIn("Выберите язык", message.calls[0][0])
 
     async def test_language_choice_is_persisted_and_deeplink_continues(self):
         bot = self.make_bot("")
