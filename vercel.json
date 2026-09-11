@@ -18,6 +18,10 @@
     {
       "source": "/api/webhook-admin",
       "destination": "/api/webhook_admin"
+    },
+    {
+      "source": "/api/channel-launch",
+      "destination": "/api/channel_launch"
     }
   ],
   "functions": {
