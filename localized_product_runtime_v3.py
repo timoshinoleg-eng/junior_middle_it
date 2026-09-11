@@ -5,13 +5,39 @@ from typing import Dict, List
 
 import channel_bot as core
 import localized_product_runtime_v2 as base
-from product_i18n import t
 
 
 DatabaseConnection = base.DatabaseConnection
 
 
 class JobBot(base.JobBot):
+    async def cmd_start(self, update, context):
+        """Preserve referral first-touch before language selection creates user history."""
+        user = update.effective_user
+        user_id = user.id if user else None
+        if not user_id:
+            return await super().cmd_start(update, context)
+        payload = str(context.args[0] if context.args else "")[:52]
+        language = self.db.get_user_language(user_id)
+
+        if not language and payload.startswith("ref_"):
+            kind, referrer_id = core.parse_start_payload([payload]) if core.GROWTH_UTILS_AVAILABLE else (None, None)
+            if kind == "ref" and referrer_id:
+                self.db.register_referral(user_id, referrer_id)
+            return await super().cmd_start(update, context)
+
+        if language and payload.startswith("ref_"):
+            self.db.log_event(user_id, "start", {"payload": payload, "language": language})
+            self.db.maybe_unlock_premium(user_id)
+            await self._send_retention_hub(update.message, user_id)
+            return
+
+        if language and payload == "invite":
+            self.db.log_event(user_id, "start", {"payload": payload, "language": language})
+            return await self.cmd_ref(update, context)
+
+        return await super().cmd_start(update, context)
+
     async def send_personal_digest(self, user_id: int) -> int:
         """Send the once-a-day roundup using the user's selected language."""
         lang = self._lang(user_id)
