@@ -72,7 +72,7 @@ if not getattr(base.TelegramUpdateLedger.claim, "_latency_hardened", False):
 
 def _localized_runtime():
     _runtime, core = _original_runtime()
-    import localized_product_runtime_v7 as localized
+    import localized_product_runtime_v8 as localized
     return localized, core
 
 

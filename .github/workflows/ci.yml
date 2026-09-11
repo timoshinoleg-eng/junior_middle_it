@@ -64,6 +64,7 @@ jobs:
             test_callback_runtime_hotfix \
             test_channel_bot_soft_link \
             test_webhook_latency_hotfix \
+            test_setup_ux_v8 \
             test_interactive_webhook_runtime \
             test_api_webhook_contract \
             test_scheduled_delivery_runtime \
