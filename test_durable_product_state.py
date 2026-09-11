@@ -1,6 +1,8 @@
+import os
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import durable_product_state as dps
 
@@ -67,6 +69,10 @@ class FakeCursor:
 
 class FakeGrowthStore:
     def __init__(self):
+        now = datetime.now(timezone.utc)
+        fresh = (now - timedelta(hours=1)).isoformat()
+        stale = (now - timedelta(days=10)).isoformat()
+        future = (now + timedelta(days=1)).isoformat()
         self.jobs = {
             "pub1": {
                 "publication_state": "published",
@@ -75,11 +81,42 @@ class FakeGrowthStore:
                     "company": "Example",
                     "hash": "pub1",
                     "salary_min_usd": 1800,
+                    "source_published_at": fresh,
                 },
             },
             "pub_no_salary": {
                 "publication_state": "published",
-                "payload": {"title": "Junior QA", "hash": "pub_no_salary"},
+                "payload": {
+                    "title": "Junior QA",
+                    "hash": "pub_no_salary",
+                    "source_published_at": fresh,
+                },
+            },
+            "stale1": {
+                "publication_state": "published",
+                "payload": {
+                    "title": "Old Backend Role",
+                    "hash": "stale1",
+                    "salary_min_usd": 5000,
+                    "source_published_at": stale,
+                },
+            },
+            "unknown_date": {
+                "publication_state": "published",
+                "payload": {
+                    "title": "Unknown age",
+                    "hash": "unknown_date",
+                    "salary_min_usd": 6000,
+                },
+            },
+            "future1": {
+                "publication_state": "published",
+                "payload": {
+                    "title": "Impossible future role",
+                    "hash": "future1",
+                    "salary_min_usd": 7000,
+                    "source_published_at": future,
+                },
             },
             "pending1": {
                 "publication_state": "pending",
@@ -87,6 +124,7 @@ class FakeGrowthStore:
                     "title": "Do not expose",
                     "hash": "pending1",
                     "salary_min_usd": 9000,
+                    "source_published_at": fresh,
                 },
             },
         }
@@ -129,15 +167,26 @@ class DurableProductStateTests(unittest.TestCase):
         self.assertTrue(db.remove_favorite(77, "pub1"))
         self.assertEqual(db.get_user_favorites(77), [])
 
-    def test_digest_reads_only_published_durable_payloads(self):
+    def test_digest_reads_only_published_source_fresh_durable_payloads(self):
         db = self.make_db()
-        jobs = db.recent_jobs_for_digest(hours=36, limit=80)
+        with patch.dict(os.environ, {"SERVERLESS_MAX_JOB_AGE_DAYS": "7"}, clear=False):
+            jobs = db.recent_jobs_for_digest(hours=36, limit=80)
         self.assertEqual([job["hash"] for job in jobs], ["pub1", "pub_no_salary"])
         self.assertEqual(jobs[0]["company"], "Example")
 
-    def test_salary_report_reads_only_published_jobs_with_numeric_salary(self):
+    def test_digest_fails_closed_for_missing_stale_and_future_source_dates(self):
         db = self.make_db()
-        jobs = db.jobs_with_salary_for_report(days=14, limit=500)
+        with patch.dict(os.environ, {"SERVERLESS_MAX_JOB_AGE_DAYS": "7"}, clear=False):
+            jobs = db.recent_jobs_for_digest(hours=36, limit=80)
+        hashes = {job["hash"] for job in jobs}
+        self.assertNotIn("stale1", hashes)
+        self.assertNotIn("unknown_date", hashes)
+        self.assertNotIn("future1", hashes)
+
+    def test_salary_report_reads_only_source_fresh_published_jobs_with_numeric_salary(self):
+        db = self.make_db()
+        with patch.dict(os.environ, {"SERVERLESS_MAX_JOB_AGE_DAYS": "7"}, clear=False):
+            jobs = db.jobs_with_salary_for_report(days=14, limit=500)
         self.assertEqual([job["hash"] for job in jobs], ["pub1"])
         self.assertEqual(jobs[0]["salary_min_usd"], 1800)
 
