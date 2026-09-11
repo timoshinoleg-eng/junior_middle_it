@@ -5,6 +5,7 @@ const EXPECTED_BOT_USERNAME = "junior_jobs_channel_bot";
 const MAX_SQL_BYTES = 40_000;
 const MAX_PARAMS = 80;
 const MAX_RESPONSE_BYTES = 2_000_000;
+const AUTH_CACHE_MS = 5 * 60_000;
 const sql = postgres(DB_URL, { prepare: false, max: 1, idle_timeout: 20, connect_timeout: 10 });
 const telegramAuthCache = new Map<string, number>();
 
@@ -36,6 +37,24 @@ async function telegramBotAuthorized(token: string): Promise<boolean> {
   const tokenHash = await sha256Hex(token);
   const now = Date.now();
   if ((telegramAuthCache.get(tokenHash) ?? 0) > now) return true;
+
+  try {
+    const cached = await sql`
+      SELECT 1
+      FROM public.growth_proxy_auth_cache
+      WHERE token_hash = ${tokenHash}
+        AND bot_username = ${EXPECTED_BOT_USERNAME}
+        AND expires_at > NOW()
+      LIMIT 1
+    `;
+    if (cached.length) {
+      telegramAuthCache.set(tokenHash, now + AUTH_CACHE_MS);
+      return true;
+    }
+  } catch {
+    // Cache failure must not make a valid bot unavailable.
+  }
+
   try {
     const response = await fetch(`https://api.telegram.org/bot${token}/getMe`, {
       method: "GET",
@@ -44,11 +63,26 @@ async function telegramBotAuthorized(token: string): Promise<boolean> {
     });
     if (!response.ok) return false;
     const body = await response.json() as { ok?: boolean; result?: { is_bot?: boolean; username?: string } };
-    const valid = Boolean(
-      body.ok && body.result?.is_bot === true && body.result?.username === EXPECTED_BOT_USERNAME
-    );
-    if (valid) telegramAuthCache.set(tokenHash, now + 5 * 60_000);
-    return valid;
+    const valid = Boolean(body.ok && body.result?.is_bot === true && body.result?.username === EXPECTED_BOT_USERNAME);
+    if (!valid) return false;
+
+    telegramAuthCache.set(tokenHash, now + AUTH_CACHE_MS);
+    try {
+      await sql`
+        INSERT INTO public.growth_proxy_auth_cache
+          (token_hash, bot_username, verified_at, expires_at)
+        VALUES
+          (${tokenHash}, ${EXPECTED_BOT_USERNAME}, NOW(), NOW() + INTERVAL '5 minutes')
+        ON CONFLICT (token_hash) DO UPDATE SET
+          bot_username = EXCLUDED.bot_username,
+          verified_at = EXCLUDED.verified_at,
+          expires_at = EXCLUDED.expires_at
+      `;
+      await sql`DELETE FROM public.growth_proxy_auth_cache WHERE expires_at < NOW() - INTERVAL '1 day'`;
+    } catch {
+      // Telegram already proved authorization; persistence is only a latency optimization.
+    }
+    return true;
   } catch {
     return false;
   }
@@ -68,9 +102,7 @@ function validateGrowthSql(value: unknown): string {
   if (forbidden.test(lower)) return "";
 
   const ctes = new Set<string>();
-  for (const match of normalized.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(/gi)) {
-    ctes.add(match[1].toLowerCase());
-  }
+  for (const match of normalized.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(/gi)) ctes.add(match[1].toLowerCase());
 
   const relations: string[] = [];
   const relationPatterns = [
@@ -80,9 +112,7 @@ function validateGrowthSql(value: unknown): string {
     /\bDELETE\s+FROM\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
     /\bUPDATE\s+(?!SET\b)((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
   ];
-  for (const pattern of relationPatterns) {
-    for (const match of normalized.matchAll(pattern)) relations.push(match[1].toLowerCase());
-  }
+  for (const pattern of relationPatterns) for (const match of normalized.matchAll(pattern)) relations.push(match[1].toLowerCase());
   if (!relations.length) return "";
 
   for (const relation of relations) {
@@ -90,19 +120,16 @@ function validateGrowthSql(value: unknown): string {
     if (parts.length > 2) return "";
     if (parts.length === 2 && parts[0] !== "public") return "";
     const name = parts.at(-1) ?? "";
+    if (name === "growth_proxy_auth_cache") return "";
     if (!name.startsWith("growth_") && !ctes.has(name)) return "";
   }
   return statement;
 }
 
 Deno.serve(async (req: Request) => {
-  if (req.method !== "POST") {
-    return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405, headers: jsonHeaders });
-  }
+  if (req.method !== "POST") return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405, headers: jsonHeaders });
   const token = (req.headers.get("x-telegram-bot-token") ?? "").trim();
-  if (!(await telegramBotAuthorized(token))) {
-    return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: jsonHeaders });
-  }
+  if (!(await telegramBotAuthorized(token))) return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: jsonHeaders });
 
   let text = "";
   try { text = await req.text(); } catch {
@@ -118,23 +145,15 @@ Deno.serve(async (req: Request) => {
   }
   const query = validateGrowthSql(body.query);
   const params = Array.isArray(body.params) ? body.params : [];
-  if (!query || params.length > MAX_PARAMS) {
-    return new Response(JSON.stringify({ error: "query rejected" }), { status: 400, headers: jsonHeaders });
-  }
+  if (!query || params.length > MAX_PARAMS) return new Response(JSON.stringify({ error: "query rejected" }), { status: 400, headers: jsonHeaders });
 
   try {
     const result = await sql.unsafe(query, params);
     const columns = (result.columns ?? []).map((column: { name: string }) => String(column.name));
     const fallbackColumns = columns.length ? columns : (result.length ? Object.keys(result[0] as Record<string, unknown>) : []);
     const rows = result.map((row: Record<string, unknown>) => fallbackColumns.map((name) => jsonSafe(row[name])));
-    const responseBody = JSON.stringify({
-      rows,
-      columns: fallbackColumns,
-      rowcount: Number(result.count ?? result.length ?? 0),
-    });
-    if (new TextEncoder().encode(responseBody).length > MAX_RESPONSE_BYTES) {
-      return new Response(JSON.stringify({ error: "response too large" }), { status: 413, headers: jsonHeaders });
-    }
+    const responseBody = JSON.stringify({ rows, columns: fallbackColumns, rowcount: Number(result.count ?? result.length ?? 0) });
+    if (new TextEncoder().encode(responseBody).length > MAX_RESPONSE_BYTES) return new Response(JSON.stringify({ error: "response too large" }), { status: 413, headers: jsonHeaders });
     return new Response(responseBody, { status: 200, headers: jsonHeaders });
   } catch (error) {
     console.error("interactive growth SQL failed", error instanceof Error ? error.name : "unknown");
