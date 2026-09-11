@@ -84,7 +84,7 @@ class DatabaseConnection(p7.DatabaseConnection):
         with self._growth_store._ensure_conn().cursor() as cur:
             cur.execute(
                 "DELETE FROM growth_favorites WHERE user_id=%s AND job_hash=%s RETURNING job_hash",
-                (int(user_id), str(job_hash)),
+                (int(search_id), int(user_id)),
             )
             return bool(cur.fetchone())
 
@@ -182,7 +182,8 @@ class DatabaseConnection(p7.DatabaseConnection):
         starts = int(growth.get("starts") or 0)
         activated = int(growth.get("activated_users") or 0)
         setup = int(growth.get("setup_done") or 0)
-        resume = int(utility.get("resume_completed_users") or 0)
+        resume_started = int(utility.get("resume_started_users") or 0)
+        resume_completed = int(utility.get("resume_completed_users") or 0)
         searches = int(utility.get("saved_search_users") or 0)
 
         def pct(value: int, base: int) -> float:
@@ -196,7 +197,8 @@ class DatabaseConnection(p7.DatabaseConnection):
             "setup": setup,
             "setup_pct": pct(setup, starts),
             "savers": int(growth.get("saves") or 0),
-            "resume_completed": resume,
+            "resume_started": resume_started,
+            "resume_completed": resume_completed,
             "resume_completion_pct": float(utility.get("resume_completion_pct") or 0.0),
             "saved_search_users": searches,
             "resume_to_search_pct": float(utility.get("resume_to_search_pct") or 0.0),
@@ -356,8 +358,8 @@ class JobBot(p7.JobBot):
             f"Activated D0: {stats['activated']} ({stats['activated_pct']}%)\n"
             f"Setup: {stats['setup']} ({stats['setup_pct']}%)\n"
             f"Saved vacancy users: {stats['savers']}\n"
-            f"Resume Match complete: {stats['resume_completed']} "
-            f"({stats['resume_completion_pct']}% of starts)\n"
+            f"Resume Match: {stats['resume_started']} start → {stats['resume_completed']} complete "
+            f"({stats['resume_completion_pct']}%)\n"
             f"Saved-search creators: {stats['saved_search_users']} · active searches: {stats['active_saved_searches']}\n"
             f"Resume → search: {stats['resume_to_search_pct']}%\n"
             f"Subscribers: alerts {stats['alert_subscribers']} · digest {stats['digest_subscribers']}\n"
