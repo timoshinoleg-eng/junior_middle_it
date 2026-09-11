@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Sentry integration for junior_middle_it.
+"""Shared runtime bootstrap and Sentry integration for junior_middle_it.
 
-Single init point used by both entry points (channel_bot.py long-running
-polling and api/cron.py serverless Vercel). Controlled entirely by env:
+This module is imported by both entry points (channel_bot.py long-running
+polling and api/cron.py serverless Vercel). Importing it installs the
+process-wide Telegram public-channel publication authority guard before any
+runtime can post vacancies.
+
+Sentry is controlled entirely by env:
 
     SENTRY_DSN    — required; if empty, Sentry is a no-op.
     SENTRY_RELEASE — optional version tag (default "dev").
@@ -16,7 +20,13 @@ import logging
 import os
 from typing import Optional
 
+from publication_authority import install_telegram_channel_publish_guard
+
 logger = logging.getLogger(__name__)
+
+# Install before any entry point reaches Telegram send_message. The guard reads
+# environment at send time, so dotenv/platform configuration may load later.
+PUBLICATION_AUTHORITY_GUARD_INSTALLED = install_telegram_channel_publish_guard()
 
 # Values that must never be sent. Lower-cased, substring match on keys.
 _BLOCKED_KEYS = (
