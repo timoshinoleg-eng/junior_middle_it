@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from interactive_webhook_runtime import (
+from localized_webhook_runtime import (
     MAX_UPDATE_BYTES,
     process_update_payload,
     webhook_secret_valid,
@@ -68,8 +68,6 @@ class handler(BaseHTTPRequestHandler):
             return
         except Exception as exc:
             logger.error("Telegram webhook processing failed: %s", type(exc).__name__)
-            # Telegram retries non-2xx responses. The update lease prevents
-            # concurrent duplicate processing while preserving later retryability.
             self._send_json(503, {"ok": False, "error": "temporarily_unavailable"})
             return
 

@@ -8,6 +8,10 @@ from urllib.parse import parse_qs, urlsplit
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+# Install the localized interactive runtime before scheduled_delivery_runtime
+# captures build_runtime. Public channel digests remain channel-wide; personal
+# daily roundups use each user's selected language.
+import localized_webhook_runtime  # noqa: F401
 from scheduled_delivery_runtime import run_scheduled_delivery
 from secure_http_logging import configure_sensitive_http_logging
 from serverless_health import cron_authorized
