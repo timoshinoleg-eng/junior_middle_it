@@ -29,7 +29,7 @@ if CallbackQuery.answer is not _resilient_callback_answer:
 
 def _localized_runtime():
     _runtime, core = _original_runtime()
-    import localized_product_runtime_v4 as localized
+    import localized_product_runtime_v5 as localized
     return localized, core
 
 
@@ -39,6 +39,7 @@ base._runtime = _localized_runtime
 def _localized_build_runtime():
     application, db, job_bot = _original_build_runtime()
     application.add_handler(CommandHandler("language", job_bot.cmd_language))
+    application.add_handler(CommandHandler("channel", job_bot.cmd_channel))
     return application, db, job_bot
 
 
