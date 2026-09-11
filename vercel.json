@@ -14,6 +14,10 @@
     {
       "source": "/robots.txt",
       "destination": "/api/robots"
+    },
+    {
+      "source": "/api/webhook-admin",
+      "destination": "/api/webhook_admin"
     }
   ],
   "functions": {
