@@ -68,7 +68,7 @@ PIN_TEXT = """<b>💼 Junior &amp; Middle IT — вакансии без лиш�
 Наша цель простая: помочь Junior и Middle специалистам быстрее находить подходящие IT-вакансии и тратить меньше времени на неподходящие предложения."""
 
 
-def _telegram_call(token: str, method: str, payload: dict | None = None) -> dict:
+def _telegram_call(token: str, method: str, payload: dict | None = None):
     response = requests.post(
         f"https://api.telegram.org/bot{token}/{method}",
         json=payload or {},
@@ -81,6 +81,13 @@ def _telegram_call(token: str, method: str, payload: dict | None = None) -> dict
     return data.get("result")
 
 
+def _try_call(token: str, method: str, payload: dict | None = None):
+    try:
+        return True, _telegram_call(token, method, payload), ""
+    except RuntimeError as exc:
+        return False, None, str(exc)[:220]
+
+
 def _apply_branding() -> dict:
     if (os.getenv("VERCEL_ENV") or "").strip().lower() != "production":
         raise RuntimeError("not_production")
@@ -90,59 +97,99 @@ def _apply_branding() -> dict:
     if not token:
         raise RuntimeError("telegram_token_missing")
 
-    _telegram_call(token, "setChatDescription", {
-        "chat_id": channel_id,
-        "description": CHANNEL_DESCRIPTION,
-    })
-    _telegram_call(token, "setMyShortDescription", {
-        "short_description": BOT_SHORT_DESCRIPTION,
-    })
-    _telegram_call(token, "setMyDescription", {
-        "description": BOT_DESCRIPTION,
-    })
+    channel_write_ok, _, channel_write_error = _try_call(
+        token,
+        "setChatDescription",
+        {"chat_id": channel_id, "description": CHANNEL_DESCRIPTION},
+    )
 
-    chat = _telegram_call(token, "getChat", {"chat_id": channel_id}) or {}
+    short_write_ok, _, short_write_error = _try_call(
+        token,
+        "setMyShortDescription",
+        {"short_description": BOT_SHORT_DESCRIPTION},
+    )
+    bot_write_ok, _, bot_write_error = _try_call(
+        token,
+        "setMyDescription",
+        {"description": BOT_DESCRIPTION},
+    )
+
+    chat_ok, chat, chat_error = _try_call(token, "getChat", {"chat_id": channel_id})
+    chat = chat or {}
     pinned = chat.get("pinned_message") or {}
     pinned_text = str(pinned.get("text") or pinned.get("caption") or "")
     message_id = pinned.get("message_id") if pinned_text.startswith(PIN_TITLE) else None
+    post_error = ""
+    pin_error = ""
 
-    if not message_id:
-        message = _telegram_call(token, "sendMessage", {
-            "chat_id": channel_id,
-            "text": PIN_TEXT,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-            "disable_notification": True,
-            "reply_markup": {
-                "inline_keyboard": [[
-                    {
+    if chat_ok and not message_id:
+        post_ok, message, post_error = _try_call(
+            token,
+            "sendMessage",
+            {
+                "chat_id": channel_id,
+                "text": PIN_TEXT,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+                "disable_notification": True,
+                "reply_markup": {
+                    "inline_keyboard": [[{
                         "text": "🤖 Настроить персональный поиск",
                         "url": "https://t.me/junior_jobs_channel_bot",
-                    }
-                ]]
+                    }]]
+                },
             },
-        }) or {}
-        message_id = message.get("message_id")
-        if not message_id:
-            raise RuntimeError("sendMessage: missing_message_id")
-        _telegram_call(token, "pinChatMessage", {
-            "chat_id": channel_id,
-            "message_id": message_id,
-            "disable_notification": True,
-        })
+        )
+        if post_ok and message:
+            message_id = message.get("message_id")
+            pin_ok, _, pin_error = _try_call(
+                token,
+                "pinChatMessage",
+                {
+                    "chat_id": channel_id,
+                    "message_id": message_id,
+                    "disable_notification": True,
+                },
+            )
+            if not pin_ok:
+                message_id = None
 
-    verified_chat = _telegram_call(token, "getChat", {"chat_id": channel_id}) or {}
-    my_description = _telegram_call(token, "getMyDescription") or {}
-    my_short = _telegram_call(token, "getMyShortDescription") or {}
+    verified_chat_ok, verified_chat, verify_chat_error = _try_call(
+        token, "getChat", {"chat_id": channel_id}
+    )
+    desc_ok, my_description, desc_error = _try_call(token, "getMyDescription")
+    short_ok, my_short, short_error = _try_call(token, "getMyShortDescription")
+    verified_chat = verified_chat or {}
     verified_pinned = verified_chat.get("pinned_message") or {}
 
-    return {
-        "channel_description_ok": verified_chat.get("description") == CHANNEL_DESCRIPTION,
-        "bot_description_ok": my_description.get("description") == BOT_DESCRIPTION,
-        "bot_short_description_ok": my_short.get("short_description") == BOT_SHORT_DESCRIPTION,
+    result = {
+        "channel_description_ok": bool(
+            verified_chat_ok and verified_chat.get("description") == CHANNEL_DESCRIPTION
+        ),
+        "channel_description_write_ok": channel_write_ok,
+        "bot_description_ok": bool(
+            desc_ok and (my_description or {}).get("description") == BOT_DESCRIPTION
+        ),
+        "bot_short_description_ok": bool(
+            short_ok and (my_short or {}).get("short_description") == BOT_SHORT_DESCRIPTION
+        ),
         "pinned_message_id": verified_pinned.get("message_id"),
-        "pinned_post_ok": str(verified_pinned.get("text") or "").startswith(PIN_TITLE),
+        "pinned_post_ok": bool(
+            verified_chat_ok
+            and str(verified_pinned.get("text") or "").startswith(PIN_TITLE)
+        ),
+        "channel_error": channel_write_error or chat_error or verify_chat_error,
+        "bot_description_error": bot_write_error or desc_error,
+        "bot_short_description_error": short_write_error or short_error,
+        "post_error": post_error,
+        "pin_error": pin_error,
     }
+    result["automated_ok"] = all([
+        result["bot_description_ok"],
+        result["bot_short_description_ok"],
+        result["pinned_post_ok"],
+    ])
+    return result
 
 
 class handler(BaseHTTPRequestHandler):
@@ -169,13 +216,7 @@ class handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(503, {"ok": False, "error": type(exc).__name__})
             return
-        ok = all([
-            result.get("channel_description_ok"),
-            result.get("bot_description_ok"),
-            result.get("bot_short_description_ok"),
-            result.get("pinned_post_ok"),
-        ])
-        self._send_json(200 if ok else 503, {"ok": ok, **result})
+        self._send_json(200 if result.get("automated_ok") else 503, {"ok": bool(result.get("automated_ok")), **result})
 
     def log_message(self, fmt, *args):
         pass
