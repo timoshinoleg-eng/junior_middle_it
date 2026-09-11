@@ -1,4 +1,4 @@
-"""Bind the production webhook processor to the localized P8 product runtime."""
+"""Bind request-driven product surfaces to the final localized runtime."""
 import interactive_webhook_runtime as base
 
 _original_runtime = base._runtime
@@ -6,7 +6,7 @@ _original_runtime = base._runtime
 
 def _localized_runtime():
     _runtime, core = _original_runtime()
-    import localized_product_runtime_v2 as localized
+    import localized_product_runtime_v3 as localized
     return localized, core
 
 
