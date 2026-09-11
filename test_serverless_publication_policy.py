@@ -16,6 +16,22 @@ class ServerlessPublicationPolicyTests(unittest.TestCase):
         with patch.dict(os.environ, {"SERVERLESS_MAX_JOB_AGE_DAYS": "7"}, clear=False):
             self.assertTrue(policy.is_fresh_for_serverless_publication(job, now=now))
 
+    def test_durable_source_published_at_is_supported(self):
+        expected = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        parsed = policy.parse_source_datetime(
+            {"source_published_at": "2026-09-10T12:00:00Z"}
+        )
+        self.assertEqual(parsed, expected)
+
+    def test_durable_source_date_has_priority_over_ledger_like_fallback_fields(self):
+        parsed = policy.parse_source_datetime(
+            {
+                "source_published_at": "2026-09-10T12:00:00Z",
+                "posted_at": "2026-09-11T12:00:00Z",
+            }
+        )
+        self.assertEqual(parsed, datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc))
+
     def test_old_job_is_rejected_and_counted(self):
         now = datetime(2026, 9, 10, 22, 0, tzinfo=timezone.utc)
         job = {"published": "2022-02-02T19:09:30Z"}
