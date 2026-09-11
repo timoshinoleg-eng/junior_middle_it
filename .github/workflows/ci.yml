@@ -62,6 +62,7 @@ jobs:
             test_p8_product_loop \
             test_product_i18n \
             test_callback_runtime_hotfix \
+            test_channel_bot_soft_link \
             test_interactive_webhook_runtime \
             test_api_webhook_contract \
             test_scheduled_delivery_runtime \
