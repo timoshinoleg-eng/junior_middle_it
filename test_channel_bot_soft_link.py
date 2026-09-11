@@ -34,6 +34,9 @@ class FakeDB:
     def list_saved_searches(self, _uid):
         return [FakeSearch()]
 
+    def maybe_unlock_premium(self, _uid):
+        return False
+
     def log_event(self, uid, name, props=None):
         self.events.append((uid, name, props or {}))
 
