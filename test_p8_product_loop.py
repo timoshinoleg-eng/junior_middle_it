@@ -77,7 +77,7 @@ class FakeDB:
 
 
 class P8VacancyCardTests(unittest.TestCase):
-    def test_card_prioritizes_apply_and_resume_without_referral_clutter(self):
+    def test_public_channel_card_prioritizes_apply_resume_and_private_search(self):
         job = {
             "hash": "abc123",
             "title": "Junior Python Developer",
@@ -91,12 +91,17 @@ class P8VacancyCardTests(unittest.TestCase):
             bot_username="junior_jobs_channel_bot",
         )["inline_keyboard"]
         labels = [[button["text"] for button in row] for row in keyboard]
+        flat = [button for row in keyboard for button in row]
+        flat_labels = [button["text"] for button in flat]
 
-        self.assertEqual(labels[0], ["🚀 Откликнуться", "📄 Resume Match"])
-        self.assertEqual(labels[1], ["💾 Сохранить", "📤 Поделиться"])
-        self.assertIn("⬇️ Подробнее", labels[2])
-        self.assertNotIn("🎁 Пригласить друзей", [label for row in labels for label in row])
-        self.assertEqual(len(keyboard), 3)
+        self.assertEqual(labels[0], ["🚀 Откликнуться", "📄 Проверить резюме"])
+        self.assertEqual(labels[1], ["🎯 Мой поиск вакансий", "📤 Поделиться"])
+        self.assertNotIn("💾 Сохранить", flat_labels)
+        self.assertNotIn("⬇️ Подробнее", flat_labels)
+        self.assertNotIn("🎁 Пригласить друзей", flat_labels)
+        self.assertFalse(any(label.startswith("🚫") for label in flat_labels))
+        self.assertTrue(all("callback_data" not in button for button in flat))
+        self.assertEqual(len(keyboard), 2)
 
 
 class P8RetentionHubTests(unittest.IsolatedAsyncioTestCase):
