@@ -159,6 +159,20 @@ There must be exactly one production vacancy scheduler.
 It calls the canonical `/api/cron` with `Authorization: Bearer <CRON_SECRET>`.
 `vercel.json` must not define a second cron schedule.
 
+## Publication authority lock
+
+Public Telegram channel publication is additionally protected below the collector layer.
+`publication_authority.py` installs a process-wide guard on Telegram `Bot.send_message` through the shared runtime bootstrap.
+
+The contract is fail-closed:
+
+- only `VERCEL=1` together with `VERCEL_ENV=production` may send to `CHANNEL_ID` or configured multi-track channel IDs;
+- Vercel preview deployments are not authorized publishers;
+- Render, Railway, local workers and forgotten non-Vercel runtimes may still send direct messages to users, but attempts to send to configured public channels raise `PublicChannelPublicationDenied`;
+- `railway.json` intentionally exits instead of starting `channel_bot.py`, with `restartPolicyType=NEVER`, so a Railway auto-deploy disables the legacy publisher rather than restarting it.
+
+This protects current deployments after they receive the hardened revision. A host that remains alive on an older commit and still possesses the Telegram bot token cannot be revoked by repository code alone; invalidate that class of stale runtime by rotating the Telegram bot token and provisioning the replacement token only on approved runtimes.
+
 ## Production smoke gates
 
 Serverless/public gates:
@@ -170,7 +184,9 @@ Serverless/public gates:
 5. authenticated collector runs return 200;
 6. durable protocol ends with no stranded `pending`/`sending` rows;
 7. public landing displays only `published` payloads;
-8. `web_home`, `web_<hash>` and `resume_<hash>` links are generated correctly.
+8. `web_home`, `web_<hash>` and `resume_<hash>` links are generated correctly;
+9. production Vercel may send to the configured public channel while non-Vercel runtimes are transport-blocked;
+10. Railway legacy publisher entrypoint remains disabled.
 
 Interactive gates, to run once an always-on Telegram runtime is enabled:
 
