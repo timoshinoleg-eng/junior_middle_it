@@ -27,9 +27,52 @@ if CallbackQuery.answer is not _resilient_callback_answer:
     CallbackQuery.answer = _resilient_callback_answer
 
 
+def _optimized_ledger_claim(self, update_id: int) -> str:
+    """Claim a new update with cleanup folded into the same SQL round-trip."""
+    uid = int(update_id)
+    with self.store._ensure_conn().cursor() as cur:
+        cur.execute(
+            """
+            WITH cleanup AS (
+                DELETE FROM growth_telegram_updates
+                WHERE state='processed'
+                  AND processed_at < NOW() - INTERVAL '30 days'
+                RETURNING update_id
+            )
+            INSERT INTO growth_telegram_updates
+                (update_id, state, lease_expires_at, first_seen_at, processed_at)
+            VALUES (%s, 'processing', NOW() + INTERVAL '10 minutes', NOW(), NULL)
+            ON CONFLICT (update_id) DO UPDATE SET
+                state='processing',
+                lease_expires_at=NOW() + INTERVAL '10 minutes',
+                processed_at=NULL
+            WHERE growth_telegram_updates.state='processing'
+              AND growth_telegram_updates.lease_expires_at IS NOT NULL
+              AND growth_telegram_updates.lease_expires_at <= NOW()
+            RETURNING update_id
+            """,
+            (uid,),
+        )
+        if cur.fetchone():
+            return "claimed"
+        cur.execute(
+            "SELECT state FROM growth_telegram_updates WHERE update_id=%s LIMIT 1",
+            (uid,),
+        )
+        row = cur.fetchone()
+    if row and str(row[0]) == "processed":
+        return "processed"
+    return "busy"
+
+
+_optimized_ledger_claim._latency_hardened = True
+if not getattr(base.TelegramUpdateLedger.claim, "_latency_hardened", False):
+    base.TelegramUpdateLedger.claim = _optimized_ledger_claim
+
+
 def _localized_runtime():
     _runtime, core = _original_runtime()
-    import localized_product_runtime_v5 as localized
+    import localized_product_runtime_v6 as localized
     return localized, core
 
 
