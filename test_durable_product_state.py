@@ -222,7 +222,10 @@ class DurableProductCallbackTests(unittest.IsolatedAsyncioTestCase):
         await bot.handle_callback(update, context)
         update.callback_query.answer.assert_awaited_once_with("Сохранено")
         context.bot.send_message.assert_awaited_once()
-        self.assertEqual(bot.db.events[0], (77, "save_job", {"hash": "pub1"}))
+        self.assertEqual(
+            bot.db.events[0],
+            (77, "save_job", {"hash": "pub1", "source": "p8_card"}),
+        )
 
 
 if __name__ == "__main__":
