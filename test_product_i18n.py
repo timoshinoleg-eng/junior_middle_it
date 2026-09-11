@@ -1,8 +1,8 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
-import localized_product_runtime_v2 as runtime
+import localized_product_runtime_v3 as runtime
 from product_i18n import t
 
 
@@ -30,6 +30,14 @@ class FakeSearch:
     skills = "python"
     categories = ["development"]
 
+    def as_profile(self):
+        return {
+            "enabled_categories": list(self.categories),
+            "skills": self.skills,
+            "min_salary_filter": 0,
+            "hide_senior": True,
+        }
+
 
 class FakeDB:
     def __init__(self, language=""):
@@ -44,6 +52,16 @@ class FakeDB:
             "digest_enabled": False,
         }
         self.events = []
+        self.jobs = [{
+            "hash": "abc123",
+            "title": "Junior Python Developer",
+            "company": "Example",
+            "category": "development",
+            "level": "Junior",
+            "location": "Remote",
+            "url": "https://example.com/job",
+            "tags": ["python"],
+        }]
 
     def get_user_language(self, _uid):
         return self.language
@@ -62,6 +80,12 @@ class FakeDB:
 
     def list_saved_searches(self, _uid):
         return [FakeSearch()]
+
+    def list_alert_subscribers(self):
+        return [77]
+
+    def recent_jobs_for_digest(self, **_kwargs):
+        return list(self.jobs)
 
     def log_event(self, uid, name, props=None):
         self.events.append((uid, name, props or {}))
@@ -127,7 +151,7 @@ class LocalizedHubTests(unittest.IsolatedAsyncioTestCase):
         bot.cmd_start.assert_awaited_once()
         proxy_update, proxy_context = bot.cmd_start.await_args.args
         self.assertIs(proxy_update.message, query.message)
-        self.assertEqual(proxy_context.args, [])
+        self.assertIs(proxy_context, context)
         self.assertEqual(context.args, [])
 
     async def test_russian_hub_is_novice_friendly(self):
@@ -166,6 +190,29 @@ class LocalizedHubTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("✅ QA / Testing", labels)
         self.assertIn("✅ Next: salary", labels)
         self.assertNotIn("Разработка", labels)
+
+    async def test_daily_roundup_follows_english_language(self):
+        bot = self.make_bot("en")
+        bot._effective_profile = lambda _uid: dict(bot.db.settings)
+        bot._digest_limit = lambda _settings: 5
+        with patch.object(runtime.core, "GROWTH_UTILS_AVAILABLE", False):
+            sent = await bot.send_personal_digest(77)
+
+        self.assertEqual(sent, 1)
+        calls = bot.application.bot.send_message.await_args_list
+        self.assertGreaterEqual(len(calls), 2)
+        header = calls[0].kwargs["text"]
+        card = calls[1].kwargs["text"]
+        self.assertIn("Your daily roundup", header)
+        self.assertNotIn("подбор", header.lower())
+        self.assertIn("Junior Python Developer", card)
+        labels = [
+            button.text
+            for row in calls[1].kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("🚀 Apply", labels)
+        self.assertIn("📄 Check my resume", labels)
 
 
 if __name__ == "__main__":
