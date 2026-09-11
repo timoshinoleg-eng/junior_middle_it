@@ -46,8 +46,42 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$CRON_SECRET"
-          curl --fail-with-body --silent --show-error \
-            --connect-timeout 20 --max-time 120 \
-            -H "Authorization: Bearer $CRON_SECRET" \
-            -X POST \
-            "https://junior-middle-it.vercel.app/api/webhook-admin?action=$ACTION"
+
+          endpoint="https://junior-middle-it.vercel.app/api/webhook-admin?action=$ACTION"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+
+          # Production Smoke can finish a few seconds before Vercel promotes the
+          # matching main deployment. Retry only transient deployment/proxy
+          # statuses; auth/configuration errors still fail immediately.
+          for attempt in {1..18}; do
+            status="$(curl --silent --show-error \
+              --connect-timeout 20 --max-time 120 \
+              -o "$response_file" -w '%{http_code}' \
+              -H "Authorization: Bearer $CRON_SECRET" \
+              -X POST \
+              "$endpoint" || true)"
+
+            if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+              cat "$response_file"
+              exit 0
+            fi
+
+            cat "$response_file" >&2 || true
+            case "$status" in
+              404|502|503|504|000)
+                if [[ "$attempt" -lt 18 ]]; then
+                  echo "Webhook admin endpoint not ready yet (HTTP $status, attempt $attempt/18); retrying..." >&2
+                  sleep 10
+                  continue
+                fi
+                ;;
+              *)
+                echo "Webhook admin request failed with non-transient HTTP $status" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          echo "Webhook admin endpoint did not become ready after deployment grace period" >&2
+          exit 1

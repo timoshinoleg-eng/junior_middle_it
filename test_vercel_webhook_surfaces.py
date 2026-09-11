@@ -29,6 +29,14 @@ class VercelWebhookSurfaceTests(unittest.TestCase):
         self.assertIn("/api/webhook-admin?action=$ACTION", text)
         self.assertIn("secrets.CRON_SECRET", text)
 
+    def test_webhook_admin_tolerates_only_transient_deployment_race(self):
+        text = Path(".github/workflows/webhook-admin.yml").read_text(encoding="utf-8")
+        self.assertIn("for attempt in {1..18}", text)
+        self.assertIn("404|502|503|504|000", text)
+        self.assertIn("sleep 10", text)
+        self.assertIn("non-transient HTTP", text)
+        self.assertIn("did not become ready after deployment grace period", text)
+
     def test_webhook_runtime_never_starts_background_runtime(self):
         text = Path("interactive_webhook_runtime.py").read_text(encoding="utf-8")
         self.assertNotIn("run_polling(", text)
