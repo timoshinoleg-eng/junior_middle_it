@@ -1,27 +1,19 @@
-"""
-Test script для проверки фикса MarkdownV2 экранирования символа '|'
-"""
-import re
+"""Regression checks for MarkdownV2 escaping in the public channel formatter."""
 from message_formatter import JobMessageFormatter
 
 fmt = JobMessageFormatter()
 
 
 def test_escape_markdown_v2():
-    """Тест _escape_markdown_v2"""
     assert fmt._escape_markdown_v2('a | b') == 'a \\| b', f"FAIL pipe: {fmt._escape_markdown_v2('a | b')!r}"
-    
     result = fmt._escape_markdown_v2('a \\| b')
     assert result == 'a \\\\\\| b', f"FAIL escaped pipe: {result!r}"
-    
     assert fmt._escape_markdown_v2('_*[]()~`>#+-=|{}.!') == \
         '\\_\\*\\[\\]\\(\\)\\~\\`\\>\\#\\+\\-\\=\\|\\{\\}\\.\\!'
-    
     print("OK: _escape_markdown_v2")
 
 
 def test_escape_url():
-    """Тест _escape_url"""
     assert fmt._escape_url('https://example.com/job|123') == \
         'https://example.com/job%7C123', "FAIL URL pipe"
     assert fmt._escape_url('https://example.com/job)123') == \
@@ -31,74 +23,56 @@ def test_escape_url():
     print("OK: _escape_url")
 
 
-def test_format_compact():
-    """Тест _format_compact с | в полях"""
-    job = {
+def _job(level='Junior'):
+    return {
         'title': 'Python Developer | Django',
         'company': 'Company | Subsidiary',
-        'level': 'Junior',
+        'level': level,
         'category': 'development',
+        'primary_track': 'development',
         'salary': '$3000 | $5000',
         'location': 'Remote | Worldwide',
         'url': 'https://example.com/job|123',
-        'description': 'Use Python | Django | React',
+        'description': 'Use Python | Django | React to build production APIs and services.',
         'tags': ['Python', 'Django'],
-        'source': 'Test',
+        'source': 'Test | Source',
         'hash': 'abc',
     }
-    text = fmt._format_compact(job)
-    
+
+
+def test_format_compact():
+    text = fmt._format_compact(_job())
     assert 'Python Developer \\| Django' in text
     assert 'Company \\| Subsidiary' in text
     assert 'Remote \\| Worldwide' in text
     assert '$3000 \\| $5000' in text
-    assert 'job%7C123' in text
-    
+    assert 'Use Python \\| Django \\| React' in text
+    assert 'https://example.com' not in text
     lines = text.split('\n')
     for line in lines:
         if ' | ' in line and ' \\| ' not in line:
             raise AssertionError(f"Неэкранированный pipe в строке: {line!r}")
-    
     print("OK: _format_compact")
 
 
 def test_format_full():
-    """Тест _format_full с | в полях"""
-    job = {
-        'title': 'Python Developer | Django',
-        'company': 'Company | Subsidiary',
-        'level': 'Middle',
-        'category': 'development',
-        'salary': '$3000 | $5000',
-        'location': 'Remote | Worldwide',
-        'description': 'Use Python | Django | React',
-        'tags': ['Python', 'Django'],
-        'source': 'Test | Source',
-        'url': 'https://example.com/job|123',
-        'hash': 'abc',
-    }
-    text = fmt._format_full(job)
-    
+    text = fmt._format_full(_job('Middle'))
     assert 'Python Developer \\| Django' in text
     assert 'Company \\| Subsidiary' in text
     assert 'Remote \\| Worldwide' in text
     assert '$3000 \\| $5000' in text
     assert 'Test \\| Source' in text
-    assert 'job%7C123' in text
-    
+    assert 'https://example.com' not in text
     print("OK: _format_full")
 
 
 def test_format_job_list():
-    """Тест format_job_list с | в полях"""
-    jobs = [
-        {
-            'title': 'Dev | Ops',
-            'company': 'Corp | Inc',
-            'level': 'Junior',
-            'category': 'devops',
-        }
-    ]
+    jobs = [{
+        'title': 'Dev | Ops',
+        'company': 'Corp | Inc',
+        'level': 'Junior',
+        'category': 'devops',
+    }]
     text = fmt.format_job_list(jobs)
     assert 'Dev \\| Ops' in text
     assert 'Corp \\| Inc' in text
