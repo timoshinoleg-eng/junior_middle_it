@@ -59,6 +59,7 @@ jobs:
             test_public_acquisition_runtime \
             test_durable_runtime_state \
             test_durable_product_state \
+            test_p8_product_loop \
             test_interactive_webhook_runtime \
             test_api_webhook_contract \
             test_scheduled_delivery_runtime \

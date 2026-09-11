@@ -1,4 +1,4 @@
-"""Cohort-correct product metrics for the P7 production runtime.
+"""Cohort-correct product metrics for the P7/P8 production runtime.
 
 Definitions:
 - acquisition cohort: users whose first-ever ``start`` is in the reporting window;
@@ -22,6 +22,9 @@ HIGH_INTENT_EVENTS = [
     "personal_digest_sent",
     "realtime_alert_sent",
     "first_value_delivered",
+    "first_value_preview_sent",
+    "resume_match_completed",
+    "saved_search_created",
 ]
 
 

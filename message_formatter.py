@@ -42,12 +42,7 @@ def build_telegram_share_url(job: dict, bot_username: str = "") -> str:
 
 
 def build_resume_match_url(job: dict, bot_username: str = "") -> str:
-    """Open Resume Match in the user's private bot chat.
-
-    A callback button on a public channel post does not establish a private bot
-    conversation.  A Telegram ``start`` deep link does, and also gives us an
-    attributable acquisition payload.
-    """
+    """Open Resume Match in the user's private bot chat."""
     username = str(bot_username or "").strip().lstrip("@")
     job_id = str(job.get("hash") or job.get("content_hash") or "")[:40]
     if not username or not job_id:
@@ -56,7 +51,7 @@ def build_resume_match_url(job: dict, bot_username: str = "") -> str:
 
 
 class JobMessageFormatter(_BaseJobMessageFormatter):
-    """Base formatter with working share and Resume Match actions."""
+    """Base formatter with a compact action hierarchy for mobile users."""
 
     def create_inline_keyboard(
         self,
@@ -64,40 +59,47 @@ class JobMessageFormatter(_BaseJobMessageFormatter):
         view_mode: str = "compact",
         bot_username: str = "",
     ) -> dict:
-        keyboard = super().create_inline_keyboard(
-            job,
-            view_mode=view_mode,
-            bot_username=bot_username,
-        )
-        rows = keyboard.setdefault("inline_keyboard", [])
-        share_url = build_telegram_share_url(job, bot_username=bot_username)
-
-        if share_url:
-            for row in rows:
-                for button in row:
-                    if button.get("text") == "📤 Поделиться":
-                        button.clear()
-                        button.update({"text": "📤 Поделиться", "url": share_url})
-                        break
-
         job_id = str(job.get("hash") or job.get("content_hash") or "")[:40]
+        url = str(job.get("url") or "").strip()
+        category = str(job.get("category") or "other")
+        rows = []
+
+        primary = []
+        if url:
+            primary.append({"text": "🚀 Откликнуться", "url": url})
         if job_id:
             resume_url = build_resume_match_url(job, bot_username=bot_username)
-            resume_button = {"text": "📄 Проверить резюме"}
+            resume_button = {"text": "📄 Resume Match"}
             if resume_url:
                 resume_button["url"] = resume_url
             else:
-                # Local/dev fallback for bot cards when BOT_USERNAME is absent.
                 resume_button["callback_data"] = f"resume_match:{job_id}"
+            primary.append(resume_button)
+        if primary:
+            rows.append(primary)
 
-            insert_at = 1 if rows else 0
-            if not any(
-                button.get("text") == "📄 Проверить резюме"
-                for row in rows
-                for button in row
-            ):
-                rows.insert(insert_at, [resume_button])
-        return keyboard
+        utility = []
+        if job_id:
+            utility.append({"text": "💾 Сохранить", "callback_data": f"save:{job_id}"})
+        share_url = build_telegram_share_url(job, bot_username=bot_username)
+        if share_url:
+            utility.append({"text": "📤 Поделиться", "url": share_url})
+        if utility:
+            rows.append(utility)
+
+        details = []
+        if job_id:
+            details.append({
+                "text": "⬇️ Подробнее" if view_mode == "compact" else "⬆️ Свернуть",
+                "callback_data": f"{'expand' if view_mode == 'compact' else 'compact'}:{job_id}",
+            })
+        details.append({
+            "text": f"🚫 {CATEGORY_NAMES_RU.get(category, category)}",
+            "callback_data": f"hide_cat:{category}",
+        })
+        rows.append(details)
+
+        return {"inline_keyboard": rows}
 
 
 _formatter = None

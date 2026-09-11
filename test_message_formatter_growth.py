@@ -52,7 +52,7 @@ class TelegramShareGrowthTests(unittest.TestCase):
             button
             for row in keyboard["inline_keyboard"]
             for button in row
-            if button.get("text") == "📄 Проверить резюме"
+            if button.get("text") == "📄 Resume Match"
         )
         self.assertEqual(
             resume["url"],
@@ -71,7 +71,7 @@ class TelegramShareGrowthTests(unittest.TestCase):
             button
             for row in keyboard["inline_keyboard"]
             for button in row
-            if button.get("text") == "📄 Проверить резюме"
+            if button.get("text") == "📄 Resume Match"
         )
         self.assertEqual(resume["callback_data"], "resume_match:abc123def4567890")
         self.assertNotIn("url", resume)
