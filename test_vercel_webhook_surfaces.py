@@ -37,20 +37,13 @@ class VercelWebhookSurfaceTests(unittest.TestCase):
         self.assertIn("non-transient HTTP", text)
         self.assertIn("did not become ready after deployment grace period", text)
 
-    def test_branding_workflow_is_manual_and_cleanup_is_allowlisted(self):
+    def test_branding_workflow_is_manual_and_never_posts_intro(self):
         branding = Path(".github/workflows/telegram-branding-once.yml").read_text(encoding="utf-8")
-        cleanup = Path(".github/workflows/telegram-cleanup-branding-duplicates.yml").read_text(encoding="utf-8")
         endpoint = Path("api/telegram_branding_admin.py").read_text(encoding="utf-8")
         self.assertIn("workflow_dispatch:", branding)
         self.assertNotIn("workflow_run:", branding)
-        self.assertNotIn("sendMessage", branding)
-        self.assertIn("CRON_SECRET", cleanup)
-        self.assertIn("action=cleanup", cleanup)
-        self.assertIn("X-Cleanup-Confirmation", cleanup)
-        self.assertIn("deleteMessage", endpoint)
-        self.assertIn("range(7493, 7526)", endpoint)
-        self.assertIn("range(7557, 7575)", endpoint)
-        self.assertIn('test "$CONFIRMATION" = "DELETE"', cleanup)
+        self.assertNotIn("sendMessage", endpoint)
+        self.assertNotIn("pinChatMessage", endpoint)
 
     def test_webhook_runtime_never_starts_background_runtime(self):
         text = Path("interactive_webhook_runtime.py").read_text(encoding="utf-8")
