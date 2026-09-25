@@ -64,20 +64,21 @@ jobs:
             test_callback_runtime_hotfix \
             test_channel_bot_soft_link \
             test_webhook_latency_hotfix \
-            test_setup_ux_v8 \
-            test_interactive_webhook_runtime \
-            test_api_webhook_contract \
+             test_setup_ux_v8 \
+             test_interactive_webhook_runtime \
+             test_api_webhook_contract \
              test_scheduled_delivery_runtime \
              test_telegram_webhook_admin \
              test_telegram_branding_admin \
              test_p7_growth_metrics \
              test_http_growth_patch \
+             test_render_main \
+             test_secure_http_logging \
+             test_serverless_health \
+             test_vercel_router \
+             test_vercel_webhook_surfaces
 
-            test_render_main \
-            test_secure_http_logging \
-            test_serverless_health \
-            test_vercel_router \
-            test_vercel_webhook_surfaces
+
 
       - name: Run formatter regression script
         run: python test_formatter_fix.py
