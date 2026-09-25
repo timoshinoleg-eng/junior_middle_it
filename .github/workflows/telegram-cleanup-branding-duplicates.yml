@@ -30,7 +30,7 @@ jobs:
           import urllib.error
           import urllib.request
 
-          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
           message_ids = list(range(7493, 7526)) + list(range(7557, 7575))
           endpoint = f"https://api.telegram.org/bot{token}/deleteMessage"
           failures = []
