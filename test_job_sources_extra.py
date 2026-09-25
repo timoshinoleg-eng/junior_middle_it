@@ -1,6 +1,7 @@
 """Tests for v6.5 extra job sources (offline + optional live)."""
 import os
 import unittest
+import xml.etree.ElementTree as ET
 
 from job_sources_extra import (
     RSS_FEEDS,
@@ -13,6 +14,7 @@ from job_sources_extra import (
     get_extra_fetchers,
     run_fetcher,
     _parse_remoteok_json,
+    _first_text,
 )
 
 
@@ -68,6 +70,30 @@ class SourceHealthTests(unittest.TestCase):
         jobs = _parse_remoteok_json(data)
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["title"], "Junior Python Engineer")
+
+    def test_remoteok_epoch_is_used_when_date_is_missing(self):
+        jobs = _parse_remoteok_json(
+            [
+                {
+                    "id": "1",
+                    "position": "Junior Python Engineer",
+                    "company": "Acme",
+                    "url": "https://x",
+                    "date": "",
+                    "epoch": 1789012345,
+                }
+            ]
+        )
+        self.assertEqual(jobs[0]["published"], 1789012345)
+
+    def test_xml_text_lookup_accepts_case_and_namespace_variants(self):
+        item = ET.fromstring(
+            '<job xmlns:ns="urn:test"><ns:pubDate>2026-09-25T10:00:00Z</ns:pubDate></job>'
+        )
+        self.assertEqual(
+            _first_text(item, "pubDate"),
+            "2026-09-25T10:00:00Z",
+        )
 
     def test_rss_feeds_no_dead_hosts(self):
         hosts = " ".join(u for _, u, _ in RSS_FEEDS)

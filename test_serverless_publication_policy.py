@@ -66,6 +66,44 @@ class ServerlessPublicationPolicyTests(unittest.TestCase):
         )
         self.assertEqual(parsed, datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc))
 
+    def test_invalid_primary_date_falls_back_to_next_valid_candidate(self):
+        parsed = policy.parse_source_datetime(
+            {
+                "source_published_at": "not-a-date",
+                "published": "2026-09-10T12:00:00Z",
+            }
+        )
+        self.assertEqual(parsed, datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc))
+
+    def test_freshness_reports_source_and_canonicalizes_payload_date(self):
+        now = datetime(2026, 9, 10, 22, 0, tzinfo=timezone.utc)
+        job = {"source": "RSS:WWR Full-Stack", "published": "2026-09-10T12:00:00Z"}
+        with patch.dict(os.environ, {"SERVERLESS_MAX_JOB_AGE_DAYS": "7"}, clear=False):
+            self.assertTrue(policy.is_fresh_for_serverless_publication(job, now=now))
+        snapshot = policy.publication_policy_snapshot()
+        row = snapshot["by_source"]["RSS:WWR Full-Stack"]
+        self.assertEqual(row["freshness_checked"], 1)
+        self.assertEqual(row["freshness_passed"], 1)
+        self.assertEqual(row["max_job_age_days"], 7)
+        self.assertEqual(job["source_date_field"], "published")
+        self.assertEqual(job["source_published_at"], "2026-09-10T12:00:00+00:00")
+
+    def test_source_specific_max_age_can_be_configured(self):
+        now = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        job = {
+            "source": "RSS:WWR Full-Stack",
+            "published": "2026-09-12T12:00:00Z",
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "SERVERLESS_MAX_JOB_AGE_DAYS": "7",
+                "SERVERLESS_SOURCE_MAX_AGE_DAYS_JSON": '{"RSS": "14"}',
+            },
+            clear=False,
+        ):
+            self.assertTrue(policy.is_fresh_for_serverless_publication(job, now=now))
+
     def test_vercel_policy_sets_conservative_burst_ceiling(self):
         original = policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE
         try:

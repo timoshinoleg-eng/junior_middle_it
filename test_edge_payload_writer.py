@@ -66,6 +66,19 @@ class EdgePayloadWriterTests(unittest.TestCase):
         ):
             self.assertFalse(writer.save_job_payload_edge("abc123", {"title": "QA"}))
 
+    def test_compact_payload_prefers_canonical_source_date(self):
+        payload = writer.compact_job_payload(
+            "abc123",
+            {
+                "title": "Junior QA",
+                "source": "Arbeitnow",
+                "source_published_at": "2026-09-25T10:00:00Z",
+                "published": "2026-09-24T10:00:00Z",
+            },
+        )
+        self.assertEqual(payload["source_published_at"], "2026-09-25T10:00:00Z")
+        self.assertEqual(payload["source_date_field"], "source_published_at")
+
     def test_release_uses_compensation_endpoint(self):
         captured = {}
 

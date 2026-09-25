@@ -28,6 +28,35 @@ FX_TO_USD = {
     "£": 1.27,
 }
 
+SOURCE_DATE_FIELDS = (
+    "source_published_at",
+    "published",
+    "created",
+    "publication_date",
+    "date_published",
+    "posted_at",
+    "posted_date",
+    "pub_date",
+    "published_at",
+    "date",
+)
+
+
+def source_date_field(job: Dict) -> str:
+    for field in SOURCE_DATE_FIELDS:
+        value = job.get(field)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"none", "null", "n/a"}:
+            return field
+    return ""
+
+
+def source_date_value(job: Dict):
+    field = source_date_field(job)
+    return job.get(field, "") if field else ""
+
 
 def job_fingerprint(job: Dict) -> str:
     title = re.sub(r"\s+", " ", str(job.get("title", "")).lower()).strip()
@@ -812,6 +841,16 @@ def serialize_job_payload(job: Dict) -> Dict:
         "description": str(job.get("description") or "")[:800],
         "url": job.get("url") or "",
         "source": job.get("source") or "",
+        "source_published_at": source_date_value(job),
+        "source_date_field": source_date_field(job),
         "tags": tags[:12],
         "salary_min_usd": job.get("salary_min_usd"),
+        "quality_gate_status": job.get("quality_gate_status") or "",
+        "primary_track": job.get("primary_track") or job.get("thematic_track") or "",
+        "specialization_tags": job.get("specialization_tags") or [],
+        "remote_scope": job.get("remote_scope") or "",
+        "level_source": job.get("level_source") or "",
+        "level_confidence": job.get("level_confidence"),
+        "url_preflight_status": job.get("url_preflight_status") or "",
+        "url_preflight_http_status": job.get("url_preflight_http_status"),
     }

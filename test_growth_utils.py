@@ -110,6 +110,23 @@ class GrowthUtilsTests(unittest.TestCase):
         self.assertEqual(p["title"], "T")
         self.assertLessEqual(len(p["description"]), 800)
 
+    def test_serialize_payload_preserves_source_date_and_quality_metadata(self):
+        payload = serialize_job_payload(
+            {
+                "title": "Junior QA",
+                "source": "Arbeitnow",
+                "published": "2026-09-25T10:00:00Z",
+                "quality_gate_status": "passed",
+                "primary_track": "qa",
+                "remote_scope": "worldwide",
+            }
+        )
+        self.assertEqual(payload["source_published_at"], "2026-09-25T10:00:00Z")
+        self.assertEqual(payload["source_date_field"], "published")
+        self.assertEqual(payload["quality_gate_status"], "passed")
+        self.assertEqual(payload["primary_track"], "qa")
+        self.assertEqual(payload["remote_scope"], "worldwide")
+
     def test_salary_magnet_report(self):
         jobs = [
             {"category": "development", "level": "Junior", "salary_min_usd": 30000},

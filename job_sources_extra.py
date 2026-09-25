@@ -45,6 +45,11 @@ def _first_text(parent, *names: str) -> str:
         child = parent.find(name)
         if child is not None and child.text:
             return child.text.strip()
+        target = name.lower()
+        for candidate in list(parent):
+            tag = str(candidate.tag).rsplit("}", 1)[-1].lower()
+            if tag == target and candidate.text:
+                return candidate.text.strip()
     return ""
 
 
@@ -439,8 +444,9 @@ def fetch_rss_jobs(feeds: Optional[List[Tuple[str, str, bool]]] = None, limit_pe
                 )
                 pub = (
                     _first_text(item, "pubDate")
-                    or _first_text(item, "updated")
                     or _first_text(item, "published")
+                    or _first_text(item, "updated")
+                    or _first_text(item, "date")
                 )
                 company = (
                     _first_text(item, "companyName")

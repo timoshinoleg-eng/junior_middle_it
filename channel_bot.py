@@ -1433,6 +1433,11 @@ def first_text(parent, *names: str) -> str:
         child = parent.find(name)
         if child is not None and child.text:
             return child.text.strip()
+        target = name.lower()
+        for candidate in list(parent):
+            tag = str(candidate.tag).rsplit('}', 1)[-1].lower()
+            if tag == target and candidate.text:
+                return candidate.text.strip()
     return ''
 
 
@@ -1460,9 +1465,70 @@ def base_source_name(job: Dict) -> str:
     return str(job.get('source', '') or 'Unknown').split(':', 1)[0].strip() or 'Unknown'
 
 
+_SOURCE_FUNNEL_FIELDS = (
+    'fetched',
+    'not_suitable',
+    'suitable',
+    'no_level',
+    'level_passed',
+    'quality_rejected',
+    'quality_passed',
+    'classified',
+    'salary_filter',
+    'salary_passed',
+    'track_filter',
+    'track_passed',
+    'duplicates',
+    'preflight_excluded',
+    'selected',
+    'posted',
+    'failed',
+)
+
+
+def diagnostic_source_name(job_or_source) -> str:
+    source = (
+        str(job_or_source.get('source') or '')
+        if isinstance(job_or_source, dict)
+        else str(job_or_source or '')
+    ).strip()
+    if not source:
+        return 'Unknown'
+    if source.startswith('RSS:'):
+        return 'RSS boards'
+    if source.upper().startswith('TG:'):
+        return 'Telegram channels'
+    return source.split(':', 1)[0].strip() or 'Unknown'
+
+
+def _new_source_funnel(source_results: List[Dict]) -> Dict[str, Dict[str, int]]:
+    funnel = {}
+    for result in source_results:
+        source = diagnostic_source_name(result.get('source', 'Unknown'))
+        row = funnel.setdefault(
+            source,
+            {field: 0 for field in _SOURCE_FUNNEL_FIELDS},
+        )
+        row['fetched'] = int(result.get('fetched') or 0)
+    return funnel
+
+
+def _source_funnel_bucket(funnel: Dict[str, Dict[str, int]], job: Dict) -> Dict[str, int]:
+    source = diagnostic_source_name(job)
+    return funnel.setdefault(
+        source,
+        {field: 0 for field in _SOURCE_FUNNEL_FIELDS},
+    )
+
+
+def _bump_source_funnel(funnel: Dict[str, Dict[str, int]], job: Dict, field: str) -> None:
+    row = _source_funnel_bucket(funnel, job)
+    row[field] = row.get(field, 0) + 1
+
+
 def parse_job_datetime(job: Dict) -> Optional[datetime]:
     """Best-effort parsing of heterogeneous source date fields."""
-    raw = job.get('published') or job.get('created') or job.get('publication_date') or job.get('date_published')
+    raw = job.get('source_published_at') or job.get('published') or job.get('created') or job.get('publication_date') or job.get('date_published')
     if not raw:
         return None
     value = str(raw).strip()
@@ -1892,7 +1958,7 @@ def fetch_remoteok() -> List[Dict]:
                 'url': job.get('url', ''),
                 'salary': job.get('salary', ''),
                 'location': job.get('location', 'Remote'),
-                'published': job.get('date', ''),
+                'published': job.get('date') or job.get('epoch') or '',
                 'employment_type': job.get('position_type', ''),
                 'source': 'RemoteOK',
                 'tags': job.get('tags', [])
@@ -2077,7 +2143,7 @@ def fetch_devitjobs() -> List[Dict]:
                 'url': first_text(item, 'url', 'link', 'apply_url'),
                 'salary': first_text(item, 'salary') or 'Не указана',
                 'location': location,
-                'published': first_text(item, 'pubdate'),
+                'published': first_text(item, 'pubDate', 'published', 'updated'),
                 'employment_type': first_text(item, 'jobtype', 'job-type', 'job-status'),
                 'source': 'DevITJobs UK',
                 'tags': []
@@ -2458,7 +2524,7 @@ def fetch_superjob() -> List[Dict]:
                 'url': item.get('link', ''),
                 'salary': salary,
                 'location': 'Удалённо',
-                'published': str(item.get('date_published', '')),
+                'published': item.get('date_published') or '',
                 'employment_type': employment_name,
                 'source': 'SuperJob',
                 'tags': []
@@ -2527,7 +2593,7 @@ def fetch_lever() -> List[Dict]:
                     'url': item.get('hostedUrl', '') or item.get('applyUrl', ''),
                     'salary': 'Не указана',
                     'location': location,
-                    'published': str(item.get('createdAt', '')),
+                    'published': item.get('createdAt') or '',
                     'employment_type': categories.get('commitment', ''),
                     'source': f'Lever:{company}',
                     'tags': [categories.get('team', '')] if categories.get('team') else []
@@ -3020,20 +3086,26 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
                 all_jobs.extend(tg_jobs)
                 source_results.append({'source': 'Telegram channels', 'fetched': len(tg_jobs)})
 
+        source_funnel = _new_source_funnel(source_results)
         classified_jobs = []
         for job in all_jobs:
             if GROWTH_UTILS_AVAILABLE:
                 normalize_job_title_company(job)
             if not is_suitable_job(job):
+                _bump_source_funnel(source_funnel, job, 'not_suitable')
                 continue
+            _bump_source_funnel(source_funnel, job, 'suitable')
             level = classify_job_level(job)
             if not level:
+                _bump_source_funnel(source_funnel, job, 'no_level')
                 continue
+            _bump_source_funnel(source_funnel, job, 'level_passed')
             job['level'] = level
             job['category'] = auto_classify_category(job)
             if GROWTH_UTILS_AVAILABLE:
                 apply_editorial_quality_gate(job, remote_only_sources=tuple(REMOTE_ONLY_SOURCES))
                 if job.get('quality_gate_status') != 'passed':
+                    _bump_source_funnel(source_funnel, job, 'quality_rejected')
                     logger.debug(
                         "⏭️ Editorial gate %s: %s (%s)",
                         job.get('quality_gate_status'),
@@ -3041,8 +3113,10 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
                         ', '.join(job.get('quarantine_reasons') or []),
                     )
                     continue
+            _bump_source_funnel(source_funnel, job, 'quality_passed')
             job['hash'] = generate_job_hash(job)
             classified_jobs.append(job)
+            _bump_source_funnel(source_funnel, job, 'classified')
 
         # Deduplication: always load recent hashes from channel history on serverless
         # (where SQLite is unavailable) to prevent reposting across cron invocations.
@@ -3061,17 +3135,24 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
             if GROWTH_UTILS_AVAILABLE:
                 enrich_job_salary_fields(job)
                 if not passes_min_salary(job, Config.GLOBAL_MIN_SALARY_USD):
+                    _bump_source_funnel(source_funnel, job, 'salary_filter')
                     continue
                 if not passes_channel_tracks(job, Config.CHANNEL_TRACKS):
+                    _bump_source_funnel(source_funnel, job, 'track_filter')
                     continue
+            _bump_source_funnel(source_funnel, job, 'salary_passed')
+            _bump_source_funnel(source_funnel, job, 'track_passed')
             if job.get('hash') in recent_hashes:
                 duplicate_count += 1
+                _bump_source_funnel(source_funnel, job, 'duplicates')
                 continue
             if db and is_duplicate_job(job, db, recent_fps=recent_fps):
                 duplicate_count += 1
+                _bump_source_funnel(source_funnel, job, 'duplicates')
                 continue
             if is_duplicate_in_batch(job, batch_hashes, batch_fps):
                 duplicate_count += 1
+                _bump_source_funnel(source_funnel, job, 'duplicates')
                 continue
             publish_candidates.append(job)
             if GROWTH_UTILS_AVAILABLE:
@@ -3081,10 +3162,13 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
         # Only definitive 404/410 outcomes exclude a candidate; all transient/blocked
         # outcomes remain publishable with observability fields attached.
         url_preflight = await preflight_application_urls(publish_candidates)
-        publish_candidates = [
-            job for job in publish_candidates
-            if job.get('url_preflight_status') != 'excluded'
-        ]
+        preflight_candidates = []
+        for job in publish_candidates:
+            if job.get('url_preflight_status') == 'excluded':
+                _bump_source_funnel(source_funnel, job, 'preflight_excluded')
+            else:
+                preflight_candidates.append(job)
+        publish_candidates = preflight_candidates
         if url_preflight['excluded']:
             logger.info("⏭️ URL preflight excluded %s stale application links", url_preflight['excluded'])
 
@@ -3103,6 +3187,7 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
 
         posted_count = 0
         for job in selected_jobs:
+            _bump_source_funnel(source_funnel, job, 'selected')
             if bot:
                 posted = await post_job_with_bot(bot, job, db=db)
             else:
@@ -3113,9 +3198,11 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
                     db.save_job_payload(job.get('hash') or generate_job_hash(job), job)
                 recent_hashes.add(job.get('hash'))
                 posted_count += 1
+                _bump_source_funnel(source_funnel, job, 'posted')
                 await asyncio.sleep(DELAYS['between_posts'])
             else:
                 failed_count += 1
+                _bump_source_funnel(source_funnel, job, 'failed')
 
         return {
             'ok': True,
@@ -3129,6 +3216,7 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
             'url_preflight': url_preflight,
             'selected_sources': selected_sources,
             'sources': source_results,
+            'source_funnel': source_funnel,
         }
     finally:
         if db:

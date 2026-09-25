@@ -46,6 +46,18 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
             spr._configure_serverless_source_policy()
         self.assertTrue(spr.core.Config.ENABLE_TELEGRAM_CHANNELS)
 
+    def test_source_funnel_normalizes_families_and_tracks_stages(self):
+        funnel = spr.core._new_source_funnel(
+            [{"source": "Greenhouse", "fetched": 3}, {"source": "RSS boards", "fetched": 2}]
+        )
+        job = {"source": "Greenhouse:acme"}
+        spr.core._bump_source_funnel(funnel, job, "suitable")
+        spr.core._bump_source_funnel(funnel, job, "posted")
+        self.assertEqual(funnel["Greenhouse"]["fetched"], 3)
+        self.assertEqual(funnel["Greenhouse"]["suitable"], 1)
+        self.assertEqual(funnel["Greenhouse"]["posted"], 1)
+        self.assertEqual(spr.core.diagnostic_source_name("RSS:WWR Full-Stack"), "RSS boards")
+
     async def test_direct_postgres_preserves_existing_behavior(self):
         fake_store = SimpleNamespace(
             growth_backend="postgres",
