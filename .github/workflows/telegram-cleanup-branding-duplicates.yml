@@ -17,50 +17,29 @@ jobs:
     steps:
       - name: Delete approved branding duplicates
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
           CONFIRMATION: ${{ inputs.confirmation }}
         shell: bash
         run: |
           set -euo pipefail
           test "$CONFIRMATION" = "DELETE"
-          test -n "$TELEGRAM_BOT_TOKEN"
-          python - <<'PY'
+          test -n "$CRON_SECRET"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          status="$(curl --silent --show-error \
+            --connect-timeout 20 --max-time 180 \
+            -o "$response_file" -w '%{http_code}' \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            -H "X-Cleanup-Confirmation: DELETE" \
+            -X POST \
+            "https://junior-middle-it.vercel.app/api/telegram_branding_admin?action=cleanup" || true)"
+          cat "$response_file"
+          test "$status" = "200"
+          python - "$response_file" <<'PY'
           import json
-          import os
-          import urllib.error
-          import urllib.request
-
-          token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
-          message_ids = list(range(7493, 7526)) + list(range(7557, 7575))
-          endpoint = f"https://api.telegram.org/bot{token}/deleteMessage"
-          failures = []
-          for message_id in message_ids:
-              payload = json.dumps({
-                  "chat_id": "@junior_middle_it",
-                  "message_id": message_id,
-              }).encode("utf-8")
-              request = urllib.request.Request(
-                  endpoint,
-                  data=payload,
-                  method="POST",
-                  headers={"Content-Type": "application/json"},
-              )
-              try:
-                  with urllib.request.urlopen(request, timeout=25) as response:
-                      result = json.loads(response.read().decode("utf-8"))
-              except urllib.error.HTTPError as exc:
-                  body = exc.read().decode("utf-8", errors="replace")
-                  if exc.code == 400 and "message to delete not found" in body:
-                      print(f"{message_id}: already absent")
-                      continue
-                  failures.append((message_id, body[:200]))
-                  continue
-              if result.get("ok") is not True:
-                  failures.append((message_id, str(result)[:200]))
-              else:
-                  print(f"{message_id}: deleted")
-          if failures:
-              for message_id, error in failures:
-                  print(f"{message_id}: FAILED {error}")
-              raise SystemExit(1)
+          import sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert data.get("ok") is True, data
+          assert data.get("failed") == [], data
+          print("Telegram branding duplicates cleanup verified")
           PY

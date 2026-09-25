@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import requests
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -67,6 +68,9 @@ PIN_TEXT = """<b>💼 Junior &amp; Middle IT — вакансии без лиш�
 
 Наша цель простая: помочь Junior и Middle специалистам быстрее находить подходящие IT-вакансии и тратить меньше времени на неподходящие предложения."""
 
+_CLEANUP_MESSAGE_IDS = tuple(range(7493, 7526)) + tuple(range(7557, 7575))
+_CLEANUP_CONFIRMATION = "DELETE"
+
 
 def _telegram_call(token: str, method: str, payload: dict | None = None):
     response = requests.post(
@@ -86,6 +90,31 @@ def _try_call(token: str, method: str, payload: dict | None = None):
         return True, _telegram_call(token, method, payload), ""
     except RuntimeError as exc:
         return False, None, str(exc)[:220]
+
+
+def _cleanup_approved_duplicates(token: str, channel_id: str) -> dict:
+    deleted = []
+    already_absent = []
+    failed = []
+    for message_id in _CLEANUP_MESSAGE_IDS:
+        ok, _, error = _try_call(
+            token,
+            "deleteMessage",
+            {"chat_id": channel_id, "message_id": message_id},
+        )
+        if ok:
+            deleted.append(message_id)
+        elif "message to delete not found" in (error or "").lower():
+            already_absent.append(message_id)
+        else:
+            failed.append({"message_id": message_id, "error": error or "delete_failed"})
+    return {
+        "ok": not failed,
+        "deleted": deleted,
+        "already_absent": already_absent,
+        "failed": failed,
+        "message_ids": list(_CLEANUP_MESSAGE_IDS),
+    }
 
 
 def _apply_branding() -> dict:
@@ -175,6 +204,28 @@ class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not cron_authorized(self.headers.get("authorization", "")):
             self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+        query = parse_qs(urlsplit(self.path).query)
+        if query.get("action") == ["cleanup"]:
+            if self.headers.get("x-cleanup-confirmation") != _CLEANUP_CONFIRMATION:
+                self._send_json(400, {"ok": False, "error": "cleanup_confirmation_required"})
+                return
+            try:
+                if (os.getenv("VERCEL_ENV") or "").strip().lower() != "production":
+                    raise RuntimeError("not_production")
+                token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+                channel_id = (os.getenv("CHANNEL_ID") or "").strip() or "@junior_middle_it"
+                if not token:
+                    raise RuntimeError("telegram_token_missing")
+                result = _cleanup_approved_duplicates(token, channel_id)
+            except RuntimeError as exc:
+                error = str(exc)
+                self._send_json(409 if error == "not_production" else 503, {"ok": False, "error": error})
+                return
+            except Exception as exc:
+                self._send_json(503, {"ok": False, "error": type(exc).__name__})
+                return
+            self._send_json(200 if result.get("ok") else 503, result)
             return
         try:
             result = _apply_branding()
