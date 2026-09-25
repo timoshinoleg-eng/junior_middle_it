@@ -119,40 +119,9 @@ def _apply_branding() -> dict:
     pinned = chat.get("pinned_message") or {}
     pinned_text = str(pinned.get("text") or pinned.get("caption") or "")
     message_id = pinned.get("message_id") if pinned_text.startswith(PIN_TITLE) else None
+    pin_post_status = "existing" if message_id else "disabled"
     post_error = ""
     pin_error = ""
-
-    if chat_ok and not message_id:
-        post_ok, message, post_error = _try_call(
-            token,
-            "sendMessage",
-            {
-                "chat_id": channel_id,
-                "text": PIN_TEXT,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-                "disable_notification": True,
-                "reply_markup": {
-                    "inline_keyboard": [[{
-                        "text": "🤖 Настроить персональный поиск",
-                        "url": "https://t.me/junior_jobs_channel_bot",
-                    }]]
-                },
-            },
-        )
-        if post_ok and message:
-            message_id = message.get("message_id")
-            pin_ok, _, pin_error = _try_call(
-                token,
-                "pinChatMessage",
-                {
-                    "chat_id": channel_id,
-                    "message_id": message_id,
-                    "disable_notification": True,
-                },
-            )
-            if not pin_ok:
-                message_id = None
 
     verified_chat_ok, verified_chat, verify_chat_error = _try_call(
         token, "getChat", {"chat_id": channel_id}
@@ -178,6 +147,7 @@ def _apply_branding() -> dict:
             verified_chat_ok
             and str(verified_pinned.get("text") or "").startswith(PIN_TITLE)
         ),
+        "pin_post_status": pin_post_status,
         "channel_error": channel_write_error or chat_error or verify_chat_error,
         "bot_description_error": bot_write_error or desc_error,
         "bot_short_description_error": short_write_error or short_error,
@@ -187,7 +157,6 @@ def _apply_branding() -> dict:
     result["automated_ok"] = all([
         result["bot_description_ok"],
         result["bot_short_description_ok"],
-        result["pinned_post_ok"],
     ])
     return result
 

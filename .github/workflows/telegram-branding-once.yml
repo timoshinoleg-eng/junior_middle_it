@@ -1,18 +1,13 @@
 name: Telegram Branding Once
 
 on:
-  workflow_run:
-    workflows: ["Production Smoke"]
-    types: [completed]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   apply:
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
     steps:
       - name: Apply approved channel and bot copy
@@ -39,10 +34,11 @@ jobs:
           import json, sys
           data = json.load(open(sys.argv[1], encoding='utf-8'))
           assert data.get('ok') is True, data
-          assert data.get('bot_description_ok') is True, data
-          assert data.get('bot_short_description_ok') is True, data
-          assert data.get('pinned_post_ok') is True, data
-          print('Automated Telegram branding verified; pinned_message_id=', data.get('pinned_message_id'))
+           assert data.get('bot_description_ok') is True, data
+           assert data.get('bot_short_description_ok') is True, data
+           assert data.get('pin_post_status') in {'existing', 'disabled'}, data
+           print('Telegram bot branding verified; pinned_message_id=', data.get('pinned_message_id'))
+
           if not data.get('channel_description_ok'):
               print('Channel description requires owner/admin rights outside the bot token.')
           PY

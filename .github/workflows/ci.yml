@@ -68,8 +68,10 @@ jobs:
             test_interactive_webhook_runtime \
             test_api_webhook_contract \
             test_scheduled_delivery_runtime \
-            test_telegram_webhook_admin \
-            test_p7_growth_metrics \
+             test_telegram_webhook_admin \
+             test_telegram_branding_admin \
+             test_p7_growth_metrics \
+
             test_http_growth_patch \
             test_render_main \
             test_secure_http_logging \

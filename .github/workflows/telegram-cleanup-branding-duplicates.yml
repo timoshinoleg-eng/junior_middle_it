@@ -1,0 +1,66 @@
+name: Telegram Cleanup Branding Duplicates
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type DELETE to remove the known branding duplicates
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete approved branding duplicates
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = "DELETE"
+          test -n "$TELEGRAM_BOT_TOKEN"
+          python - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          message_ids = list(range(7493, 7526)) + list(range(7557, 7575))
+          endpoint = f"https://api.telegram.org/bot{token}/deleteMessage"
+          failures = []
+          for message_id in message_ids:
+              payload = json.dumps({
+                  "chat_id": "@junior_middle_it",
+                  "message_id": message_id,
+              }).encode("utf-8")
+              request = urllib.request.Request(
+                  endpoint,
+                  data=payload,
+                  method="POST",
+                  headers={"Content-Type": "application/json"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      result = json.loads(response.read().decode("utf-8"))
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode("utf-8", errors="replace")
+                  if exc.code == 400 and "message to delete not found" in body:
+                      print(f"{message_id}: already absent")
+                      continue
+                  failures.append((message_id, body[:200]))
+                  continue
+              if result.get("ok") is not True:
+                  failures.append((message_id, str(result)[:200]))
+              else:
+                  print(f"{message_id}: deleted")
+          if failures:
+              for message_id, error in failures:
+                  print(f"{message_id}: FAILED {error}")
+              raise SystemExit(1)
+          PY
