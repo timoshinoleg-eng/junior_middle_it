@@ -156,21 +156,23 @@ class Config:
     RECENT_TELEGRAM_MESSAGES = env_int('RECENT_TELEGRAM_MESSAGES', 800)
     TELEGRAM_HOURS_BACK = env_int('TELEGRAM_HOURS_BACK', 48)
     # v6.5 expanded remote-first ATS boards (override via env)
+    # Boards that answer 404 are not listed here: every default was verified
+    # against its live posting API. Dead slugs only add a failed request and log
+    # noise per cycle, so re-add one only after it serves jobs again.
     GREENHOUSE_BOARDS = os.getenv(
         'GREENHOUSE_BOARDS',
-        'gitlab,canonical,elastic,cloudflare,datadog,hashicorp,notion,figma,'
-        'vercel,posthog,sentry,stripe,discord,shopify,airbnb,coinbase,plaid,'
+        'gitlab,canonical,elastic,cloudflare,datadog,figma,'
+        'vercel,stripe,discord,airbnb,coinbase,'
         'duolingo,reddit,twilio,dropbox,asana,airtable'
     ).split(',')
     LEVER_COMPANIES = os.getenv(
         'LEVER_COMPANIES',
-        'Instrumentl,2brains,360learning,netflix,spotify,palantir,box,nubank,'
-        'wealthfront,affirm,rippling'
+        'Instrumentl,2brains,360learning,spotify,palantir,wealthfront'
     ).split(',')
     ASHBY_COMPANIES = os.getenv(
         'ASHBY_COMPANIES',
-        'cursor,linear,supabase,openai,anthropic,retool,ramp,mercury,clerk,'
-        'resend,cal,planetscale,prisma,railway'
+        'cursor,linear,supabase,openai,ramp,mercury,clerk,'
+        'resend,railway'
     ).split(',')
     ENABLE_EXTRA_SOURCES = os.getenv('ENABLE_EXTRA_SOURCES', 'true').lower() == 'true'
     ENABLE_RSS_SOURCES = os.getenv('ENABLE_RSS_SOURCES', 'true').lower() == 'true'

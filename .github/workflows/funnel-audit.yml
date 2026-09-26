@@ -1,0 +1,93 @@
+name: Funnel Audit
+
+on:
+  schedule:
+    # 07:20 UTC daily: after the 06:00 cron run, before the working day.
+    - cron: '20 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: funnel-audit
+  cancel-in-progress: false
+
+jobs:
+  yield:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # The audit walks the serverless publication path, never the Telegram one.
+      VERCEL: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run per-source funnel audit
+        run: |
+          python tools/funnel_audit.py --json --save funnel-audit.json | tee funnel-audit.txt
+
+      - name: Upload the funnel report
+        uses: actions/upload-artifact@v4
+        with:
+          name: funnel-audit
+          path: funnel-audit.json
+          retention-days: 30
+
+      - name: Assert the funnel still produces publishable vacancies
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+
+          MIN_CLASSIFIED = 5
+          MIN_SOURCES = 2
+          MIN_FETCHED = 2000
+
+          report = json.load(open('funnel-audit.json', encoding='utf-8'))
+          totals = report.get('totals') or {}
+          rows = [r for r in report.get('sources') or [] if not r.get('error')]
+          classified = {
+              r['source']: int((r.get('stages') or {}).get('classified') or 0) for r in rows
+          }
+          producing = sorted(name for name, value in classified.items() if value > 0)
+          fetched = int(totals.get('fetched') or 0)
+
+          summary = (
+              f"fetched={fetched} suitable={totals.get('suitable')} "
+              f"fresh={totals.get('fresh')} level={totals.get('level_passed')} "
+              f"classified={totals.get('classified')} by_source={producing}"
+          )
+          with open('funnel-audit-summary.txt', 'w', encoding='utf-8') as handle:
+              handle.write(summary + '\n')
+          print(summary)
+
+          problems = []
+          if int(totals.get('classified') or 0) < MIN_CLASSIFIED:
+              problems.append(
+                  f'classified {totals.get("classified")} < {MIN_CLASSIFIED}: '
+                  'the funnel is below the level that ever fills the publication cap'
+              )
+          if len(producing) < MIN_SOURCES:
+              problems.append(
+                  f'only {len(producing)} source(s) produced vacancies: {producing}'
+              )
+          if fetched < MIN_FETCHED:
+              problems.append(f'fetched {fetched} < {MIN_FETCHED}: source ingestion collapsed')
+          if problems:
+              for problem in problems:
+                  print(f'FUNNEL AUDIT FAILURE: {problem}', file=sys.stderr)
+              raise SystemExit(1)
+          PY
