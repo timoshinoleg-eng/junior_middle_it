@@ -502,7 +502,11 @@ RESUME_BLOCK_SIGNALS = [
     "зарплатные ожидания", "salary expectations", "ожидания по зарплате",
     "формат работы:", "о себе:", "ищу работу", "в поиске работы",
     "open to work", "looking for a job", "looking for work",
-    "years of experience", "года опыта", "лет опыта", "мой стек",
+    # "years of experience" is deliberately absent: it states a hiring
+    # requirement, not a candidate profile. As a resume marker it rejected the
+    # majority of Greenhouse and 4dayweek postings before any other check ran,
+    # which capped the whole channel at ~12 publishable vacancies per cycle.
+    "года опыта", "лет опыта", "мой стек",
     "мой опыт", "готов к", "рассматриваю предложения"
 ]
 
@@ -1434,18 +1438,20 @@ def strip_html(text: str) -> str:
 
     Handles entity-encoded HTML too: some boards (e.g. Twilio's Greenhouse
     feed) deliver content as &lt;div&gt; entities, so tags are invisible to a
-    plain tag regex and leak into Telegram posts as literal text.
+    plain tag regex and leak into Telegram posts as literal text. Decoding and
+    tag removal are alternated until the text is stable, because a single late
+    ``html_unescape`` after tag removal materializes encoded tags (a long
+    entity-encoded body with one literal ``<`` anywhere used to publish raw
+    ``<h1>`` markup into the channel).
     """
     if not text:
         return ''
     text = str(text)
-    # Decode entities until real tags appear (max 2 passes for double-encoding).
-    for _ in range(2):
-        if '<' in text or '&' not in text:
+    for _ in range(3):
+        stripped = re.sub(r'<[^>]+>', ' ', html_unescape(text))
+        if stripped == text:
             break
-        text = html_unescape(text)
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = html_unescape(text)  # decode leftovers like &nbsp; / &amp;
+        text = stripped
     return ' '.join(text.split())
 
 
@@ -1567,7 +1573,7 @@ def parse_job_datetime(job: Dict) -> Optional[datetime]:
             return datetime.fromisoformat(candidate.replace('Z', '+00:00')).replace(tzinfo=None)
         except Exception:
             pass
-    for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y'):
+    for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y', '%d.%m.%Y'):
         try:
             return datetime.strptime(value[:10], fmt)
         except Exception:
@@ -1762,16 +1768,19 @@ def classify_job_level(job_data: Dict) -> Optional[str]:
     full_text = f"{job_data.get('title', '')} {job_data.get('description', '')}".lower()
     structured_text = _structured_level_text(job_data).lower()
 
-    # Exclude senior+ roles first, including explicit seniority in metadata.
+    # Exclude senior+ roles stated in the posting text first.
     if any(has_text_signal(full_text, word) for word in EXCLUDE_SIGNALS):
-        return None
-    if structured_text and any(has_text_signal(structured_text, word) for word in EXCLUDE_SIGNALS):
         return None
 
     if any(has_text_signal(full_text, word) for word in JUNIOR_SIGNALS):
         return "Junior"
     if any(has_text_signal(full_text, signal) for signal in MIDDLE_SIGNALS):
         return "Middle"
+    # Structured metadata is weaker than the posting text: boards routinely tag
+    # every technical role "Senior", so a coarse metadata label must not veto a
+    # title that explicitly asks for a junior or mid candidate.
+    if structured_text and any(has_text_signal(structured_text, word) for word in EXCLUDE_SIGNALS):
+        return None
     if structured_text:
         if any(has_text_signal(structured_text, word) for word in JUNIOR_SIGNALS):
             return "Junior"
@@ -1915,7 +1924,7 @@ def format_job_message_legacy(job: Dict) -> str:
     
     title = escape_html(job['title'])
     company = escape_html(job['company'])
-    location = escape_html(job.get('location', 'Remote'))
+    location = escape_html(str(job.get('location') or job.get('location_restriction') or '').strip() or 'не указана')
     source = escape_html(job['source'])
     category = job.get('category', 'other')
     cat_emoji = {'development': '💻', 'qa': '🧪', 'devops': '🔧', 'data': '📊', 
@@ -2185,8 +2194,12 @@ def fetch_jobicy() -> List[Dict]:
                 'url': job.get('url', ''),
                 'salary': '',
                 'location': job.get('jobGeo', 'Remote'),
-                'published': job.get('jobPosted', ''),
+                # v2 publishes pubDate; jobPosted is kept for older payloads.
+                # Reading only jobPosted left every Jobicy vacancy dateless and
+                # therefore invisible to the freshness gate.
+                'published': job.get('pubDate') or job.get('jobPosted', ''),
                 'employment_type': job.get('jobType', ''),
+                'level': job.get('jobLevel', ''),
                 'source': 'Jobicy',
                 'tags': []
             })

@@ -104,6 +104,22 @@ class ServerlessPublicationPolicyTests(unittest.TestCase):
         ):
             self.assertTrue(policy.is_fresh_for_serverless_publication(job, now=now))
 
+    def test_dotted_european_source_date_is_fresh(self):
+        now = datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
+        job = {"source": "DevITJobs UK", "published": "26.09.2026"}
+        with patch.dict(os.environ, {"SERVERLESS_MAX_JOB_AGE_DAYS": "7"}, clear=False):
+            self.assertTrue(policy.is_fresh_for_serverless_publication(job, now=now))
+        self.assertEqual(job["source_published_at"], "2026-09-26T00:00:00+00:00")
+
+    def test_dotted_source_date_outside_the_window_is_stale(self):
+        now = datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
+        with patch.dict(os.environ, {"SERVERLESS_MAX_JOB_AGE_DAYS": "7"}, clear=False):
+            self.assertFalse(
+                policy.is_fresh_for_serverless_publication(
+                    {"published": "04.09.2025"}, now=now
+                )
+            )
+
     def test_vercel_policy_honours_the_configured_burst_ceiling(self):
         original = policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE
         try:

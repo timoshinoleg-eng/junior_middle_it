@@ -133,6 +133,14 @@ def _parse_source_value(raw: object) -> Optional[datetime]:
         except (OverflowError, OSError, ValueError):
             return None
 
+    if re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{4}", text):
+        # Dotted European dates: devitjobs.uk publishes <pubdate> as DD.MM.YYYY,
+        # which used to fall through as an unknown date and hide the source.
+        try:
+            return datetime.strptime(text, "%d.%m.%Y").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:

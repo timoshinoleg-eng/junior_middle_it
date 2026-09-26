@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import channel_bot
 from channel_bot import (
@@ -13,11 +13,15 @@ from channel_bot import (
     classify_url_preflight_outcome,
     collect_and_post_once,
     diversify_jobs_by_track_and_source,
+    extract_description,
     format_job_message_legacy,
     is_duplicate_in_batch,
+    is_suitable_job,
+    parse_job_datetime,
     preflight_application_urls,
     probe_candidates_for_publication,
     select_jobs_for_publication,
+    strip_html,
 )
 
 
@@ -111,6 +115,103 @@ class PublicationPolicyTests(unittest.TestCase):
             }
         )
         self.assertIn("Доступность:</b> Canada", text)
+
+    def test_legacy_card_never_publishes_raw_markup_or_an_empty_location(self):
+        text = format_job_message_legacy(
+            {
+                "title": "Software Engineer, Backend",
+                "company": "Sevenroomsuk",
+                "location": "",
+                "level": "Middle",
+                "source": "Arbeitnow",
+                "url": "https://example.com/jobs/9",
+                # Entity-encoded body with one literal tag far down the text.
+                "description": (
+                    "&lt;h1&gt;&lt;strong&gt;About the Team&lt;/strong&gt;&lt;/h1&gt;"
+                    "&lt;p&gt;SevenRooms is a hospitality platform &amp;amp; more "
+                    "text to pass the minimum length check for summaries."
+                    + " details" * 20
+                    + " a &lt; b comparison"
+                ),
+            }
+        )
+        self.assertNotIn("&lt;h1&gt;", text)
+        self.assertNotIn("<h1>", text)
+        self.assertIn("About the Team", text)
+        self.assertIn("Локация:</b> не указана", text)
+
+    def test_strip_html_removes_encoded_tags_around_a_literal_tag(self):
+        raw = "&lt;p&gt;Intro&lt;/p&gt; tail " + ("x" * 50) + " if (a &lt; b) {}"
+        cleaned = strip_html(raw)
+        self.assertNotIn("<p>", cleaned)
+        self.assertIn("Intro", cleaned)
+
+    def test_vacancy_years_of_experience_is_not_a_candidate_profile(self):
+        vacancy = {
+            "title": "Software Engineer",
+            "description": "Remote role. We need 3+ years of experience with Python.",
+            "location": "Remote",
+            "source": "Example",
+        }
+        self.assertTrue(is_suitable_job(vacancy))
+        for signal in ("open to work", "looking for a job", "#resume", "curriculum vitae"):
+            with self.subTest(signal=signal):
+                blocked = dict(vacancy, description=f"Remote role. {signal} for 5 years.")
+                self.assertFalse(is_suitable_job(blocked))
+
+    def test_metadata_senior_label_does_not_veto_an_explicit_junior_title(self):
+        self.assertEqual(
+            classify_job_level(
+                {
+                    "title": "Junior Web Builder (Fully Remote)",
+                    "description": "Remote role building web pages.",
+                    "level": "Senior",
+                }
+            ),
+            "Junior",
+        )
+
+    def test_metadata_senior_label_still_excludes_a_silent_title(self):
+        self.assertIsNone(
+            classify_job_level(
+                {
+                    "title": "Software Engineer",
+                    "description": "Remote role on a payments platform.",
+                    "level": "Senior",
+                }
+            )
+        )
+
+    def test_dotted_european_publish_date_is_parsed(self):
+        parsed = parse_job_datetime({"published": "26.09.2026"})
+        self.assertIsNotNone(parsed)
+        self.assertEqual((parsed.year, parsed.month, parsed.day), (2026, 9, 26))
+
+    def test_jobicy_payload_uses_pub_date_and_exposes_its_level(self):
+        payload = {
+            "jobs": [
+                {
+                    "jobTitle": "Junior Web Builder",
+                    "companyName": "Example",
+                    "jobExcerpt": "Remote web building role.",
+                    "url": "https://example.com/jobs/1",
+                    "jobGeo": "Philippines",
+                    "pubDate": "2026-09-26T11:30:15+00:00",
+                    "jobPosted": "",
+                    "jobType": ["Contract"],
+                    "jobLevel": "Entry-Level, Junior",
+                }
+            ]
+        }
+        response = MagicMock()
+        response.json.return_value = payload
+        response.raise_for_status.return_value = None
+        with patch("channel_bot.requests.get", return_value=response):
+            jobs = channel_bot.fetch_jobicy()
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["published"], "2026-09-26T11:30:15+00:00")
+        self.assertEqual(jobs[0]["level"], "Entry-Level, Junior")
 
     def test_level_classifier_requires_explicit_junior_or_middle_evidence(self):
         self.assertIsNone(

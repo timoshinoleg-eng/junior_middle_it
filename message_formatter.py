@@ -94,9 +94,14 @@ class JobMessageFormatter(_BaseJobMessageFormatter):
         if not raw:
             return ""
         raw = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
-        raw = re.sub(r"(?s)<[^>]+>", " ", raw)
-        text = html_unescape(raw)
-        text = self._repair_mojibake(text)
+        # Alternate decoding and tag removal: decoding after removal would
+        # materialize entity-encoded markup as literal text in the card.
+        for _ in range(3):
+            stripped = re.sub(r"(?s)<[^>]+>", " ", html_unescape(raw))
+            if stripped == raw:
+                break
+            raw = stripped
+        text = self._repair_mojibake(raw)
         text = re.sub(r"\s+", " ", text).strip()
         if len(text) < 35:
             return ""
