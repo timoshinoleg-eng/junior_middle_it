@@ -146,6 +146,11 @@ class PublicationPolicyTests(unittest.TestCase):
         self.assertNotIn("<p>", cleaned)
         self.assertIn("Intro", cleaned)
 
+    def test_strip_html_removes_leaked_markdown_headings(self):
+        cleaned = strip_html("#### Company Description Experian is a data company.")
+        self.assertNotIn("####", cleaned)
+        self.assertTrue(cleaned.startswith("Company Description Experian"))
+
     def test_vacancy_years_of_experience_is_not_a_candidate_profile(self):
         vacancy = {
             "title": "Software Engineer",

@@ -1452,6 +1452,8 @@ def strip_html(text: str) -> str:
         if stripped == text:
             break
         text = stripped
+    # Source feeds leak raw markdown headings ("#### Company Description").
+    text = re.sub(r'(?:^|\s)#{1,6}\s*', ' ', text)
     return ' '.join(text.split())
 
 

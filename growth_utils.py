@@ -205,6 +205,19 @@ def _contains_seniority_conflict(text: str) -> bool:
     return False
 
 
+_CATEGORY_TRACKS = {
+    "development": "development",
+    "qa": "qa",
+    "devops": "devops_infra",
+    "design": "design_product",
+    "pm": "design_product",
+    "support": "support_other",
+    "security": "support_other",
+    "marketing": "support_other",
+    "sales": "support_other",
+}
+
+
 def classify_thematic_track(job: Dict) -> str:
     """Map legacy categories and vacancy text to one stable audience-facing track."""
     category = str(job.get("category") or "other").lower()
@@ -227,18 +240,21 @@ def classify_thematic_track(job: Dict) -> str:
         return "data_ai"
     if _contains_any(text, vibe_signals):
         return "vibe_coding"
-    if category == "qa" or _contains_any(text, ("quality assurance", "software tester", "test automation", "qa engineer")):
+    # An explicit classifier category outranks the free-text heuristics below:
+    # a single "ui" or "sre" mention in the description used to relabel
+    # "Full Stack Engineer" and "Software Engineer" postings as design or devops.
+    if category in _CATEGORY_TRACKS:
+        return _CATEGORY_TRACKS[category]
+    if _contains_any(text, ("quality assurance", "software tester", "test automation", "qa engineer")):
         return "qa"
-    if category == "devops" or _contains_any(text, ("site reliability", "sre", "platform engineer", "cloud engineer", "devops")):
+    if _contains_any(text, ("site reliability", "sre", "platform engineer", "cloud engineer", "devops")):
         return "devops_infra"
     design_signal = bool(re.search(r"\b(?:ux|ui)\b", text)) or _contains_any(
         text, ("product designer", "product manager")
     )
-    if category in {"design", "pm"} or design_signal:
+    if design_signal:
         return "design_product"
-    if category in {"support", "security"}:
-        return "support_other"
-    if category == "development" or _contains_any(text, ("developer", "software engineer", "frontend", "backend", "fullstack", "mobile")):
+    if _contains_any(text, ("developer", "software engineer", "frontend", "backend", "fullstack", "mobile")):
         return "development"
     return "support_other"
 

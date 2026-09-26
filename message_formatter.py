@@ -102,6 +102,7 @@ class JobMessageFormatter(_BaseJobMessageFormatter):
                 break
             raw = stripped
         text = self._repair_mojibake(raw)
+        text = re.sub(r"(?:^|\s)#{1,6}\s*", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
         if len(text) < 35:
             return ""

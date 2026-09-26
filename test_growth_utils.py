@@ -222,6 +222,45 @@ class GrowthUtilsTests(unittest.TestCase):
         }
         self.assertEqual(classify_thematic_track(vibe_job), "vibe_coding")
 
+    def test_thematic_track_prefers_explicit_category_over_description_mentions(self):
+        full_stack = {
+            "title": "Full Stack Engineer - Finance",
+            "category": "development",
+            "location": "Remote",
+            "description": "Remote full stack role. The product UI is used by our partners.",
+        }
+        self.assertEqual(classify_thematic_track(full_stack), "development")
+
+        platform = {
+            "title": "Software Engineer, Ingestion Platform",
+            "category": "development",
+            "location": "Remote",
+            "description": "Remote role on site reliability tooling for the platform team.",
+        }
+        self.assertEqual(classify_thematic_track(platform), "development")
+
+    def test_thematic_track_keeps_explicit_design_and_data_categories(self):
+        self.assertEqual(
+            classify_thematic_track(
+                {
+                    "title": "Product Designer",
+                    "category": "design",
+                    "description": "Remote design role for web platforms.",
+                }
+            ),
+            "design_product",
+        )
+        self.assertEqual(
+            classify_thematic_track(
+                {
+                    "title": "Software Engineer",
+                    "category": "data",
+                    "description": "Remote role on analytics pipelines.",
+                }
+            ),
+            "data_ai",
+        )
+
     def test_editorial_gate_passes_explicit_worldwide_role(self):
         job = {
             "title": "Junior Backend Developer",
