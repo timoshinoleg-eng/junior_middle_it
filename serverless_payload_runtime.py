@@ -9,6 +9,11 @@ Telethon source collection and legacy Telegram-history dedup are stateful and
 are disabled on Vercel by default. They may be explicitly re-enabled only with
 ``VERCEL_ENABLE_TELEGRAM_SOURCES=true`` when a serverless-safe session strategy
 has been provisioned.
+
+Because that legacy dedup is a no-op on Vercel, candidates are additionally
+probed against the durable ledger *before* the per-cycle publication cap is
+applied: a claim that is immediately released leaves no ledger trace, so
+already published vacancies stop consuming publication slots.
 """
 from __future__ import annotations
 
@@ -25,6 +30,7 @@ from edge_payload_writer import (
     claim_job_payload_edge,
     edge_writer_configured,
     mark_job_payload_published_edge,
+    release_job_payload_edge,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,7 +43,14 @@ _durable_duplicate_skips: ContextVar[int] = ContextVar("durable_duplicate_skips"
 _durable_begin_failures: ContextVar[int] = ContextVar("durable_begin_failures", default=0)
 _durable_ambiguous_sends: ContextVar[int] = ContextVar("durable_ambiguous_sends", default=0)
 _durable_finalize_failures: ContextVar[int] = ContextVar("durable_finalize_failures", default=0)
+_durable_probe_probes: ContextVar[int] = ContextVar("durable_probe_probes", default=0)
+_durable_probe_unavailable: ContextVar[int] = ContextVar("durable_probe_unavailable", default=0)
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+# Bounded probe budget: the ledger call is remote, so the cycle never turns into
+# a full candidate sweep. The publication cap keeps the tail short in practice.
+_PROBE_MAX_CANDIDATES = 24
+_PROBE_CONCURRENCY = 6
+_PROBE_TIMEOUT = 8.0
 
 
 def _durable_dsn_configured() -> bool:
@@ -196,6 +209,113 @@ async def post_job_with_durable_payload(bot, job, db=None) -> bool:
     return bool(await _ORIGINAL_POST_JOB_WITH_BOT(bot, job, db=db))
 
 
+def _durable_probe_available() -> bool:
+    """True when the Edge ledger is the dedup authority for this deployment.
+
+    The probe must mirror the claim path in :func:`post_job_with_durable_payload`
+    exactly. When a direct Postgres mirror answers instead, that store is the
+    dedup authority and probing Edge would spend remote calls on a ledger the
+    publication path never touches.
+    """
+    if not (os.getenv("VERCEL") or "").strip():
+        return False
+    if not edge_writer_configured():
+        return False
+    return _payload_store() is None
+
+
+async def _probe_candidate_state(job) -> Optional[bool]:
+    """Resolve one candidate against the durable ledger.
+
+    Returns ``True`` when the ledger has no record of the vacancy, ``False``
+    when it already published it, and ``None`` when the ledger could not be
+    consulted. The probe claims the hash and immediately releases it, and the
+    release endpoint deletes a still ``pending`` row outright, so nothing is
+    left behind and the real publication claim later in the same cycle starts
+    clean.
+
+    Fail-open by design: an unreachable ledger must never remove a candidate,
+    because the send path re-verifies the claim before touching Telegram.
+    """
+    job_hash = job.get("hash") or core.generate_job_hash(job)
+    if not job_hash:
+        return True
+
+    try:
+        claim = await asyncio.wait_for(
+            asyncio.to_thread(claim_job_payload_edge, job_hash, job),
+            timeout=_PROBE_TIMEOUT,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Durable probe unavailable for %s: %s",
+            job_hash,
+            type(exc).__name__,
+        )
+        return None
+
+    if not bool(getattr(claim, "claimed", False)):
+        logger.info(
+            "Durable probe found existing publication for %s (state=%s)",
+            job_hash,
+            getattr(claim, "publication_state", "") or "unknown",
+        )
+        return False
+
+    await _edge_transition_with_retries(
+        release_job_payload_edge,
+        job_hash,
+        getattr(claim, "claim_token", ""),
+        label="probe-release",
+    )
+    return True
+
+
+async def filter_candidates_by_durable_state(candidates):
+    """Pre-selection dedup gate backed by the durable ledger.
+
+    Without it the per-cycle slots are consumed by vacancies the ledger already
+    published, because the send-time claim rejects them only after selection.
+    """
+    pending = list(candidates or [])
+    if not pending or not _durable_probe_available():
+        return pending
+
+    # Only the highest ranked candidates can consume a slot, so the remote
+    # budget is spent there. Everything past the budget stays publishable and
+    # keeps its historical behaviour.
+    budget = pending[:_PROBE_MAX_CANDIDATES]
+    ranked = sorted(budget, key=core.job_quality_score, reverse=True)
+    semaphore = asyncio.Semaphore(_PROBE_CONCURRENCY)
+
+    async def probe(job):
+        async with semaphore:
+            return await _probe_candidate_state(job)
+
+    # Probe tasks run in their own context, so the counters are reconciled here.
+    _durable_probe_probes.set(_durable_probe_probes.get() + len(ranked))
+    outcomes = await asyncio.gather(*(probe(job) for job in ranked), return_exceptions=True)
+    publishable = set()
+    for job, outcome in zip(ranked, outcomes):
+        if isinstance(outcome, BaseException) or outcome is None:
+            # Fail open: an unresolved probe must never remove a candidate.
+            _durable_probe_unavailable.set(_durable_probe_unavailable.get() + 1)
+            if isinstance(outcome, BaseException):
+                logger.warning("Durable probe task failed: %s", type(outcome).__name__)
+            outcome = True
+        if outcome:
+            publishable.add(id(job))
+
+    probed_ids = {id(job) for job in budget}
+    duplicates = len(budget) - len(publishable)
+    if duplicates:
+        logger.info("Durable pre-selection probe dropped %s published candidates", duplicates)
+    return [
+        job for job in pending
+        if id(job) not in probed_ids or id(job) in publishable
+    ]
+
+
 def _reset_durable_telemetry() -> None:
     telemetry = getattr(core, "CYCLE_TELEMETRY", None)
     if not isinstance(telemetry, dict):
@@ -203,6 +323,8 @@ def _reset_durable_telemetry() -> None:
     telemetry["durable_begin_failures"] = 0
     telemetry["durable_ambiguous_sends"] = 0
     telemetry["durable_finalize_failures"] = 0
+    telemetry["durable_probe_probes"] = 0
+    telemetry["durable_probe_unavailable"] = 0
     funnel = telemetry.setdefault("funnel", {})
     if isinstance(funnel, dict):
         funnel["durable_duplicates"] = 0
@@ -216,17 +338,23 @@ async def collect_and_post_once(*args, **kwargs):
     begin_token = _durable_begin_failures.set(0)
     ambiguous_token = _durable_ambiguous_sends.set(0)
     finalize_token = _durable_finalize_failures.set(0)
+    probe_token = _durable_probe_probes.set(0)
+    probe_unavailable_token = _durable_probe_unavailable.set(0)
     try:
         result = await _ORIGINAL_COLLECT_AND_POST_ONCE(*args, **kwargs)
         durable_duplicates = _durable_duplicate_skips.get()
         begin_failures = _durable_begin_failures.get()
         ambiguous_sends = _durable_ambiguous_sends.get()
         finalize_failures = _durable_finalize_failures.get()
+        probe_probes = _durable_probe_probes.get()
+        probe_unavailable = _durable_probe_unavailable.get()
     finally:
         _durable_duplicate_skips.reset(duplicate_token)
         _durable_begin_failures.reset(begin_token)
         _durable_ambiguous_sends.reset(ambiguous_token)
         _durable_finalize_failures.reset(finalize_token)
+        _durable_probe_probes.reset(probe_token)
+        _durable_probe_unavailable.reset(probe_unavailable_token)
 
     if not isinstance(result, dict):
         return result
@@ -240,6 +368,13 @@ async def collect_and_post_once(*args, **kwargs):
     reconciled["durable_begin_failures"] = begin_failures
     reconciled["durable_ambiguous_sends"] = ambiguous_sends
     reconciled["durable_finalize_failures"] = finalize_failures
+    reconciled["durable_probe_probes"] = probe_probes
+    reconciled["durable_probe_unavailable"] = probe_unavailable
+    # The core collector owns the pre-selection funnel stage; keep the field
+    # present for dashboards even when the default no-op hook is installed.
+    reconciled["pre_selection_duplicates"] = int(
+        reconciled.get("pre_selection_duplicates") or 0
+    )
 
     telemetry = getattr(core, "CYCLE_TELEMETRY", None)
     if isinstance(telemetry, dict):
@@ -247,16 +382,20 @@ async def collect_and_post_once(*args, **kwargs):
         telemetry["durable_begin_failures"] = begin_failures
         telemetry["durable_ambiguous_sends"] = ambiguous_sends
         telemetry["durable_finalize_failures"] = finalize_failures
+        telemetry["durable_probe_probes"] = probe_probes
+        telemetry["durable_probe_unavailable"] = probe_unavailable
         funnel = telemetry.setdefault("funnel", {})
         if isinstance(funnel, dict):
             funnel["duplicates"] = reconciled["duplicates"]
             funnel["durable_duplicates"] = durable_duplicates
+            funnel["pre_selection_duplicate"] = reconciled["pre_selection_duplicates"]
 
     return reconciled
 
 
-# The core collector resolves this global at execution time.
+# The core collector resolves these globals at execution time.
 core.post_job_with_bot = post_job_with_durable_payload
+core.probe_candidates_for_publication = filter_candidates_by_durable_state
 
 Config = core.Config
 CYCLE_TELEMETRY = core.CYCLE_TELEMETRY

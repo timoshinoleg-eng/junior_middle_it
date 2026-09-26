@@ -19,6 +19,8 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
             (spr._durable_begin_failures, spr._durable_begin_failures.set(0)),
             (spr._durable_ambiguous_sends, spr._durable_ambiguous_sends.set(0)),
             (spr._durable_finalize_failures, spr._durable_finalize_failures.set(0)),
+            (spr._durable_probe_probes, spr._durable_probe_probes.set(0)),
+            (spr._durable_probe_unavailable, spr._durable_probe_unavailable.set(0)),
         ]
         self.old_telegram_sources = spr.core.Config.ENABLE_TELEGRAM_CHANNELS
 
@@ -33,6 +35,14 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
         for context, token in reversed(self.context_tokens):
             context.reset(token)
         spr.core.Config.ENABLE_TELEGRAM_CHANNELS = self.old_telegram_sources
+
+    def _durable_probe_env(self, vercel="1"):
+        return {
+            "VERCEL": vercel,
+            "GROWTH_DATABASE_URL": "",
+            "DATABASE_URL": "",
+            "GROWTH_PUBLIC_URL": "https://project.supabase.co/functions/v1/growth-proxy",
+        }
 
     def test_vercel_disables_stateful_telegram_sources_by_default(self):
         spr.core.Config.ENABLE_TELEGRAM_CHANNELS = True
@@ -325,6 +335,114 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
         fake_store.close.assert_called_once()
         fake_store.save_job_payload.assert_not_called()
         original.assert_awaited_once()
+
+
+    def test_pre_selection_probe_is_installed_on_the_core_collector(self):
+        self.assertIs(spr.core.probe_candidates_for_publication, spr.filter_candidates_by_durable_state)
+
+    async def test_pre_selection_probe_drops_already_published_candidates(self):
+        jobs = [
+            {"hash": "published1", "title": "Junior QA", "company": "Example"},
+            {"hash": "fresh1", "title": "Junior Backend", "company": "Example"},
+        ]
+
+        def claim(job_hash, job, **kwargs):
+            if job_hash == "published1":
+                return SimpleNamespace(claimed=False, claim_token="", publication_state="published")
+            return SimpleNamespace(claimed=True, claim_token=CLAIM_TOKEN, publication_state="pending")
+
+        release = MagicMock(return_value=True)
+        with patch.dict(os.environ, self._durable_probe_env(), clear=False), patch.object(
+            spr, "edge_writer_configured", return_value=True
+        ), patch.object(spr, "claim_job_payload_edge", side_effect=claim) as claim_mock, patch.object(
+            spr, "release_job_payload_edge", release
+        ):
+            kept = await spr.filter_candidates_by_durable_state(jobs)
+
+        self.assertEqual([job["hash"] for job in kept], ["fresh1"])
+        self.assertEqual(claim_mock.call_count, 2)
+        # A probed claim must not survive: release deletes the pending row.
+        release.assert_called_once_with("fresh1", CLAIM_TOKEN)
+        self.assertEqual(spr._durable_probe_probes.get(), 2)
+        self.assertEqual(spr._durable_probe_unavailable.get(), 0)
+
+    async def test_pre_selection_probe_fails_open_when_the_ledger_is_unavailable(self):
+        jobs = [{"hash": "a1"}, {"hash": "a2"}]
+        with patch.dict(os.environ, self._durable_probe_env(), clear=False), patch.object(
+            spr, "edge_writer_configured", return_value=True
+        ), patch.object(
+            spr, "claim_job_payload_edge", side_effect=RuntimeError("edge down")
+        ), patch.object(
+            spr, "release_job_payload_edge", MagicMock()
+        ) as release:
+            kept = await spr.filter_candidates_by_durable_state(jobs)
+
+        self.assertEqual(kept, jobs)
+        release.assert_not_called()
+        self.assertEqual(spr._durable_probe_probes.get(), 2)
+        self.assertEqual(spr._durable_probe_unavailable.get(), 2)
+
+    async def test_pre_selection_probe_is_skipped_outside_the_serverless_ledger_path(self):
+        jobs = [{"hash": "a1"}, {"hash": "a2"}]
+        cases = (
+            # Not a serverless invocation: local/Render behaviour is untouched.
+            ("local", self._durable_probe_env(vercel=""), True, None),
+            # Serverless without a configured Edge writer.
+            ("no edge writer", self._durable_probe_env(), False, None),
+            # A direct Postgres mirror is the dedup authority, not Edge.
+            ("postgres mirror", self._durable_probe_env(), True, object()),
+        )
+        for label, env, edge_configured, store in cases:
+            with self.subTest(label):
+                claim = MagicMock()
+                with patch.dict(os.environ, env, clear=False), patch.object(
+                    spr, "edge_writer_configured", return_value=edge_configured
+                ), patch.object(spr, "_payload_store", return_value=store), patch.object(
+                    spr, "claim_job_payload_edge", claim
+                ):
+                    kept = await spr.filter_candidates_by_durable_state(jobs)
+                self.assertEqual(kept, jobs)
+                claim.assert_not_called()
+        self.assertEqual(spr._durable_probe_probes.get(), 0)
+
+    async def test_pre_selection_probe_budget_never_drops_uncandidates(self):
+        total = spr._PROBE_MAX_CANDIDATES + 6
+        jobs = [{"hash": f"h{index}"} for index in range(total)]
+        claim = MagicMock(
+            return_value=SimpleNamespace(claimed=False, claim_token="", publication_state="published")
+        )
+        with patch.dict(os.environ, self._durable_probe_env(), clear=False), patch.object(
+            spr, "edge_writer_configured", return_value=True
+        ), patch.object(spr, "claim_job_payload_edge", claim), patch.object(
+            spr, "release_job_payload_edge", MagicMock()
+        ):
+            kept = await spr.filter_candidates_by_durable_state(jobs)
+
+        self.assertEqual(claim.call_count, spr._PROBE_MAX_CANDIDATES)
+        self.assertEqual([job["hash"] for job in kept], [f"h{index}" for index in range(24, total)])
+        self.assertEqual(spr._durable_probe_probes.get(), spr._PROBE_MAX_CANDIDATES)
+
+    async def test_collect_reports_probe_counters_and_pre_selection_stage(self):
+        old_telemetry = copy.deepcopy(spr.core.CYCLE_TELEMETRY)
+
+        async def fake_collect(*args, **kwargs):
+            spr._durable_probe_probes.set(4)
+            spr._durable_probe_unavailable.set(1)
+            return {"ok": True, "posted": 0, "duplicates": 0, "failed": 0}
+
+        try:
+            with patch.object(spr, "_ORIGINAL_COLLECT_AND_POST_ONCE", side_effect=fake_collect):
+                result = await spr.collect_and_post_once(use_sqlite=False)
+
+            self.assertEqual(result["durable_probe_probes"], 4)
+            self.assertEqual(result["durable_probe_unavailable"], 1)
+            self.assertEqual(result["pre_selection_duplicates"], 0)
+            self.assertEqual(spr.core.CYCLE_TELEMETRY["durable_probe_probes"], 4)
+            self.assertEqual(spr.core.CYCLE_TELEMETRY["durable_probe_unavailable"], 1)
+            self.assertEqual(spr.core.CYCLE_TELEMETRY["funnel"]["pre_selection_duplicate"], 0)
+        finally:
+            spr.core.CYCLE_TELEMETRY.clear()
+            spr.core.CYCLE_TELEMETRY.update(old_telemetry)
 
 
 if __name__ == "__main__":

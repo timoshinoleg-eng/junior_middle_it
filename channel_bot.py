@@ -431,7 +431,9 @@ JUNIOR_SIGNALS = [
     "junior", "jr", "jr.", "entry level", "entry-level", "entry",
     "trainee", "graduate", "начинающий", "начальный",
     "0-1 year", "0-2 years", "1 year", "1+ year", "1-2 years",
-    "no experience", "без опыта", "beginner"
+    "no experience", "без опыта", "beginner",
+    "new grad", "new graduate", "campus hire", "associate engineer",
+    "intern", "стажер", "стажёр"
 ]
 
 MIDDLE_SIGNALS = [
@@ -445,6 +447,26 @@ EXCLUDE_SIGNALS = [
     "vice president", "cto", "cfo", "chief", "c-level",
     "старший", "ведущий", "руководитель", "главный"
 ]
+
+# Structured source fields that may carry an explicit machine readable level.
+_LEVEL_FIELD_KEYS = (
+    'level',
+    'seniority',
+    'seniority_level',
+    'experience',
+    'experience_level',
+    'grade',
+    'job_level',
+    'career_level',
+)
+
+# Ladder markers such as "Engineer I" or "Developer 2" state scope explicitly.
+_ENTRY_LEVEL_TITLE_RE = re.compile(
+    r'\b(?:engineer|developer|dev|programmer|analyst|specialist|consultant)\s*(?:i|1)\b'
+)
+_MID_LEVEL_TITLE_RE = re.compile(
+    r'\b(?:engineer|developer|dev|programmer|analyst|specialist|consultant)\s*(?:ii|2)\b'
+)
 
 IT_ROLES = [
     "developer", "engineer", "programmer", "designer", "qa", "tester",
@@ -1479,6 +1501,7 @@ _SOURCE_FUNNEL_FIELDS = (
     'track_filter',
     'track_passed',
     'duplicates',
+    'pre_selection_duplicate',
     'preflight_excluded',
     'selected',
     'posted',
@@ -1524,6 +1547,11 @@ def _source_funnel_bucket(funnel: Dict[str, Dict[str, int]], job: Dict) -> Dict[
 def _bump_source_funnel(funnel: Dict[str, Dict[str, int]], job: Dict, field: str) -> None:
     row = _source_funnel_bucket(funnel, job)
     row[field] = row.get(field, 0) + 1
+
+
+def _source_funnel_stage_total(funnel: Dict[str, Dict[str, int]], field: str) -> int:
+    """Sum one funnel stage across every source bucket."""
+    return sum(int(row.get(field) or 0) for row in funnel.values())
 
 
 def parse_job_datetime(job: Dict) -> Optional[datetime]:
@@ -1649,6 +1677,17 @@ def select_jobs_for_publication(jobs: List[Dict]) -> List[Dict]:
     return ranked[:emergency_limit] if emergency_limit is not None else ranked
 
 
+async def probe_candidates_for_publication(candidates: List[Dict]) -> List[Dict]:
+    """Return the candidates still worth a publication slot.
+
+    The core collector is transport agnostic, so the default hook keeps every
+    candidate. Serverless runs replace it with a durable-ledger probe: without
+    that probe the per-cycle slots are consumed by vacancies that the ledger
+    already published, and the cycle ends with zero new posts.
+    """
+    return candidates
+
+
 def should_skip_source(source_name: str) -> bool:
     """True if source is in auto-skip fail-streak cooldown (v6.6)."""
     if not Config.SOURCE_FAIL_SKIP:
@@ -1695,18 +1734,53 @@ def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int = 3) ->
     return []
 
 # ==================== JOB PROCESSING ====================
+def _structured_level_text(job_data: Dict) -> str:
+    """Collect explicit seniority evidence carried in structured source fields.
+
+    Boards such as The Muse or Ashby publish a machine readable level/tag
+    instead of stating it in the title or description. Those fields are
+    authoritative evidence, unlike a bare technical title.
+    """
+    parts: List[str] = []
+    for key in _LEVEL_FIELD_KEYS:
+        value = job_data.get(key)
+        if isinstance(value, dict):
+            value = value.get('name') or value.get('label') or ''
+        if isinstance(value, (list, tuple, set)):
+            value = ' '.join(str(item) for item in value)
+        if value not in (None, '', [], {}):
+            parts.append(str(value))
+    tags = job_data.get('tags') or []
+    if isinstance(tags, (list, tuple, set)):
+        parts.extend(str(tag) for tag in tags if isinstance(tag, str) and tag.strip())
+    return ' '.join(parts)
+
+
 def classify_job_level(job_data: Dict) -> Optional[str]:
     """Classify job level with exclusion logic"""
     title_text = str(job_data.get('title', '')).lower()
     full_text = f"{job_data.get('title', '')} {job_data.get('description', '')}".lower()
-    
-    # Exclude senior+ roles first
+    structured_text = _structured_level_text(job_data).lower()
+
+    # Exclude senior+ roles first, including explicit seniority in metadata.
     if any(has_text_signal(full_text, word) for word in EXCLUDE_SIGNALS):
         return None
-    
-    if any(has_text_signal(full_text, signal) for signal in JUNIOR_SIGNALS):
+    if structured_text and any(has_text_signal(structured_text, word) for word in EXCLUDE_SIGNALS):
+        return None
+
+    if any(has_text_signal(full_text, word) for word in JUNIOR_SIGNALS):
         return "Junior"
     if any(has_text_signal(full_text, signal) for signal in MIDDLE_SIGNALS):
+        return "Middle"
+    if structured_text:
+        if any(has_text_signal(structured_text, word) for word in JUNIOR_SIGNALS):
+            return "Junior"
+        if any(has_text_signal(structured_text, signal) for signal in MIDDLE_SIGNALS):
+            return "Middle"
+    # Scoped ladder markers are explicit statements, not seniority guesses.
+    if _ENTRY_LEVEL_TITLE_RE.search(title_text):
+        return "Junior"
+    if _MID_LEVEL_TITLE_RE.search(title_text):
         return "Middle"
     # A technical title alone is not evidence of Junior/Middle seniority.
     # Keep unknown levels out of the public queue instead of labelling them Junior.
@@ -3172,6 +3246,25 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
         if url_preflight['excluded']:
             logger.info("⏭️ URL preflight excluded %s stale application links", url_preflight['excluded'])
 
+        # Pre-selection dedup gate. The default hook is a no-op, but serverless
+        # runs probe the durable ledger here so that already published vacancies
+        # never consume a publication slot before the send claim is attempted.
+        preselection_duplicate_count = 0
+        probed_candidates = await probe_candidates_for_publication(publish_candidates)
+        if len(probed_candidates) != len(publish_candidates):
+            kept_ids = {id(job) for job in probed_candidates}
+            for job in publish_candidates:
+                if id(job) in kept_ids:
+                    continue
+                _bump_source_funnel(source_funnel, job, 'pre_selection_duplicate')
+                preselection_duplicate_count += 1
+            duplicate_count += preselection_duplicate_count
+            logger.info(
+                "🔁 Pre-selection dedup dropped %s already published candidates",
+                preselection_duplicate_count,
+            )
+        publish_candidates = probed_candidates
+
         # Publish all editorially approved jobs. A ceiling exists only for an operational incident.
         total_selected = len(publish_candidates)
         selected_jobs = select_jobs_for_publication(publish_candidates)
@@ -3208,9 +3301,12 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
             'ok': True,
             'fetched': len(all_jobs),
             'suitable': len(classified_jobs),
+            'classified': len(classified_jobs),
+            'suitable_after_freshness': _source_funnel_stage_total(source_funnel, 'suitable'),
             'candidates': len(publish_candidates),
             'posted': posted_count,
             'duplicates': duplicate_count,
+            'pre_selection_duplicates': preselection_duplicate_count,
             'failed': failed_count,
             'transport': post_transport,
             'url_preflight': url_preflight,

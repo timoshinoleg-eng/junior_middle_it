@@ -104,16 +104,27 @@ class ServerlessPublicationPolicyTests(unittest.TestCase):
         ):
             self.assertTrue(policy.is_fresh_for_serverless_publication(job, now=now))
 
-    def test_vercel_policy_sets_conservative_burst_ceiling(self):
+    def test_vercel_policy_honours_the_configured_burst_ceiling(self):
         original = policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE
         try:
             with patch.dict(
                 os.environ,
-                {"VERCEL": "1", "SERVERLESS_MAX_POSTS_PER_CYCLE": "3"},
+                {"VERCEL": "1", "SERVERLESS_MAX_POSTS_PER_CYCLE": "5"},
                 clear=False,
             ):
                 self.assertTrue(policy.install_serverless_publication_policy())
-                self.assertEqual(policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE, 3)
+                self.assertEqual(policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE, 5)
+        finally:
+            policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE = original
+            policy.core.is_suitable_job = policy._ORIGINAL_IS_SUITABLE_JOB
+
+    def test_vercel_policy_keeps_publication_headroom_without_an_env_override(self):
+        original = policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE
+        try:
+            with patch.dict(os.environ, {"VERCEL": "1", "SERVERLESS_MAX_POSTS_PER_CYCLE": ""}, clear=False):
+                self.assertTrue(policy.install_serverless_publication_policy())
+                self.assertEqual(policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE, 8)
+                self.assertEqual(policy.publication_policy_snapshot()["max_posts_per_cycle"], 8)
         finally:
             policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE = original
             policy.core.is_suitable_job = policy._ORIGINAL_IS_SUITABLE_JOB
