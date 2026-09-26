@@ -329,6 +329,51 @@ class GrowthUtilsTests(unittest.TestCase):
         self.assertEqual(senior["quality_gate_status"], "excluded")
         self.assertIn("seniority_conflict", senior["quarantine_reasons"])
 
+    def test_editorial_gate_keeps_explicit_middle_role_with_architecture_wording(self):
+        job = {
+            "title": "Intermediate Backend Engineer, India",
+            "category": "development",
+            "location": "Remote",
+            "description": (
+                "Remote role for an intermediate engineer. You will work on the "
+                "service architecture and help with team leadership. 2+ years of "
+                "experience with Python required."
+            ),
+        }
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["quality_gate_status"], "passed")
+        self.assertNotEqual(job["level_source"], "conflict")
+        self.assertGreater(job["level_confidence"], 0)
+
+    def test_editorial_gate_still_excludes_explicit_years_of_experience(self):
+        job = {
+            "title": "Software Engineer, Ingestion Platform",
+            "category": "development",
+            "location": "Remote",
+            "description": (
+                "Remote role building ingestion pipelines. You will lead a team "
+                "and we are looking for 5+ years of experience."
+            ),
+            "level": "Middle",
+        }
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["quality_gate_status"], "excluded")
+        self.assertIn("seniority_conflict", job["quarantine_reasons"])
+
+    def test_editorial_gate_still_excludes_senior_and_lead_titles(self):
+        for title in ("Senior Backend Engineer", "Backend Team Lead", "Solutions Architect"):
+            with self.subTest(title=title):
+                job = {
+                    "title": title,
+                    "category": "development",
+                    "location": "Remote",
+                    "description": "Remote engineering role, 2+ years of experience.",
+                    "level": "Middle",
+                }
+                apply_editorial_quality_gate(job)
+                self.assertEqual(job["quality_gate_status"], "excluded")
+                self.assertIn("seniority_conflict", job["quarantine_reasons"])
+
     def test_office_location_without_remote_is_quarantined(self):
         job = {
             "title": "Network Operations Engineer",

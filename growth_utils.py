@@ -186,6 +186,25 @@ def _contains_any(text: str, signals: Tuple[str, ...]) -> bool:
     return any(signal in text for signal in signals)
 
 
+def _contains_seniority_conflict(text: str) -> bool:
+    """Detect a seniority conflict without firing on ordinary word extensions.
+
+    Single word signals are matched on word boundaries: a plain substring test
+    lets "architect" fire on "architecture" and "lead" fire on "leadership",
+    which quarantined explicitly junior and middle postings whose description
+    merely mentioned software architecture or team leadership. Multi word
+    signals stay substring matches because they are phrase level evidence
+    ("5+ years", "deep experience", "head of").
+    """
+    for signal in _SENIORITY_CONFLICT_SIGNALS:
+        if " " in signal:
+            if signal in text:
+                return True
+        elif re.search(r"(?<!\w)" + re.escape(signal) + r"(?!\w)", text):
+            return True
+    return False
+
+
 def classify_thematic_track(job: Dict) -> str:
     """Map legacy categories and vacancy text to one stable audience-facing track."""
     category = str(job.get("category") or "other").lower()
@@ -342,7 +361,7 @@ def assess_level_evidence(job: Dict) -> Dict[str, Any]:
     text = _job_text(job)
     level = str(job.get("level") or "").strip()
 
-    if _contains_any(text, _SENIORITY_CONFLICT_SIGNALS):
+    if _contains_seniority_conflict(text):
         return {
             "level_source": "conflict",
             "level_confidence": 0,
