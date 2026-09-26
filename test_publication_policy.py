@@ -226,10 +226,22 @@ class PublicationPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             classify_job_level(
-                {"title": "DevOps Engineer", "description": "Regular remote role."}
+                {"title": "DevOps Engineer", "description": "Remote role, 2+ years of Kubernetes."}
             ),
             "Middle",
         )
+
+    def test_level_classifier_ignores_regular_as_seniority_evidence(self):
+        for description in (
+            "Remote role. Regular working hours and a remote first team.",
+            "Remote role. You will have regular 1:1s with your manager.",
+        ):
+            with self.subTest(description=description):
+                self.assertIsNone(
+                    classify_job_level(
+                        {"title": "Forward Deployed Engineer", "description": description}
+                    )
+                )
 
     def test_structured_level_metadata_is_authoritative_evidence(self):
         self.assertEqual(

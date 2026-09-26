@@ -437,7 +437,11 @@ JUNIOR_SIGNALS = [
 ]
 
 MIDDLE_SIGNALS = [
-    "middle", "mid-level", "mid level", "intermediate", "regular",
+    # "regular" is deliberately absent: it reads as seniority only in
+    # "regular employment", and in practice it classified forward-deployed and
+    # analytics roles from the phrase "regular working hours". Measured on live
+    # sources it was the sole level evidence for 5 of 41 classified vacancies.
+    "middle", "mid-level", "mid level", "intermediate",
     "2-3 years", "2-4 years", "3-5 years", "2+ years", "3+ years"
 ]
 

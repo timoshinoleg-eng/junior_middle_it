@@ -23,6 +23,7 @@ from growth_utils import (
     resolve_channels_for_job,
     serialize_job_payload,
 )
+from channel_bot import classify_job_level
 
 
 class GrowthUtilsTests(unittest.TestCase):
@@ -260,6 +261,31 @@ class GrowthUtilsTests(unittest.TestCase):
             ),
             "data_ai",
         )
+
+    def test_classifier_evidence_survives_the_editorial_gate(self):
+        """Anything the level classifier admits must not die in the gate.
+
+        The classifier reads structured metadata and ladder markers; the gate
+        keeps its own narrower evidence dictionary. When those drift apart the
+        loss is silent, because the vacancy is classified and then quarantined
+        with ``missing_level_evidence`` in the same cycle.
+        """
+        cases = (
+            {"title": "SRE Specialist I", "description": "Remote role on reliability work."},
+            {"title": "Software Engineer II", "description": "Remote role on platform work."},
+            {"title": "Intermediate Backend Engineer", "description": "Remote role, 2+ years of Python."},
+            {"title": "Software Engineer", "description": "Remote role, mid-level Python engineer."},
+            {"title": "New Grad Backend Engineer", "description": "Remote role, graduate program."},
+        )
+        for job in cases:
+            with self.subTest(title=job["title"]):
+                candidate = dict(job, category="development", location="Remote")
+                level = classify_job_level(candidate)
+                self.assertIsNotNone(level, candidate)
+                candidate["level"] = level
+                apply_editorial_quality_gate(candidate)
+                self.assertNotEqual(candidate["level_source"], "unknown", candidate)
+                self.assertGreater(candidate["level_confidence"], 0, candidate)
 
     def test_editorial_gate_passes_explicit_worldwide_role(self):
         job = {
