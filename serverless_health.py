@@ -51,8 +51,63 @@ def copilot_rollout() -> Dict[str, object]:
         key: _flag_enabled(name) for key, name in COPILOT_ROLLOUT_FLAGS
     }
     state["webapp_url"] = _present("COPILOT_WEBAPP_URL")
+    state["tables"] = copilot_tables_present()
     state["ready"] = bool(state.get("enabled")) and bool(state.get("webapp"))
     return state
+
+
+# One table per migration of P9-P12. The probe touches all of them in a single
+# statement, so the answer is "all four migrations are applied" or nothing.
+_COPILOT_TABLE_PROBE = (
+    "SELECT (SELECT count(*) FROM growth_copilot_profiles) "
+    "+ (SELECT count(*) FROM growth_copilot_ai_reports) "
+    "+ (SELECT count(*) FROM growth_copilot_applications) "
+    "+ (SELECT count(*) FROM growth_copilot_rate_limits)"
+)
+_PROBE_TIMEOUT = 8.0
+
+
+def _interactive_bridge_url() -> str:
+    """The interactive Edge bridge of this deployment, if it is configured."""
+    endpoint = (os.getenv("GROWTH_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
+    mode = (os.getenv("GROWTH_HTTP_AUTH_MODE") or "").strip().lower()
+    if mode != "telegram" or not endpoint.startswith("https://"):
+        return ""
+    if "supabase.co/functions/v1/interactive-growth-proxy" not in endpoint:
+        return ""
+    return endpoint
+
+
+def copilot_tables_present() -> Optional[bool]:
+    """Whether the tables of the migrations P9-P12 exist in the database.
+
+    ``None`` means "unknown": the probe needs the interactive bridge and the
+    bot token, and a failure of the probe must never turn the health endpoint
+    red.
+    """
+    endpoint = _interactive_bridge_url()
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    if not endpoint or not token:
+        return None
+    body = json.dumps({"query": _COPILOT_TABLE_PROBE, "params": []}).encode("utf-8")
+    request = Request(
+        endpoint,
+        data=body,
+        headers={"Content-Type": "application/json", "x-telegram-bot-token": token},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=_PROBE_TIMEOUT) as response:
+            return int(getattr(response, "status", 200)) == 200
+    except HTTPError as exc:
+        payload = exc.read().decode("utf-8", "replace")
+        if int(exc.code) == 503 and "query failed" in payload:
+            # The bridge answered, the database refused the statement: a table
+            # of the migrations is missing.
+            return False
+        return None
+    except Exception:
+        return None
 
 
 def missing_posting_env() -> List[str]:
