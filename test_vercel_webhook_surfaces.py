@@ -1,5 +1,33 @@
+import re
 import unittest
 from pathlib import Path
+
+EDGE_VALIDATORS = (
+    "supabase/functions/growth-proxy/index.ts",
+    "supabase/functions/interactive-growth-proxy/index.ts",
+)
+
+# Mirrors of the relation scan of the Edge validators. The list must stay in
+# sync with the TypeScript sources, otherwise the test would check nothing.
+RELATION_PATTERNS = (
+    r"\bFROM\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)",
+    r"\bJOIN\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)",
+    r"\bINTO\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)",
+    r"\bDELETE\s+FROM\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)",
+    r"\bUPDATE\s+(?!SET\b)((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)",
+)
+DISTINCT_FROM_PATTERN = re.compile(r"\bIS\s+(?:NOT\s+)?DISTINCT\s+FROM\b", re.IGNORECASE)
+
+
+def _relations(sql: str, *, normalized: bool) -> list:
+    """Relations the Edge validator would read out of one statement."""
+    scan = re.sub(r"\s+", " ", sql.strip())
+    if normalized:
+        scan = DISTINCT_FROM_PATTERN.sub("IS DISTINCT_FROM", scan)
+    found = []
+    for pattern in RELATION_PATTERNS:
+        found.extend(match.group(1).lower() for match in re.finditer(pattern, scan, re.IGNORECASE))
+    return found
 
 
 class VercelWebhookSurfaceTests(unittest.TestCase):
@@ -59,6 +87,30 @@ class VercelWebhookSurfaceTests(unittest.TestCase):
         )
         self.assertIn(r"/\bUPDATE\s+(?!SET\b)", text)
         self.assertNotIn(r"/^UPDATE\s+", text)
+
+    def test_edge_validators_ignore_is_distinct_from_as_a_relation(self):
+        for path in EDGE_VALIDATORS:
+            text = Path(path).read_text(encoding="utf-8")
+            self.assertIn(r"/\bIS\s+(?:NOT\s+)?DISTINCT\s+FROM\b/gi", text, path)
+            self.assertIn("relationScan", text, path)
+
+    def test_daily_free_credit_statement_survives_the_relation_scan(self):
+        source = Path("copilot/store.py").read_text(encoding="utf-8")
+        match = re.search(
+            r"(UPDATE\s+growth_copilot_credits.*?RETURNING\s+balance)", source, re.S
+        )
+        self.assertIsNotNone(match, "daily free credit statement not found")
+        statement = match.group(1)
+
+        without_fix = _relations(statement, normalized=False)
+        self.assertIn("current_date", without_fix)
+        with_fix = _relations(statement, normalized=True)
+        self.assertNotIn("current_date", with_fix)
+        for relation in with_fix:
+            self.assertTrue(
+                relation.startswith("growth_"),
+                "relation outside the growth allowlist: %s" % relation,
+            )
 
 
 if __name__ == "__main__":
