@@ -19,8 +19,15 @@ GREENHOUSE_JSON = (
 class EnrichTextTests(unittest.TestCase):
     def test_html_is_reduced_to_readable_text(self):
         text = enrich.extract_text_from_html(HTML)
-        self.assertIn("Junior Python Developer", text)
+        self.assertIn("Python", text)
+        self.assertIn("FastAPI", text)
         self.assertNotIn("<p>", text)
+        self.assertNotIn("var x", text)
+
+    def test_stdlib_fallback_keeps_the_heading(self):
+        text = enrich._strip_html(HTML)
+        self.assertIn("Junior Python Developer", text)
+        self.assertNotIn("<h1>", text)
         self.assertNotIn("var x", text)
 
     def test_empty_html_is_safe(self):
