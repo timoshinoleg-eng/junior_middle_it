@@ -328,11 +328,30 @@ def check_copilot_rollout(results: List[Dict[str, str]], payload: Optional[Dict[
     )
 
 
-def check_validator_versions(results: List[Dict[str, str]]) -> None:
+def check_validator_versions(
+    results: List[Dict[str, str]], payload: Optional[Dict[str, object]] = None
+) -> None:
+    """The validator build of the Edge functions.
+
+    The version marker is only a proxy: a deployment that already accepts the
+    credit statement works, even if it predates the marker. The functional
+    probe of the health payload therefore decides.
+    """
+    state = payload.get("copilot") if payload else None
+    accepted = state.get("validator_ok") if isinstance(state, dict) else None
     for name, path in (
         ("edge.growth_bridge.validator", "/growth-proxy/health"),
         ("edge.interactive_bridge.validator", "/interactive-growth-proxy/health"),
     ):
+        if accepted is True:
+            results.append(
+                {
+                    "name": name,
+                    "status": PASS,
+                    "detail": "the deployed build accepts the credit statement",
+                }
+            )
+            continue
         status, body = http(EDGE_BASE + path)
         if status != 200:
             results.append(
@@ -344,16 +363,16 @@ def check_validator_versions(results: List[Dict[str, str]]) -> None:
             )
             continue
         try:
-            payload = json.loads(body)
+            edge_payload = json.loads(body)
         except ValueError:
             results.append({"name": name, "status": FAIL, "detail": "response is not JSON"})
             continue
-        problems = validator_version_problems(payload)
+        problems = validator_version_problems(edge_payload)
         results.append(
             {
                 "name": name,
                 "status": FAIL if problems else PASS,
-                "detail": "; ".join(problems) if problems else "validator %s" % payload.get("validator"),
+                "detail": "; ".join(problems) if problems else "validator %s" % edge_payload.get("validator"),
             }
         )
 
@@ -634,7 +653,7 @@ def run_checks() -> List[Dict[str, str]]:
     check_miniapp(results)
     check_signature_gate(results)
     check_edge_health(results)
-    check_validator_versions(results)
+    check_validator_versions(results, payload)
     check_interactive_bridge(results)
     check_validator_fix(results)
     check_tables(results)

@@ -8,6 +8,7 @@ match the migrations of P9-P12, and the flag list has to stay documented in
 import re
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools import verify_release_v7 as verify
 
@@ -213,6 +214,30 @@ class CopilotValidatorCheckTests(unittest.TestCase):
 
     def test_unknown_validator_is_skipped(self):
         self.assertEqual(self._run({"copilot": {"validator_ok": None}})["status"], verify.SKIP)
+
+
+class ValidatorVersionCheckTests(unittest.TestCase):
+    def test_functional_probe_overrides_a_missing_marker(self):
+        results = []
+        verify.check_validator_versions(results, {"copilot": {"validator_ok": True}})
+        self.assertEqual(len(results), 2)
+        for entry in results:
+            self.assertEqual(entry["status"], verify.PASS)
+            self.assertIn("credit statement", entry["detail"])
+
+    def test_marker_decides_when_the_functional_probe_is_unknown(self):
+        results = []
+        with patch("tools.verify_release_v7.http", return_value=(200, '{"validator": 2}')):
+            verify.check_validator_versions(results, {"copilot": {"validator_ok": None}})
+        for entry in results:
+            self.assertEqual(entry["status"], verify.PASS)
+
+    def test_old_build_fails_when_the_functional_probe_is_unknown(self):
+        results = []
+        with patch("tools.verify_release_v7.http", return_value=(200, '{"validator": 1}')):
+            verify.check_validator_versions(results, {"copilot": {"validator_ok": None}})
+        for entry in results:
+            self.assertEqual(entry["status"], verify.FAIL)
 
 
 if __name__ == "__main__":
