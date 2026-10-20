@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from localized_webhook_runtime import (
+from copilot_webhook_runtime import (
     MAX_UPDATE_BYTES,
     process_update_payload,
     webhook_secret_valid,

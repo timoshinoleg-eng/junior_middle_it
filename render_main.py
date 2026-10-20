@@ -44,6 +44,7 @@ def config_summary() -> dict:
         "PRODUCT_UTILITY_METRICS": True,
         "REFERRAL_2": True,
         "PUBLIC_ACQUISITION": True,
+        "COPILOT": present("COPILOT_ENABLED"),
         "APIFY_API_TOKEN": present("APIFY_API_TOKEN"),
         "TELEGRAM_API_ID": present("TELEGRAM_API_ID"),
         "TELEGRAM_API_HASH": present("TELEGRAM_API_HASH"),
@@ -151,6 +152,9 @@ def run_bot(exit_fn: Callable[[int], None] = os._exit) -> None:
         # P1-P7 runtime modules bind PostgresGrowthStore into their classes.
         import http_growth_patch  # noqa: F401
         import durable_product_state
+        # The Copilot surface installs its deep-link and callback handlers on the
+        # durable JobBot, so the legacy long-polling worker answers them too.
+        import copilot_webhook_runtime  # noqa: F401
 
         with STATE_LOCK:
             STATE["bot_running"] = True

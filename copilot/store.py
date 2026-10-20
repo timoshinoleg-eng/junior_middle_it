@@ -1,0 +1,418 @@
+"""Single access point for the Copilot tables behind the durable growth transport.
+
+Every statement here is a single parameterized query against a ``growth_*``
+relation, which is exactly what the Edge growth bridge accepts. The module
+never talks to Telegram and never imports the bot runtime.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional
+
+logger = logging.getLogger(__name__)
+
+PROFILES_TABLE = "growth_copilot_profiles"
+EVALUATIONS_TABLE = "growth_copilot_evaluations"
+DOCUMENTS_TABLE = "growth_copilot_documents"
+CREDITS_TABLE = "growth_copilot_credits"
+CREDIT_EVENTS_TABLE = "growth_copilot_credit_events"
+GRADE_AUDITS_TABLE = "growth_copilot_grade_audits"
+ENRICHMENTS_TABLE = "growth_copilot_enrichments"
+
+EVALUATION_RETENTION_DAYS = 90
+DOCUMENT_RETENTION_DAYS = 90
+GRADE_AUDIT_RETENTION_DAYS = 45
+ENRICHMENT_RETENTION_DAYS = 14
+
+
+class CopilotStoreUnavailable(RuntimeError):
+    """Raised when the durable growth backend cannot serve a Copilot query."""
+
+
+class CopilotStore:
+    """Typed access to the Copilot tables of the durable growth backend."""
+
+    def __init__(self, growth_store):
+        if growth_store is None:
+            raise CopilotStoreUnavailable("Copilot store requires a durable growth backend")
+        self._store = growth_store
+
+    @classmethod
+    def from_database(cls, db) -> Optional["CopilotStore"]:
+        """Build a store from a bot database object, or ``None`` without Postgres."""
+        growth_store = getattr(db, "_growth_store", None)
+        if growth_store is None:
+            return None
+        return cls(growth_store)
+
+    @contextmanager
+    def _cursor(self) -> Iterator[Any]:
+        try:
+            cursor = self._store._ensure_conn().cursor()
+        except Exception as exc:
+            raise CopilotStoreUnavailable(
+                f"Growth backend unavailable: {type(exc).__name__}"
+            ) from exc
+        with cursor:
+            yield cursor
+
+    # ------------------------------------------------------------------
+    # Profile
+    # ------------------------------------------------------------------
+    def save_profile(self, user_id: int, *, grade: str, skills: str, source: str) -> bool:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_profiles (user_id, grade, skills, source, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    grade = EXCLUDED.grade,
+                    skills = EXCLUDED.skills,
+                    source = EXCLUDED.source,
+                    updated_at = NOW()
+                RETURNING user_id
+                """,
+                (int(user_id), str(grade or ""), str(skills or ""), str(source or "")),
+            )
+            return bool(cur.fetchone())
+
+    def get_profile(self, user_id: int) -> Optional[Dict]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT grade, skills, source, updated_at
+                FROM growth_copilot_profiles
+                WHERE user_id = %s
+                """,
+                (int(user_id),),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "grade": str(row[0] or ""),
+            "skills": str(row[1] or ""),
+            "source": str(row[2] or ""),
+            "updated_at": row[3],
+        }
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+    def save_evaluation(
+        self,
+        user_id: int,
+        job_id: str,
+        *,
+        fit_score: int,
+        stack_match_score: int = 0,
+        keyword_overlap_pct: int = 0,
+        matched_keywords: Optional[List[str]] = None,
+        missing_skills: Optional[List[str]] = None,
+        llm_used: bool = False,
+        model: str = "",
+    ) -> bool:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_evaluations
+                    (user_id, job_id, fit_score, stack_match_score, keyword_overlap_pct,
+                     matched_keywords, missing_skills, llm_used, model, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (user_id, job_id) DO UPDATE SET
+                    fit_score = EXCLUDED.fit_score,
+                    stack_match_score = EXCLUDED.stack_match_score,
+                    keyword_overlap_pct = EXCLUDED.keyword_overlap_pct,
+                    matched_keywords = EXCLUDED.matched_keywords,
+                    missing_skills = EXCLUDED.missing_skills,
+                    llm_used = EXCLUDED.llm_used,
+                    model = EXCLUDED.model,
+                    updated_at = NOW()
+                RETURNING fit_score
+                """,
+                (
+                    int(user_id),
+                    str(job_id),
+                    int(fit_score),
+                    int(stack_match_score),
+                    int(keyword_overlap_pct),
+                    json.dumps(list(matched_keywords or []), ensure_ascii=False),
+                    json.dumps(list(missing_skills or []), ensure_ascii=False),
+                    bool(llm_used),
+                    str(model or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def get_evaluation(self, user_id: int, job_id: str) -> Optional[Dict]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT fit_score, stack_match_score, keyword_overlap_pct,
+                       matched_keywords, missing_skills, llm_used, model, created_at
+                FROM growth_copilot_evaluations
+                WHERE user_id = %s AND job_id = %s
+                """,
+                (int(user_id), str(job_id)),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "fit_score": int(row[0] or 0),
+            "stack_match_score": int(row[1] or 0),
+            "keyword_overlap_pct": int(row[2] or 0),
+            "matched_keywords": _decode_list(row[3]),
+            "missing_skills": _decode_list(row[4]),
+            "llm_used": bool(row[5]),
+            "model": str(row[6] or ""),
+            "created_at": row[7],
+        }
+
+    # ------------------------------------------------------------------
+    # Grade audit
+    # ------------------------------------------------------------------
+    def save_grade_audit(self, job_hash: str, audit) -> bool:
+        payload = audit.as_dict() if hasattr(audit, "as_dict") else dict(audit or {})
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_grade_audits
+                    (job_hash, declared_grade, real_grade, realism_score, is_fake_grade,
+                     badge_text, signals, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (job_hash) DO UPDATE SET
+                    declared_grade = EXCLUDED.declared_grade,
+                    real_grade = EXCLUDED.real_grade,
+                    realism_score = EXCLUDED.realism_score,
+                    is_fake_grade = EXCLUDED.is_fake_grade,
+                    badge_text = EXCLUDED.badge_text,
+                    signals = EXCLUDED.signals,
+                    updated_at = NOW()
+                RETURNING job_hash
+                """,
+                (
+                    str(job_hash),
+                    str(payload.get("declared_grade") or ""),
+                    str(payload.get("real_grade") or ""),
+                    int(payload.get("realism_score") or 0),
+                    bool(payload.get("is_fake_grade")),
+                    str(payload.get("badge_text") or ""),
+                    json.dumps(list(payload.get("signals") or []), ensure_ascii=False),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def get_grade_audit(self, job_hash: str) -> Optional[Dict]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT declared_grade, real_grade, realism_score, is_fake_grade,
+                       badge_text, signals, created_at
+                FROM growth_copilot_grade_audits
+                WHERE job_hash = %s
+                """,
+                (str(job_hash),),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "declared_grade": str(row[0] or ""),
+            "real_grade": str(row[1] or ""),
+            "realism_score": int(row[2] or 0),
+            "is_fake_grade": bool(row[3]),
+            "badge_text": str(row[4] or ""),
+            "signals": _decode_list(row[5]),
+            "created_at": row[6],
+        }
+
+    # ------------------------------------------------------------------
+    # Enrichment cache
+    # ------------------------------------------------------------------
+    def save_enrichment(self, job_hash: str, source_url: str, text: str) -> bool:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_enrichments (job_hash, source_url, text, fetched_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (job_hash) DO UPDATE SET
+                    source_url = EXCLUDED.source_url,
+                    text = EXCLUDED.text,
+                    fetched_at = NOW()
+                RETURNING job_hash
+                """,
+                (str(job_hash), str(source_url or ""), str(text or "")),
+            )
+            return bool(cur.fetchone())
+
+    def get_enrichment(self, job_hash: str) -> Optional[Dict]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT source_url, text, fetched_at
+                FROM growth_copilot_enrichments
+                WHERE job_hash = %s
+                """,
+                (str(job_hash),),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {"source_url": str(row[0] or ""), "text": str(row[1] or ""), "fetched_at": row[2]}
+
+    # ------------------------------------------------------------------
+    # Credits
+    # ------------------------------------------------------------------
+    def ensure_credit_row(self, user_id: int) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_credits (user_id, balance, updated_at)
+                VALUES (%s, 0, NOW())
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                (int(user_id),),
+            )
+
+    def get_balance(self, user_id: int) -> int:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT balance FROM growth_copilot_credits WHERE user_id = %s
+                """,
+                (int(user_id),),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    def grant_daily_allowance(self, user_id: int, amount: int) -> Optional[int]:
+        """Add the daily free allowance exactly once per calendar day."""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE growth_copilot_credits
+                SET balance = balance + %s,
+                    free_granted_on = CURRENT_DATE,
+                    updated_at = NOW()
+                WHERE user_id = %s
+                  AND free_granted_on IS DISTINCT FROM CURRENT_DATE
+                RETURNING balance
+                """,
+                (int(amount), int(user_id)),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    def grant_credits(self, user_id: int, amount: int) -> Optional[int]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE growth_copilot_credits
+                SET balance = balance + %s,
+                    updated_at = NOW()
+                WHERE user_id = %s
+                RETURNING balance
+                """,
+                (int(amount), int(user_id)),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    def spend_credits(self, user_id: int, amount: int) -> Optional[int]:
+        """Atomically spend credits; ``None`` means the balance was too low."""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE growth_copilot_credits
+                SET balance = balance - %s,
+                    updated_at = NOW()
+                WHERE user_id = %s
+                  AND balance >= %s
+                RETURNING balance
+                """,
+                (int(amount), int(user_id), int(amount)),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    def log_credit_event(self, user_id: int, delta: int, reason: str, ref: str = "") -> bool:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                RETURNING id
+                """,
+                (int(user_id), int(delta), str(reason or ""), str(ref or "")),
+            )
+            return bool(cur.fetchone())
+
+    def count_credit_events(self, reason: str, today_only: bool = False) -> int:
+        if today_only:
+            statement = """
+                SELECT COUNT(*) FROM growth_copilot_credit_events
+                WHERE reason = %s AND created_at >= CURRENT_DATE
+            """
+        else:
+            statement = """
+                SELECT COUNT(*) FROM growth_copilot_credit_events WHERE reason = %s
+            """
+        with self._cursor() as cur:
+            cur.execute(statement, (str(reason),))
+            row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    # ------------------------------------------------------------------
+    # Retention
+    # ------------------------------------------------------------------
+    def prune_expired(self) -> Dict[str, int]:
+        """Drop rows that outlived their retention window."""
+        removed: Dict[str, int] = {}
+        statements = (
+            (
+                EVALUATIONS_TABLE,
+                f"DELETE FROM {EVALUATIONS_TABLE} "
+                f"WHERE created_at < NOW() - INTERVAL '{EVALUATION_RETENTION_DAYS} days'",
+            ),
+            (
+                DOCUMENTS_TABLE,
+                f"DELETE FROM {DOCUMENTS_TABLE} "
+                f"WHERE created_at < NOW() - INTERVAL '{DOCUMENT_RETENTION_DAYS} days'",
+            ),
+            (
+                GRADE_AUDITS_TABLE,
+                f"DELETE FROM {GRADE_AUDITS_TABLE} "
+                f"WHERE created_at < NOW() - INTERVAL '{GRADE_AUDIT_RETENTION_DAYS} days'",
+            ),
+            (
+                ENRICHMENTS_TABLE,
+                f"DELETE FROM {ENRICHMENTS_TABLE} "
+                f"WHERE fetched_at < NOW() - INTERVAL '{ENRICHMENT_RETENTION_DAYS} days'",
+            ),
+        )
+        for table, statement in statements:
+            try:
+                with self._cursor() as cur:
+                    cur.execute(statement)
+                    removed[table] = int(cur.rowcount or 0)
+            except Exception as exc:
+                logger.info("Copilot prune failed for %s: %s", table, type(exc).__name__)
+                removed[table] = -1
+        return removed
+
+
+def _decode_list(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(item) for item in raw]
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]

@@ -76,7 +76,14 @@ jobs:
              test_secure_http_logging \
              test_serverless_health \
              test_vercel_router \
-             test_vercel_webhook_surfaces
+             test_vercel_webhook_surfaces \
+             test_copilot_fit \
+             test_copilot_grade_audit \
+             test_copilot_hr_link \
+             test_copilot_enrich \
+             test_copilot_store \
+             test_copilot_credits \
+             test_copilot_runtime
 
 
 

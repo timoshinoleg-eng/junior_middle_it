@@ -16,6 +16,10 @@ psycopg[binary]>=3.2,<4
 pypdf>=5.0,<7
 python-docx>=1.1,<2
 
+# P9 Copilot: readable text extraction for optional vacancy enrichment.
+# The module degrades to a stdlib extractor when the library is unavailable.
+trafilatura>=1.12,<3
+
 # Telegram channel parsing (optional)
 telethon>=1.28.5
 PySocks>=1.7.1

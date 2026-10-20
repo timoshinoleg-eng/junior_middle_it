@@ -6,6 +6,7 @@ callback buttons that would imply per-user state changes on a shared post.
 """
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timezone
 from html import unescape as html_unescape
@@ -64,6 +65,21 @@ def build_resume_match_url(job: dict, bot_username: str = "") -> str:
     if not username or not job_id:
         return ""
     return f"https://t.me/{username}?start=resume_{job_id}"
+
+
+def copilot_enabled() -> bool:
+    """The vacancy analysis surface is opt-in and off by default."""
+    raw = str(os.getenv("COPILOT_ENABLED") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def build_copilot_url(job: dict, bot_username: str = "") -> str:
+    """Open the deterministic vacancy analysis in the user's private bot chat."""
+    username = str(bot_username or "").strip().lstrip("@")
+    job_id = str(job.get("hash") or job.get("content_hash") or "")[:40]
+    if not username or not job_id:
+        return ""
+    return f"https://t.me/{username}?start=copilot_{job_id}"
 
 
 def build_bot_home_url(bot_username: str = "") -> str:
@@ -246,6 +262,9 @@ class JobMessageFormatter(_BaseJobMessageFormatter):
         resume_url = build_resume_match_url(job, bot_username=bot_username) if job_id else ""
         if resume_url:
             primary.append({"text": "📄 Проверить резюме", "url": resume_url})
+        copilot_url = build_copilot_url(job, bot_username=bot_username) if job_id else ""
+        if copilot_url and copilot_enabled():
+            primary.append({"text": "✨ Разбор вакансии", "url": copilot_url})
         if primary:
             rows.append(primary)
 
