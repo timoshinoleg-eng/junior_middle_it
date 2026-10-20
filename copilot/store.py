@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -612,6 +612,27 @@ class CopilotStore:
             row = cur.fetchone()
         hits = int(row[0] or 0) if row else 0
         return hits <= int(limit), hits
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+    def count_events_by_name(self, names: Iterable[str], *, days: int = 30) -> Dict[str, int]:
+        """Count the growth events of the given names over one window."""
+        wanted = [str(name) for name in (names or []) if str(name).strip()]
+        if not wanted:
+            return {}
+        window = max(1, min(int(days), 90))
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT name, COUNT(*) FROM growth_events
+                WHERE name = ANY(%s) AND ts >= NOW() - (%s * INTERVAL '1 day')
+                GROUP BY name
+                """,
+                (wanted, window),
+            )
+            rows = cur.fetchall()
+        return {str(row[0]): int(row[1] or 0) for row in rows or []}
 
     # ------------------------------------------------------------------
     # Credits

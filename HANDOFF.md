@@ -1,111 +1,120 @@
-# Handoff — junior_middle_it (post v6.6 merge)
+# Handoff — junior_middle_it (v7.0, AI Career Copilot)
 
-**Date:** 2026-07-18  
-**Repo:** https://github.com/timoshinoleg-eng/junior_middle_it  
-**Main tip:** `d68c900` — Merge PR #6 (stack v6.1–v6.6 + review fix)  
-**Local:** branch `main` fast-forwarded to `origin/main`
+**Date:** 2026-10-20
+**Repo:** https://github.com/timoshinoleg-eng/junior_middle_it
+**Base:** `main` (P7/P8: Supabase Postgres + Edge-мост, webhook-рантайм)
 
 ## Status
 
 | Item | State |
-|------|--------|
-| PR #1–#6 | **MERGED** into `main` |
-| Open PRs | none (growth stack closed) |
-| Unit tests | 30 OK (`test_growth_utils` + `test_job_sources_extra`) |
-| Live sources | 4dayweek / Muse / RemoteOK multi-cat / Working Nomads / RSS OK (set `LIVE_SOURCE_TESTS=1`) |
+|---|---|
+| Copilot, этап A (детерминированное ядро) | PR #53, ветка `feat/copilot-core`, CI зелёный |
+| Copilot, этап B (PDF-резюме) | PR #54, ветка `feat/copilot-cv`, CI зелёный |
+| Copilot, этап C (LLM по кнопке) | PR #55, ветка `feat/copilot-llm`, CI зелёный |
+| Copilot, этап D (forward, трекер, радар) | PR #56, ветка `feat/copilot-d`, CI зелёный |
+| Copilot, этап E (Mini App) | PR #57, ветка `feat/copilot-webapp`, CI зелёный |
+| Copilot, этап F (документация, метрики) | PR #58, ветка `feat/copilot-docs`, CI зелёный |
+| Мержи | **делает владелец**, порядок A → B → C → D → E → F |
+| Миграции P9–P12 | лежат в `supabase/migrations/`, **не применены** — нужен доступ к Supabase |
+| Edge-функция `growth-proxy` | правка валидатора в PR #57, **не задеплоена** |
 
-## What shipped (v6.1 → v6.6)
+Стек веток: `feat/copilot-docs` → `feat/copilot-webapp` → `feat/copilot-d` →
+`feat/copilot-llm` → `feat/copilot-cv` → `feat/copilot-core` → `main`.
+После мержа #53 остальные PR нужно один раз перенацелить на `main`.
 
-1. **v6.1** — fuzzy dedup (RapidFuzz), referrals, FloodWait, diversify, salary min gate, digests  
-2. **v6.2** — `/setup` `/profile` `/digest`, personal DM, CHANNEL_TRACKS, invite CTA  
-3. **v6.3** — `/stats_growth`, salary magnet, premium refs, realtime alerts, dedup retention  
-4. **v6.4** — multi-track `CHANNEL_ROUTES` (Variant A), `/tracks`  
-5. **v6.5** — free sources: 4dayweek, The Muse, RemoteOK multi-cat, Working Nomads, WWR+Himalayas RSS; ATS expand; `/sources` health  
-6. **v6.6** — `compute_publish_score`, title/company normalize, `SOURCE_FAIL_SKIP` with **cooldown+probe** (not permanent)
+## Что появилось в v7.0
 
-**Review fix (on main):** auto-skip no longer permanent; Windows signal handlers try/except; `datetime` UTC aware.
+1. **Детерминированное ядро Copilot** (`copilot/`): персональный fit-score,
+   аудит реального грейда, извлечение HR-контакта, обогащение текста вакансии,
+   кредиты и хранилище в Postgres.
+2. **PDF-резюме под вакансию** (`fpdf2` + ATS-проверка), кэш `file_id`,
+   повторный запрос не списывает кредит.
+3. **Опциональный LLM-слой** — только по явной кнопке, с prompt-injection
+   guard, бюджетом и гарантированной деградацией к детерминированному отчёту.
+4. **Forward-to-Analyze** — пересланная вакансия разбирается тем же ядром,
+   дедуп по хэшу текста.
+5. **Трекер откликов** — отметка «отклик отправлен», напоминание через 7 дней
+   внутри существующей ежедневной доставки, исход «интервью/тишина/отказ».
+6. **`/upskill`-радар** — сколько вакансий закрывает стек и чего не хватает.
+7. **Telegram Mini App** (`/copilot`) — статика + API с проверкой подписи
+   `initData` и rate-limit по пользователю.
+8. **Метрики Copilot** в `/stats_growth` (админ).
 
-## Key files
+## Что нужно сделать владельцу (в этом порядке)
 
-```
-channel_bot.py          # pipeline, bot cmds, safe_fetch, diversify
-growth_utils.py         # fuzzy, salary, multi-track, scores, normalize
-job_sources_extra.py    # free APIs/RSS + SourceHealthRegistry
-message_formatter.py
-telegram_job_parser.py
-test_growth_utils.py
-test_job_sources_extra.py
-CHANGELOG_v6.1.md … v6.6.md
-.env.example.txt
-README.md               # updated for v6.6
-```
+1. **Смержить PR** #53 → #54 → #55 → #56 → #57 → #58 (или перенацелить стек
+   на `main` и смержить по очереди). CI обязан быть зелёным.
+2. **Применить миграции** в Supabase:
+   - `20261020120000_p9_copilot_tables.sql`
+   - `20261020130000_p10_copilot_ai_reports.sql`
+   - `20261020140000_p11_copilot_forward_and_applications.sql`
+   - `20261020150000_p12_copilot_rate_limits.sql`
+3. **Задеплоить Edge-функцию** `growth-proxy` с правкой валидатора из PR #57
+   (иначе upsert-ы `copilot/store.py` отклоняются ключевым прокси).
+4. **Задать флаги** в проде (все новые — выключены по умолчанию):
+   ```env
+   COPILOT_ENABLED=true
+   COPILOT_PDF_ENABLED=true
+   COPILOT_FORWARD_ENABLED=true
+   COPILOT_OUTCOME_ENABLED=true
+   COPILOT_UPSKILL_ENABLED=true
+   COPILOT_LLM_ENABLED=false        # включать только с ключом провайдера
+   COPILOT_LLM_API_KEY=             # только в секретах
+   COPILOT_LLM_BASE_URL=https://api.openai.com/v1
+   COPILOT_WEBAPP_ENABLED=false     # после регистрации URL у бота
+   COPILOT_WEBAPP_URL=https://junior-middle-it.vercel.app/copilot
+   ```
+5. **Зарегистрировать Mini App** у `junior_jobs_channel_bot` (BotFather →
+   Mini App → URL `https://junior-middle-it.vercel.app/copilot`), затем включить
+   `COPILOT_WEBAPP_ENABLED`.
+6. **Проверить прод** после каждого шага: `/api/health`, `/status`,
+   `/stats_growth`, разбор вакансии в личке.
 
-## Deploy env (minimum + growth)
+## Статус интерактивного рантайма
 
-```env
-TELEGRAM_BOT_TOKEN=
-CHANNEL_ID=
-BOT_USERNAME=
+| Часть | Где работает | Статус |
+|---|---|---|
+| Сбор вакансий и публикация | Vercel `/api/cron` + `vercel-cron.yml` | работает |
+| Доставка (канал + персональные дайджесты) | Vercel `/api/delivery` + `delivery-cron.yml` | работает |
+| Интерактивный бот (webhook) | Vercel `/api/webhook` | работает |
+| Интерактивный бот (long polling) | Render | **выключен**: нет `TELEGRAM_BOT_TOKEN`, fail-closed |
+| Mini App API | Vercel `/api/copilot` | ждёт применения миграций и регистрации URL |
 
-# v6.4 multi-track (vars not sent yet by owner — optional)
-ENABLE_MULTI_TRACK=false
-# CHANNEL_ROUTES=development,qa,devops:@dev;data:@data;design,pm:@design;*:@main
-# MULTI_TRACK_MIRROR_MAIN=false
-
-# v6.5 sources
-ENABLE_EXTRA_SOURCES=true
-ENABLE_RSS_SOURCES=true
-
-# v6.6 quality
-SOURCE_FAIL_SKIP=3
-ENABLE_SOURCE_DIVERSIFY=true
-# 0 = публиковать все вакансии, прошедшие quality gate; включать только при инциденте
-EMERGENCY_MAX_POSTS_PER_CYCLE=0
-```
-
-Admin after crawl: `/sources`, `/status`, `/stats_growth`, `/tracks`.
-
-## Known constraints / follow-ups
-
-1. **CHANNEL_ROUTES** — owner will send specialty channel IDs later; leave multi-track off until then.  
-2. **Keyed APIs** (Reed/Jooble/FindWork/SuperJob/Adzuna) — only if keys appear in env; not required.  
-3. **Source health is in-memory** — resets on process restart (serverless cold start clears streaks).  
-4. **Overlap** RemoteOK full + multi-cat / Himalayas API + RSS — OK, hash/fuzzy dedup.  
-5. **PTB LGPLv3** — noted earlier; keep awareness for commercial redistribute.  
-6. **ROI next** — deploy prod + white traffic + metrics > more sources.
-
-## Next session ideas (not started)
-
-- Wire `CHANNEL_ROUTES` when channel vars arrive  
-- Persist source health to SQLite (survive cold start)  
-- Mini App / resume match (mentioned in v6.1 changelog backlog)  
-- Vercel deploy verify after merge (preview was green on #1)  
-- Optional: prune dead ATS board slugs after first week of `/sources` data
-
-## Commands for new session
+## Порядок запуска (для новой сессии)
 
 ```bash
 git clone https://github.com/timoshinoleg-eng/junior_middle_it.git
 cd junior_middle_it
 git checkout main && git pull
-python -m unittest test_job_sources_extra test_growth_utils -v
-# live optional:
-# LIVE_SOURCE_TESTS=1 python -m unittest test_job_sources_extra.LiveSourceTests -v
+python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+python -m compileall -q .
+python -m unittest -v test_copilot_runtime test_copilot_webapp_api test_copilot_llm
 ```
 
-## Review summary (this session)
+## Известные ограничения и техдолг
 
-| Severity | Finding | Action |
-|----------|---------|--------|
-| **High** | Auto-skip permanent after 3 fails (no probe) | **Fixed** — N-cycle cooldown then probe |
-| Medium | `add_signal_handler` crashes Windows loop | **Fixed** — try/except |
-| Low | `datetime.utcnow` deprecated | **Fixed** → timezone.utc |
-| Info | Dual RemoteOK/Himalayas paths | Accept — dedup |
-| Info | RSS XML dirty namespaces | Mitigated via strip prefixes |
-| Info | PRs #1–#5 stacked under #6 | Merged via #6 tip |
+1. **Миграции не применены** — до применения P9–P12 код Copilot не должен
+   включаться в проде.
+2. **LLM без ключа** — этап C написан и покрыт тестами, но без
+   `COPILOT_LLM_API_KEY` кнопка AI не показывается.
+3. **Mini App без регистрации** — `web_app`-кнопка скрыта, пока не задан
+   `COPILOT_WEBAPP_URL` и не включён флаг.
+4. **Rate-limit Mini App** — счётчик в Postgres, окно 10 минут; при недоступной
+   БД запрос не блокируется (fail-open), кредиты и подпись всё равно защищают.
+5. **Edge-мост как бутылочное горлышко** — `growth-proxy` и
+   `interactive-growth-proxy` валидируют SQL; новые relations должны
+   начинаться с `growth_`.
+6. **Bейдж аудита грейда в постах канала не выводится** — решение владельца:
+   репутационный риск, бейдж остаётся только внутри бота.
+7. **Техдолг (вне плана)**: модули `localized_product_runtime_v2..v8` не
+   мигрированы; source health частично in-memory.
 
 ## Do not
 
-- Black-hat growth / private channel scrape  
-- Merge without re-pull if new work started off stale main  
-- Enable multi-track without real specialty channel IDs  
+- не применять миграции в проде до мержа PR #53–#58;
+- не включать `COPILOT_LLM_ENABLED` без ключа и без суточного бюджета;
+- не публиковать в канал из чего-либо, кроме Vercel production;
+- не хранить резюме: текст и байты остаются в памяти запроса;
+- не добавлять новый планировщик — для follow-up используется `delivery-cron.yml`;
+- не расширять приватный SQL-контракт Edge-моста без теста на allowlist.

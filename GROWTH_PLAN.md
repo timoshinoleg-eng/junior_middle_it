@@ -1,6 +1,6 @@
 # Growth plan — junior_middle_it
 
-Updated: 2026-09-09
+Updated: 2026-10-20 (v7.0 — AI Career Copilot)
 
 ## Product diagnosis
 
@@ -37,14 +37,18 @@ Track unique users, not raw event counts:
 - [x] Add `start=share_<job_hash>` attribution to shared vacancy copy.
 - [x] Add regression tests around share URLs and formatter compatibility.
 - [x] Add GitHub Actions CI for Python 3.12/3.13 and the existing policy suite.
-- [ ] Replace the misleading referral reward. Current copy promises Senior jobs,
+- [x] Replace the misleading referral reward. Current copy promises Senior jobs,
   while the publication pipeline intentionally excludes senior vacancies.
   Reward with real value instead: earlier alerts, larger digests, saved searches
-  and extra resume checks.
-- [ ] Make the first `/start` screen action-oriented: 2-3 buttons, not a command
-  manual. Primary CTA: "Подобрать вакансии за 30 сек".
+  and extra resume checks. — **выполнено**: копи реферала честная
+  («персональные подборки, алерты и Resume Match»), награда — кредиты Copilot
+  (`COPILOT_REFERRAL_BONUS`).
+- [x] Make the first `/start` screen action-oriented: 2-3 buttons, not a command
+  manual. Primary CTA: "Подобрать вакансии за 30 сек". — **выполнено**:
+  `durable_product_state.cmd_start` показывает хаб с кнопками действий.
 - [ ] After onboarding, immediately send the first matched set instead of asking
-  the user to type `/digest now`.
+  the user to type `/digest now`. — **частично**: хаб предлагает кнопку
+  персональной подборки, автоматическая отправка первой подборки не сделана.
 
 ## P1 — durable user state and measurable retention
 
@@ -105,6 +109,36 @@ Saved-search examples:
 - Data/AI entry-level, no strict country restriction
 
 Each saved search becomes an explicit retention subscription.
+
+## P2.5 — Copilot (v7.0, реализовано)
+
+v7.0 закрывает замкнутый контур «пользователь увидел вакансию → получил
+персональную оценку → совершил действие», не переписывая редакционный
+пайплайн.
+
+Поверхности и их метрики (события в `growth_events`, агрегаты — в
+`/stats_growth` для админа):
+
+| Шаг воронки | Событие | Метрика |
+|---|---|---|
+| Персональный разбор вакансии | `copilot_fit_viewed`, `copilot_forward_analyzed`, `copilot_webapp_fit_viewed` | разборы |
+| Оценка полезна | `copilot_search_saved` | конверсия «разбор → сохранённый поиск» |
+| Действие по вакансии | `copilot_hr_link_clicked` | переходы к HR |
+| Готовое CV | `copilot_cv_built`, `copilot_cv_cached` | выдачи CV и доля выдач из кэша |
+| Возврат к продукту | `copilot_upskill_viewed`, `copilot_application_marked`, `copilot_application_answered` | удержание в Copilot |
+| Качество AI-слоя | `copilot_ai_viewed`, `copilot_ai_failed` | доля откатов на детерминированный отчёт |
+
+Правила, которые нельзя нарушать иначе:
+
+- детерминированное ядро остаётся основным: fit-score, аудит грейда и
+  upskill-радар считаются офлайн и воспроизводимо;
+- LLM — только по явной кнопке, с бюджетом, кредитами и гарантированной
+  деградацией;
+- резюме не персистится и по умолчанию не уходит в модель;
+- новые функции выключаются флагами, а не удалением кода.
+
+Детали контрактов: `docs/COPIOT.md`, правила недоверенного ввода:
+`SECURITY.md`.
 
 ## P3 — content loops for channel growth
 
@@ -178,14 +212,24 @@ Useful OSS building blocks:
 
 ## Release order
 
-1. P0 share fix + CI.
-2. Persistence migration design and implementation.
-3. Funnel metrics with unique users and retention.
-4. Honest referral reward + activation-first onboarding.
-5. Resume matcher MVP.
-6. Saved searches / semantic matching.
-7. Content magnets with campaign attribution.
-8. Only then A/B tooling and incremental source expansion.
+Shipped so far:
+
+1. [x] P0 share fix + CI.
+2. [x] Persistence migration: PostgreSQL in Supabase, Edge-мост `growth-proxy`,
+   fail-closed durable state.
+3. [x] Funnel metrics with unique users and retention (`/stats_growth`).
+4. [x] Honest referral reward + activation-first onboarding.
+5. [x] Resume matcher MVP (Resume Match, детерминированный, без LLM).
+6. [x] Saved searches (Postgres `growth_saved_searches`).
+7. [x] Content magnets with campaign attribution (`magnet_*`, `share_*`).
+8. [x] v7.0 Copilot: разбор вакансии, CV под вакансию, LLM по кнопке,
+   forward-to-analyze, трекер откликов, upskill-радар, Mini App.
+
+Next:
+
+9. Применение миграций P9–P12 и включение флагов Copilot в проде.
+10. A/B tooling (GrowthBook) — только после базовой линии метрик Copilot.
+11. Incremental source expansion — только там, где метрики покажут пробел.
 
 ## Explicit non-goals
 
@@ -193,6 +237,10 @@ Useful OSS building blocks:
 - no mass unsolicited DMs;
 - no fake referral rewards;
 - no adding sources purely to increase a README counter;
-- no LLM/GPU dependency for the first resume-match MVP;
+- no LLM/GPU dependency for the first resume-match MVP — правило сохранено:
+  ядро Copilot детерминированное, LLM подключается отдельным флагом
+  (`COPILOT_LLM_ENABLED`) и только по явному действию пользователя;
 - no major rewrite of the existing editorial pipeline while growth metrics are
-  still unreliable.
+  still unreliable;
+- no auto-applying to ATS, no captcha solving, no scraping private channels;
+- no storing resume content in the database.

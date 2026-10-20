@@ -30,6 +30,7 @@ from copilot import forward as copilot_forward
 from copilot import grade_audit as copilot_grade
 from copilot import hr_link as copilot_hr
 from copilot import llm as copilot_llm
+from copilot import metrics as copilot_metrics
 from copilot import outcome as copilot_outcome
 from copilot import pdf as copilot_pdf
 from copilot import upskill as copilot_upskill
@@ -47,6 +48,7 @@ MAX_ENRICHMENT_CHARS = 3000
 CV_FILENAME = "cv.pdf"
 
 _original_cmd_start = durable.JobBot.cmd_start
+_original_cmd_stats_growth = durable.JobBot.cmd_stats_growth
 _original_handle_callback = durable.JobBot.handle_callback
 _original_handle_setup_text = durable.JobBot.handle_setup_text
 _localized_build_runtime = localized.build_runtime
@@ -1103,9 +1105,39 @@ def _copilot_build_runtime():
     return application, db, job_bot
 
 
+async def _copilot_cmd_stats_growth(self, update, context):
+    """The admin statistics also show the counters of the Copilot surfaces."""
+    await _original_cmd_stats_growth(self, update, context)
+    user_id = update.effective_user.id if update.effective_user else None
+    is_admin = bool(core.Config.ADMIN_USER_ID and user_id == core.Config.ADMIN_USER_ID)
+    if not is_admin:
+        return
+    days = int(getattr(core.Config, "GROWTH_STATS_DAYS", 30) or 30)
+    if context.args:
+        try:
+            days = max(1, min(int(context.args[0]), 90))
+        except ValueError:
+            pass
+    store = CopilotStore.from_database(self.db)
+    if store is None:
+        return
+    try:
+        counts = store.count_events_by_name(copilot_metrics.all_event_names(), days=days)
+    except Exception as exc:
+        logger.info("Copilot metrics read failed: %s", type(exc).__name__)
+        return
+    metrics = copilot_metrics.build_metrics(counts)
+    if not metrics.fit_viewed and not metrics.ai_viewed:
+        return
+    await update.message.reply_text(
+        copilot_metrics.format_metrics(metrics, days=days)
+    )
+
+
 durable.JobBot.cmd_start = _copilot_cmd_start
 durable.JobBot.cmd_copilot = _cmd_copilot
 durable.JobBot.cmd_upskill = _cmd_upskill
+durable.JobBot.cmd_stats_growth = _copilot_cmd_stats_growth
 durable.JobBot.handle_callback = _copilot_handle_callback
 durable.JobBot.handle_setup_text = _copilot_handle_setup_text
 base.build_runtime = _copilot_build_runtime
