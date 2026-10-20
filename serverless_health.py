@@ -68,14 +68,28 @@ _PROBE_TIMEOUT = 8.0
 
 
 def _interactive_bridge_url() -> str:
-    """The interactive Edge bridge of this deployment, if it is configured."""
-    endpoint = (os.getenv("GROWTH_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
-    mode = (os.getenv("GROWTH_HTTP_AUTH_MODE") or "").strip().lower()
-    if mode != "telegram" or not endpoint.startswith("https://"):
+    """The interactive Edge bridge of this deployment, if it is configured.
+
+    The runtime derives the interactive URL from the public growth URL, so the
+    probe uses the same source. A DSN that already points at the interactive
+    bridge is accepted as well.
+    """
+    endpoint = (os.getenv("GROWTH_DATABASE_URL") or "").strip().rstrip("/")
+    if endpoint.startswith("https://") and endpoint.endswith("/functions/v1/interactive-growth-proxy"):
+        return endpoint
+    base = (os.getenv("GROWTH_PUBLIC_URL") or "").strip().rstrip("/")
+    try:
+        parsed = urlsplit(base)
+    except ValueError:
         return ""
-    if "supabase.co/functions/v1/interactive-growth-proxy" not in endpoint:
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host.endswith(".supabase.co"):
         return ""
-    return endpoint
+    if parsed.path.rstrip("/") != "/functions/v1/growth-proxy":
+        return ""
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, "/functions/v1/interactive-growth-proxy", "", "")
+    )
 
 
 def copilot_tables_present() -> Optional[bool]:
