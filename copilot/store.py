@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import contextmanager
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -735,6 +735,213 @@ class CopilotStore:
             cur.execute(statement, (str(reason),))
             row = cur.fetchone()
         return int(row[0]) if row and row[0] is not None else 0
+
+    # ------------------------------------------------------------------
+    # Costed operations
+    # ------------------------------------------------------------------
+    # The balance and the journal are always written by one statement, so they
+    # can never drift apart. A single statement is also the only shape the Edge
+    # growth bridge accepts: it forwards exactly one query per request, so a
+    # multi statement transaction is not available over the bridge.
+    def reserve_credit(
+        self,
+        user_id: int,
+        amount: int,
+        reason: str,
+        ref: str,
+        *,
+        release_reason: str = "spend_release",
+    ) -> bool:
+        """Debit the balance and log the reservation in one statement.
+
+        ``False`` means the balance was too low or the operation is already
+        paid for. The debit only happens when no reservation of this operation
+        is unmatched, so a repeated request cannot charge the user twice, and
+        a request after a refund is charged again as a new attempt.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                WITH debit AS (
+                    UPDATE growth_copilot_credits
+                    SET balance = balance - %s, updated_at = NOW()
+                    WHERE user_id = %s
+                      AND balance >= %s
+                      AND (
+                          (SELECT COUNT(*) FROM growth_copilot_credit_events
+                            WHERE user_id = %s AND ref = %s AND reason = %s)
+                          <=
+                          (SELECT COUNT(*) FROM growth_copilot_credit_events
+                            WHERE user_id = %s AND ref = %s AND reason = %s)
+                      )
+                    RETURNING balance
+                )
+                INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                SELECT %s, %s, %s, %s, NOW() FROM debit
+                RETURNING id
+                """,
+                (
+                    int(amount),
+                    int(user_id),
+                    int(amount),
+                    int(user_id),
+                    str(ref or ""),
+                    str(reason or ""),
+                    int(user_id),
+                    str(ref or ""),
+                    str(release_reason or ""),
+                    int(user_id),
+                    -int(amount),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def release_credit(
+        self,
+        user_id: int,
+        amount: int,
+        reason: str,
+        ref: str,
+        *,
+        reserved_reason: str,
+    ) -> bool:
+        """Give a reserved credit back and log the release in one statement.
+
+        The credit is only returned when a reservation of this operation is
+        unmatched, so a repeated release cannot credit the user twice.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                WITH refund AS (
+                    UPDATE growth_copilot_credits
+                    SET balance = balance + %s, updated_at = NOW()
+                    WHERE user_id = %s
+                      AND (
+                          (SELECT COUNT(*) FROM growth_copilot_credit_events
+                            WHERE user_id = %s AND ref = %s AND reason = %s)
+                          >
+                          (SELECT COUNT(*) FROM growth_copilot_credit_events
+                            WHERE user_id = %s AND ref = %s AND reason = %s)
+                      )
+                    RETURNING balance
+                )
+                INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                SELECT %s, %s, %s, %s, NOW() FROM refund
+                RETURNING id
+                """,
+                (
+                    int(amount),
+                    int(user_id),
+                    int(user_id),
+                    str(ref or ""),
+                    str(reserved_reason or ""),
+                    int(user_id),
+                    str(ref or ""),
+                    str(reason or ""),
+                    int(user_id),
+                    int(amount),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def grant_daily_allowance_with_event(
+        self, user_id: int, amount: int, reason: str, ref: str
+    ) -> bool:
+        """Grant the daily allowance and log it in one statement.
+
+        The grant itself stays idempotent per calendar day, and the journal
+        entry appears exactly when the balance changed.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                WITH granted AS (
+                    UPDATE growth_copilot_credits
+                    SET balance = balance + %s,
+                        free_granted_on = CURRENT_DATE,
+                        updated_at = NOW()
+                    WHERE user_id = %s
+                      AND free_granted_on IS DISTINCT FROM CURRENT_DATE
+                    RETURNING balance
+                )
+                INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                SELECT %s, %s, %s, %s, NOW() FROM granted
+                RETURNING id
+                """,
+                (
+                    int(amount),
+                    int(user_id),
+                    int(user_id),
+                    int(amount),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def credit_event_counts(
+        self, user_id: int, reasons: Sequence[str], ref: str
+    ) -> Dict[str, int]:
+        """Count the journal entries of one operation reference."""
+        wanted = [str(item) for item in reasons if str(item)]
+        if not wanted:
+            return {}
+        placeholders = ", ".join(["%s"] * len(wanted))
+        statement = (
+            "SELECT reason, COUNT(*) FROM growth_copilot_credit_events "
+            "WHERE user_id = %s AND ref = %s AND reason IN ("
+            + placeholders
+            + ") GROUP BY reason"
+        )
+        with self._cursor() as cur:
+            cur.execute(statement, (int(user_id), str(ref or ""), *wanted))
+            rows = cur.fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def claim_document(
+        self, user_id: int, job_id: str, filename: str, *, stale_after_minutes: int = 15
+    ) -> bool:
+        """Claim the document slot of one (user, job) pair.
+
+        The slot is the unique key of the document cache, so a second request
+        for the same vacancy cannot start a parallel build. A claim without a
+        file id that is older than ``stale_after_minutes`` is taken over, so a
+        build that died does not block the user forever.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_documents
+                    (user_id, job_id, telegram_file_id, filename, fit_score, created_at)
+                VALUES (%s, %s, '', %s, 0, NOW())
+                ON CONFLICT (user_id, job_id) DO UPDATE SET
+                    created_at = NOW()
+                WHERE growth_copilot_documents.telegram_file_id = ''
+                  AND growth_copilot_documents.created_at
+                      < NOW() - (%s * INTERVAL '1 minute')
+                RETURNING job_id
+                """,
+                (int(user_id), str(job_id), str(filename or ""), int(stale_after_minutes)),
+            )
+            return bool(cur.fetchone())
+
+    def release_document_claim(self, user_id: int, job_id: str) -> bool:
+        """Release a claim that produced no document."""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM growth_copilot_documents
+                WHERE user_id = %s AND job_id = %s AND telegram_file_id = ''
+                RETURNING job_id
+                """,
+                (int(user_id), str(job_id)),
+            )
+            return bool(cur.fetchone())
 
     # ------------------------------------------------------------------
     # Retention

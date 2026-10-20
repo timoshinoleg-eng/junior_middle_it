@@ -32,7 +32,15 @@ from copilot import forward as copilot_forward
 from copilot import pdf as copilot_pdf
 from copilot import webapp as copilot_webapp
 from copilot import webapp_auth
-from copilot.credits import REASON_SPEND, CreditManager
+from copilot.credit_operations import (
+    DELIVERY_DELIVERED,
+    DELIVERY_UNKNOWN,
+    CreditStoreUnavailable,
+    InsufficientCredits,
+    cv_operation,
+    settle_delivery,
+)
+from copilot.credits import CreditManager
 from copilot.store import CopilotStore
 from interactive_webhook_runtime import build_runtime
 from resume_documents import ResumeDocumentError, extract_resume_document
@@ -270,14 +278,37 @@ class handler(BaseHTTPRequestHandler):
             resume = {}
         content = self._resume_bytes(resume)
 
+        # One build of one vacancy at a time. The slot is the primary key of
+        # the document cache, so a parallel request cannot assemble the same
+        # document twice and cannot be charged for it either.
+        try:
+            claimed = store.claim_document(user_id, job_hash, CV_FILENAME)
+        except Exception as exc:
+            logger.warning("Copilot webapp document claim failed: %s", type(exc).__name__)
+            raise copilot_webapp.WebappError(
+                503, "store_unavailable", "Не удалось начать сборку. Попробуй позже."
+            ) from exc
+        if not claimed:
+            raise copilot_webapp.WebappError(
+                409, "cv_in_progress", "Сборка CV по этой вакансии уже идёт."
+            )
+
         manager = CreditManager(store)
+        operation = cv_operation(store, user_id, job_hash)
         try:
             manager.ensure_daily_allowance(user_id)
             balance = manager.balance(user_id)
+            # An operation the user already paid for is not paid for again,
+            # so an empty balance must not block it.
+            already_paid = operation.paid
         except Exception as exc:
             logger.warning("Copilot webapp credits failed: %s", type(exc).__name__)
-            balance = 0
-        if balance < 1:
+            self._release_claim(store, user_id, job_hash)
+            raise copilot_webapp.WebappError(
+                503, "store_unavailable", "Не удалось проверить кредиты. Попробуй позже."
+            ) from exc
+        if balance < 1 and not already_paid:
+            self._release_claim(store, user_id, job_hash)
             raise copilot_webapp.WebappError(
                 402,
                 "no_credits",
@@ -291,8 +322,10 @@ class handler(BaseHTTPRequestHandler):
                 mime_type=str(resume.get("mime_type") or ""),
             )
         except ResumeDocumentError as exc:
+            self._release_claim(store, user_id, job_hash)
             raise copilot_webapp.WebappError(400, "invalid_resume", str(exc)) from exc
         except Exception as exc:
+            self._release_claim(store, user_id, job_hash)
             raise copilot_webapp.WebappError(
                 400, "invalid_resume", "Не удалось прочитать файл. Пришли PDF или DOCX."
             ) from exc
@@ -311,6 +344,7 @@ class handler(BaseHTTPRequestHandler):
             )
         except Exception as exc:
             logger.warning("Copilot webapp CV build failed: %s", type(exc).__name__)
+            self._release_claim(store, user_id, job_hash)
             raise copilot_webapp.WebappError(
                 500, "cv_failed", "Не удалось собрать CV. Попробуй позже."
             ) from exc
@@ -318,14 +352,36 @@ class handler(BaseHTTPRequestHandler):
         ats = copilot_pdf.validate_pdf_bytes(pdf_bytes, job=job)
         caption = f"🧾 CV под вакансию «{title}».\n" + ats.summary()
 
+        # The credit is taken once the document exists and only for the attempt
+        # that delivers it. A repeated request of the same vacancy keeps the
+        # state the operation already has.
         try:
-            manager.spend(user_id, 1, REASON_SPEND, "pdf")
-        except Exception as exc:
-            logger.warning("Copilot webapp credit spend failed: %s", type(exc).__name__)
+            operation.reserve()
+        except InsufficientCredits as exc:
+            self._release_claim(store, user_id, job_hash)
+            raise copilot_webapp.WebappError(
+                402,
+                "no_credits",
+                "Бесплатные сборки на сегодня закончились. Пригласи друга — получите бонус.",
+            ) from exc
+        except CreditStoreUnavailable as exc:
+            self._release_claim(store, user_id, job_hash)
+            raise copilot_webapp.WebappError(
+                503, "store_unavailable", "Не удалось списать кредит. Попробуй позже."
+            ) from exc
 
-        sent = copilot_webapp.send_document_to_chat(
-            token, user_id, CV_FILENAME, pdf_bytes, caption=caption
-        )
+        try:
+            sent = copilot_webapp.send_document_to_chat(
+                token, user_id, CV_FILENAME, pdf_bytes, caption=caption
+            )
+        except copilot_webapp.WebappError as exc:
+            # A rejected document is paid back, a lost answer keeps the credit
+            # spent: Telegram may have stored the file anyway.
+            settle_delivery(operation, exc.delivery or DELIVERY_UNKNOWN)
+            self._release_claim(store, user_id, job_hash)
+            raise
+
+        settle_delivery(operation, DELIVERY_DELIVERED)
         try:
             store.save_document(
                 user_id,
@@ -351,6 +407,13 @@ class handler(BaseHTTPRequestHandler):
             },
             "message": "CV собран и отправлен в чат бота.",
         }
+
+    def _release_claim(self, store, user_id, job_hash):
+        """Give the document slot back after a build that produced nothing."""
+        try:
+            store.release_document_claim(user_id, job_hash)
+        except Exception as exc:
+            logger.warning("Copilot webapp document claim release failed: %s", type(exc).__name__)
 
     def _resume_bytes(self, resume):
         raw = str(resume.get("content_base64") or "")

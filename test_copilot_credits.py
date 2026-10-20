@@ -28,6 +28,15 @@ class FakeStore:
         self.balances[uid] = self.get_balance(uid) + int(amount)
         return self.balances[uid]
 
+    def grant_daily_allowance_with_event(self, user_id, amount, reason, ref=""):
+        uid = int(user_id)
+        if uid in self.granted_today:
+            return False
+        self.granted_today.add(uid)
+        self.balances[uid] = self.get_balance(uid) + int(amount)
+        self.events.append((uid, int(amount), reason, ref))
+        return True
+
     def grant_credits(self, user_id, amount):
         uid = int(user_id)
         self.balances[uid] = self.get_balance(uid) + int(amount)
@@ -39,6 +48,42 @@ class FakeStore:
             return None
         self.balances[uid] = self.get_balance(uid) - int(amount)
         return self.balances[uid]
+
+    def _count(self, user_id, reason, ref):
+        return sum(
+            1
+            for uid, _delta, item_reason, item_ref in self.events
+            if int(uid) == int(user_id)
+            and str(item_reason) == str(reason)
+            and str(item_ref) == str(ref)
+        )
+
+    def reserve_credit(self, user_id, amount, reason, ref, *, release_reason="spend_release"):
+        uid = int(user_id)
+        if self._count(uid, reason, ref) > self._count(uid, release_reason, ref):
+            return False
+        if self.get_balance(uid) < int(amount):
+            return False
+        self.balances[uid] = self.get_balance(uid) - int(amount)
+        self.events.append((uid, -int(amount), reason, ref))
+        return True
+
+    def release_credit(self, user_id, amount, reason, ref, *, reserved_reason):
+        uid = int(user_id)
+        if self._count(uid, reserved_reason, ref) <= self._count(uid, reason, ref):
+            return False
+        self.balances[uid] = self.get_balance(uid) + int(amount)
+        self.events.append((uid, int(amount), reason, ref))
+        return True
+
+    def credit_event_counts(self, user_id, reasons, ref):
+        counts = {}
+        for uid, _delta, reason, item_ref in self.events:
+            if int(uid) != int(user_id) or str(item_ref) != str(ref):
+                continue
+            if reason in reasons:
+                counts[reason] = counts.get(reason, 0) + 1
+        return counts
 
     def log_credit_event(self, user_id, delta, reason, ref=""):
         self.events.append((int(user_id), int(delta), reason, ref))
@@ -72,6 +117,21 @@ class CreditManagerTests(unittest.TestCase):
 
     def test_spend_of_zero_is_a_noop(self):
         self.assertTrue(self.manager.spend(1, 0))
+
+    def test_spend_writes_the_journal_entry_with_the_debit(self):
+        self.manager.ensure_daily_allowance(1)
+        self.assertTrue(self.manager.spend(1, 1, copilot_credits.REASON_SPEND, "job-1"))
+        spends = [event for event in self.store.events if event[2] == copilot_credits.REASON_SPEND]
+        self.assertEqual(len(spends), 1)
+        self.assertEqual(spends[0][1], -1)
+        self.assertEqual(spends[0][3], "job-1")
+        self.assertEqual(self.store.get_balance(1), 2)
+
+    def test_the_same_reference_is_charged_once(self):
+        self.manager.ensure_daily_allowance(1)
+        self.assertTrue(self.manager.spend(1, 1, copilot_credits.REASON_SPEND, "job-1"))
+        self.assertFalse(self.manager.spend(1, 1, copilot_credits.REASON_SPEND, "job-1"))
+        self.assertEqual(self.store.get_balance(1), 2)
 
     def test_referral_bonus_is_granted_and_logged(self):
         with patch.dict(os.environ, {"COPILOT_REFERRAL_BONUS": "5"}, clear=False):

@@ -83,6 +83,7 @@ jobs:
              test_copilot_enrich \
              test_copilot_store \
              test_copilot_credits \
+             test_copilot_credit_operations \
              test_copilot_runtime \
              test_copilot_pdf \
              test_copilot_security \
