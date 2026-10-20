@@ -20,11 +20,13 @@ CREDITS_TABLE = "growth_copilot_credits"
 CREDIT_EVENTS_TABLE = "growth_copilot_credit_events"
 GRADE_AUDITS_TABLE = "growth_copilot_grade_audits"
 ENRICHMENTS_TABLE = "growth_copilot_enrichments"
+AI_REPORTS_TABLE = "growth_copilot_ai_reports"
 
 EVALUATION_RETENTION_DAYS = 90
 DOCUMENT_RETENTION_DAYS = 90
 GRADE_AUDIT_RETENTION_DAYS = 45
 ENRICHMENT_RETENTION_DAYS = 14
+AI_REPORT_RETENTION_DAYS = 14
 
 
 class CopilotStoreUnavailable(RuntimeError):
@@ -320,6 +322,67 @@ class CopilotStore:
         }
 
     # ------------------------------------------------------------------
+    # AI report cache
+    # ------------------------------------------------------------------
+    def save_ai_report(
+        self,
+        user_id: int,
+        job_id: str,
+        *,
+        model: str = "",
+        answer: str = "",
+        used_resume: bool = False,
+    ) -> bool:
+        """Remember an AI answer so a repeated tap does not pay twice.
+
+        The answer text is only stored when it was produced without the resume:
+        an answer that was built from a resume may echo personal data, and the
+        privacy invariant forbids keeping resume content in the database.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_ai_reports
+                    (user_id, job_id, model, answer, used_resume, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (user_id, job_id) DO UPDATE SET
+                    model = EXCLUDED.model,
+                    answer = EXCLUDED.answer,
+                    used_resume = EXCLUDED.used_resume,
+                    updated_at = NOW()
+                RETURNING job_id
+                """,
+                (
+                    int(user_id),
+                    str(job_id),
+                    str(model or ""),
+                    str(answer or ""),
+                    bool(used_resume),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def get_ai_report(self, user_id: int, job_id: str) -> Optional[Dict]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT model, answer, used_resume, created_at
+                FROM growth_copilot_ai_reports
+                WHERE user_id = %s AND job_id = %s
+                """,
+                (int(user_id), str(job_id)),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "model": str(row[0] or ""),
+            "answer": str(row[1] or ""),
+            "used_resume": bool(row[2]),
+            "created_at": row[3],
+        }
+
+    # ------------------------------------------------------------------
     # Credits
     # ------------------------------------------------------------------
     def ensure_credit_row(self, user_id: int) -> None:
@@ -447,6 +510,11 @@ class CopilotStore:
                 ENRICHMENTS_TABLE,
                 f"DELETE FROM {ENRICHMENTS_TABLE} "
                 f"WHERE fetched_at < NOW() - INTERVAL '{ENRICHMENT_RETENTION_DAYS} days'",
+            ),
+            (
+                AI_REPORTS_TABLE,
+                f"DELETE FROM {AI_REPORTS_TABLE} "
+                f"WHERE created_at < NOW() - INTERVAL '{AI_REPORT_RETENTION_DAYS} days'",
             ),
         )
         for table, statement in statements:

@@ -10,6 +10,7 @@ back to the normal behaviour when the feature is off.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import channel_bot as core
@@ -24,8 +25,9 @@ from copilot import enrich as copilot_enrich
 from copilot import fit as copilot_fit
 from copilot import grade_audit as copilot_grade
 from copilot import hr_link as copilot_hr
+from copilot import llm as copilot_llm
 from copilot import pdf as copilot_pdf
-from copilot.credits import CreditManager
+from copilot.credits import REASON_LLM_CALL, CreditManager
 from copilot.store import CopilotStore
 from resume_documents import MAX_FILE_BYTES, ResumeDocumentError, extract_resume_document
 
@@ -56,6 +58,32 @@ def enrichment_enabled() -> bool:
 def pdf_enabled() -> bool:
     """PDF export is a paid action, so it has its own switch."""
     return flag_enabled("COPILOT_PDF_ENABLED")
+
+
+def ai_enabled() -> bool:
+    """The AI layer is off unless it is switched on and a provider is set."""
+    return copilot_llm.llm_ready()
+
+
+def _ai_cache_hours() -> int:
+    """How long a cached AI answer stays reusable."""
+    from copilot import flag_int
+
+    return flag_int("COPILOT_LLM_CACHE_HOURS", 12, minimum=0, maximum=168)
+
+
+def _ai_cache_fresh(created_at) -> bool:
+    """Whether a stored AI answer may be shown again without a new call."""
+    hours = _ai_cache_hours()
+    if not hours or created_at is None:
+        return False
+    try:
+        stamp = created_at
+        if getattr(stamp, "tzinfo", None) is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - stamp < timedelta(hours=hours)
+    except Exception:
+        return False
 
 
 def _job_hash(raw: str) -> str:
@@ -124,7 +152,14 @@ def format_analysis(job: Dict, analysis: Dict) -> str:
     return "\n".join(lines)
 
 
-def analysis_keyboard(job_hash: str, analysis: Dict, *, can_enrich: bool = False, can_pdf: bool = False):
+def analysis_keyboard(
+    job_hash: str,
+    analysis: Dict,
+    *,
+    can_enrich: bool = False,
+    can_pdf: bool = False,
+    can_ai: bool = False,
+):
     """Buttons for the analysis card."""
     rows: List[List] = []
     if analysis.get("hr_handle"):
@@ -163,6 +198,15 @@ def analysis_keyboard(job_hash: str, analysis: Dict, *, can_enrich: bool = False
                 core.InlineKeyboardButton(
                     "🔍 Полное описание",
                     callback_data=f"copilot_enrich:{job_hash}",
+                )
+            ]
+        )
+    if can_ai:
+        rows.append(
+            [
+                core.InlineKeyboardButton(
+                    "🤖 Разобрать глубже (AI)",
+                    callback_data=f"copilot_ai:{job_hash}",
                 )
             ]
         )
@@ -213,6 +257,7 @@ async def _send_analysis(job_bot, update, job_hash: str) -> None:
     analysis = analyse_job(job, profile)
     can_enrich = bool(enrichment_enabled() and str(job.get("url") or "").startswith("http"))
     can_pdf = bool(pdf_enabled() and analysis["report"].matched_skills)
+    can_ai = bool(ai_enabled())
 
     await update.message.reply_text(
         format_analysis(job, analysis),
@@ -221,6 +266,7 @@ async def _send_analysis(job_bot, update, job_hash: str) -> None:
             analysis,
             can_enrich=can_enrich,
             can_pdf=can_pdf,
+            can_ai=can_ai,
         ),
         disable_web_page_preview=True,
     )
@@ -339,6 +385,127 @@ async def _handle_enrich(job_bot, update, job_hash: str) -> None:
         disable_web_page_preview=True,
     )
     job_bot.db.log_event(user_id, "copilot_enrichment_viewed", {"hash": job_hash})
+
+
+async def _handle_ai(job_bot, update, job_hash: str) -> None:
+    """Run the optional LLM analysis behind the explicit button."""
+    query = update.callback_query
+    user_id = update.effective_user.id if update.effective_user else None
+    if not user_id:
+        await query.answer("Не удалось определить пользователя.", show_alert=True)
+        return
+    if not copilot_llm.llm_enabled():
+        await query.answer("AI-разбор выключен.", show_alert=True)
+        return
+    if copilot_llm.llm_config() is None:
+        await query.answer("AI-разбор временно недоступен.", show_alert=True)
+        return
+
+    job = job_bot.db.get_job_payload(job_hash)
+    if not job:
+        await query.answer("Карточка вакансии устарела.", show_alert=True)
+        return
+
+    store = CopilotStore.from_database(job_bot.db)
+    manager = CreditManager(store) if store is not None else None
+
+    cached = None
+    if store is not None:
+        try:
+            cached = store.get_ai_report(user_id, job_hash)
+        except Exception as exc:
+            logger.info("Copilot AI cache read failed: %s", type(exc).__name__)
+            cached = None
+    if cached and cached.get("answer") and _ai_cache_fresh(cached.get("created_at")):
+        await query.answer("Показываю сохранённый разбор")
+        await query.message.reply_text(
+            str(cached["answer"]), disable_web_page_preview=True
+        )
+        job_bot.db.log_event(user_id, "copilot_ai_cached", {"hash": job_hash})
+        return
+
+    if manager is not None:
+        try:
+            manager.ensure_daily_allowance(user_id)
+            if manager.balance(user_id) < 1:
+                await query.answer(
+                    "Бесплатные AI-разборы на сегодня закончились. "
+                    "Пригласи друга — он получит бонус, а ты — +5 кредитов.",
+                    show_alert=True,
+                )
+                return
+            if not manager.llm_allowed():
+                await query.answer(
+                    "Дневной лимит AI-разборов исчерпан. Попробуй позже.",
+                    show_alert=True,
+                )
+                return
+        except Exception as exc:
+            logger.info("Copilot AI budget check failed: %s", type(exc).__name__)
+
+    settings = job_bot.db.get_user_settings(user_id)
+    profile = _profile_from_settings(settings)
+    analysis = analyse_job(job, profile)
+    report = analysis["report"]
+    deterministic = {
+        "fit_score": report.score,
+        "matched_skills": list(report.matched_skills),
+        "missing_skills": list(report.missing_skills),
+        "grade": analysis["audit"].declared_grade,
+    }
+
+    await query.answer("Разбираю вакансию…")
+    result = await _run_in_thread(
+        copilot_llm.analyze,
+        job,
+        str(profile.get("skills") or ""),
+        deterministic,
+        None,
+    )
+    if not result.ok:
+        await query.message.reply_text(
+            "AI-разбор не получился. Ниже — обычный разбор без нейросети.\n\n"
+            + format_analysis(job, analysis),
+            disable_web_page_preview=True,
+        )
+        job_bot.db.log_event(
+            user_id, "copilot_ai_failed", {"hash": job_hash, "error": result.error}
+        )
+        return
+
+    text = result.as_text()
+    if manager is not None:
+        try:
+            manager.spend(user_id, 1, REASON_LLM_CALL, job_hash)
+        except Exception as exc:
+            logger.info("Copilot AI credit spend failed: %s", type(exc).__name__)
+    if store is not None:
+        try:
+            store.save_ai_report(
+                user_id,
+                job_hash,
+                model=result.model,
+                answer="" if result.used_resume else text,
+                used_resume=result.used_resume,
+            )
+            store.save_evaluation(
+                user_id,
+                job_hash,
+                fit_score=report.score,
+                stack_match_score=report.stack_match_score,
+                keyword_overlap_pct=report.keyword_overlap_pct,
+                matched_keywords=list(report.matched_skills),
+                missing_skills=list(report.missing_skills),
+                llm_used=True,
+                model=result.model,
+            )
+        except Exception as exc:
+            logger.info("Copilot AI cache write failed: %s", type(exc).__name__)
+
+    await query.message.reply_text(text, disable_web_page_preview=True)
+    job_bot.db.log_event(
+        user_id, "copilot_ai_viewed", {"hash": job_hash, "model": result.model}
+    )
 
 
 async def _handle_pdf(job_bot, update, job_hash: str) -> None:
@@ -555,6 +722,9 @@ async def _copilot_handle_callback(self, update, context):
         return
     if action == "copilot_enrich":
         await _handle_enrich(self, update, job_hash)
+        return
+    if action == "copilot_ai":
+        await _handle_ai(self, update, job_hash)
         return
     if action == "copilot_pdf":
         await _handle_pdf(self, update, job_hash)

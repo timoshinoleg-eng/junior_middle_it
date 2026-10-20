@@ -84,7 +84,9 @@ jobs:
              test_copilot_store \
              test_copilot_credits \
              test_copilot_runtime \
-             test_copilot_pdf
+             test_copilot_pdf \
+             test_copilot_security \
+             test_copilot_llm
 
 
 
