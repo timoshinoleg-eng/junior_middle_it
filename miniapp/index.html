@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Career Copilot</title>
+  <link rel="stylesheet" href="/miniapp/style.css" />
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <h1>Career Copilot</h1>
+    <p class="subtitle">Разбор вакансий, CV под вакансию и твои поиски</p>
+  </header>
+
+  <div id="status" class="status" hidden></div>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab is-active" data-tab="fit" role="tab">Fit</button>
+    <button class="tab" data-tab="cv" role="tab">Резюме</button>
+    <button class="tab" data-tab="searches" role="tab">Поиск</button>
+  </nav>
+
+  <main>
+    <section id="tab-fit" class="panel is-active">
+      <label class="field">
+        <span>Хэш вакансии</span>
+        <input id="job-hash" type="text" inputmode="text" autocomplete="off"
+               placeholder="например, 3f1c…" />
+      </label>
+      <p class="hint">
+        Хэш приходит из ссылки бота: открой вакансию в канале и нажми
+        «Разбор вакансии» — бот пришлёт ссылку с хэшем.
+      </p>
+      <button id="fit-button" class="primary" type="button">Разобрать</button>
+      <div id="fit-result" class="card" hidden></div>
+    </section>
+
+    <section id="tab-cv" class="panel">
+      <label class="field">
+        <span>Резюме (PDF или DOCX)</span>
+        <input id="cv-file" type="file" accept="application/pdf,.pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
+      </label>
+      <p class="hint">
+        Файл разбирается в памяти и не сохраняется на сервере. Готовый CV
+        придёт в чат бота.
+      </p>
+      <button id="cv-button" class="primary" type="button">Собрать CV</button>
+      <div id="cv-result" class="card" hidden></div>
+    </section>
+
+    <section id="tab-searches" class="panel">
+      <button id="searches-button" class="primary" type="button">Показать мои поиски</button>
+      <div id="searches-result" class="card" hidden></div>
+    </section>
+  </main>
+
+  <footer class="bottom">
+    <span>Данные считаются локально по твоему профилю. Резюме не хранится.</span>
+  </footer>
+
+  <script src="/miniapp/app.js"></script>
+</body>
+</html>

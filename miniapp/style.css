@@ -1,0 +1,209 @@
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #14181f;
+  --muted: #6b7280;
+  --card: #f4f6f8;
+  --line: #e3e7ec;
+  --accent: #2f6fed;
+  --accent-fg: #ffffff;
+  --error-bg: #fdecec;
+  --error-fg: #a11a1a;
+  --ok-bg: #e9f7ee;
+  --ok-fg: #1a7a3c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101318;
+    --fg: #eef1f5;
+    --muted: #98a2b3;
+    --card: #191d24;
+    --line: #262c35;
+    --accent: #4c8dff;
+    --accent-fg: #0b0e12;
+    --error-bg: #3a1d1d;
+    --error-fg: #ffb4b4;
+    --ok-bg: #14301f;
+    --ok-fg: #8fe0ae;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 16px 16px calc(24px + env(safe-area-inset-bottom));
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+.top h1 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.subtitle {
+  margin: 4px 0 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.tab {
+  flex: 1;
+  padding: 9px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.tab.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+.panel {
+  display: none;
+}
+
+.panel.is-active {
+  display: block;
+}
+
+.field {
+  display: block;
+  margin-bottom: 10px;
+}
+
+.field span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+}
+
+input[type="text"],
+input[type="file"] {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--fg);
+  font-size: 15px;
+}
+
+.hint {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+button.primary {
+  width: 100%;
+  padding: 12px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button.primary:disabled {
+  opacity: .6;
+}
+
+.status {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 14px;
+}
+
+.status.is-error {
+  background: var(--error-bg);
+  color: var(--error-fg);
+}
+
+.status.is-ok {
+  background: var(--ok-bg);
+  color: var(--ok-fg);
+}
+
+.card {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  font-size: 14px;
+}
+
+.card h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.card dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 0 0 10px;
+}
+
+.card dt {
+  color: var(--muted);
+}
+
+.card dd {
+  margin: 0;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 10px;
+}
+
+.chip {
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.chip.is-missing {
+  border-color: var(--error-fg);
+  color: var(--error-fg);
+}
+
+.score {
+  font-size: 30px;
+  font-weight: 700;
+}
+
+.bottom {
+  margin-top: 22px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}

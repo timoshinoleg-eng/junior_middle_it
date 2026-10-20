@@ -20,6 +20,7 @@ import durable_product_state as durable
 import interactive_webhook_runtime as base
 import localized_webhook_runtime as localized
 from saved_searches import suggested_search_from_resume
+from telegram import WebAppInfo
 from telegram.ext import CommandHandler
 
 from copilot import flag_enabled
@@ -84,6 +85,23 @@ def outcome_enabled() -> bool:
 def upskill_enabled() -> bool:
     """The upskill radar reads the vacancy feed, so it has its own switch."""
     return flag_enabled("COPILOT_UPSKILL_ENABLED")
+
+
+def webapp_enabled() -> bool:
+    """The Mini App needs a registered public URL, so it has its own switch."""
+    return flag_enabled("COPILOT_WEBAPP_ENABLED")
+
+
+def webapp_url(job_hash: str = "") -> str:
+    """Public URL of the Mini App, empty while it is not registered."""
+    if not webapp_enabled():
+        return ""
+    base = str(os.getenv("COPILOT_WEBAPP_URL") or "").strip()
+    if not base or not base.startswith("https://"):
+        return ""
+    if not job_hash:
+        return base
+    return base + ("&" if "?" in base else "?") + "job=" + quote(str(job_hash), safe="")
 
 
 def followup_days() -> int:
@@ -270,6 +288,16 @@ def analysis_keyboard(
                 core.InlineKeyboardButton(
                     "✉️ Отклик отправлен",
                     callback_data=f"copilot_applied:{job_hash}",
+                )
+            ]
+        )
+    mini_app = webapp_url(job_hash)
+    if mini_app:
+        rows.append(
+            [
+                core.InlineKeyboardButton(
+                    "🖥 Открыть Mini App",
+                    web_app=WebAppInfo(url=mini_app),
                 )
             ]
         )
