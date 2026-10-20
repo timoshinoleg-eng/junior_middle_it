@@ -92,7 +92,8 @@ jobs:
              test_copilot_upskill \
              test_copilot_webapp_auth \
              test_copilot_webapp_api \
-             test_copilot_metrics
+             test_copilot_metrics \
+             test_release_verification
 
 
 

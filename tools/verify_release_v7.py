@@ -1,0 +1,512 @@
+"""Post-release verification of the v7.0 AI Career Copilot rollout.
+
+One command that checks every surface of the release:
+
+* the production health contract and the Mini App delivery;
+* the Mini App API signature gate - a forged ``initData`` must stay a 401;
+* both Edge growth bridges, including the ``IS DISTINCT FROM`` validator fix;
+* the P9-P12 Copilot tables and their privileges (needs a Supabase access token);
+* the Copilot feature flags of the Vercel production environment and whether the
+  last production deployment is newer than them (needs a Vercel token).
+
+Credentials are optional. A check that needs one is reported as skipped instead
+of failed, so the script always ends with a readable matrix and a stable exit
+code: 0 when nothing failed, 1 otherwise.
+
+The script only reads. It never writes to Telegram, never posts to the channel
+and never changes an environment.
+
+Run it locally with:
+
+    python tools/verify_release_v7.py
+    python tools/verify_release_v7.py --json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Dict, List, Optional, Tuple
+
+PROD_BASE = "https://junior-middle-it.vercel.app"
+SUPABASE_PROJECT_REF = "uucjptyqfsdzqsftgiro"
+EDGE_BASE = "https://%s.supabase.co/functions/v1" % SUPABASE_PROJECT_REF
+VERCEL_PROJECT = "junior-middle-it"
+VERCEL_SCOPE = "olegs-projects-bfc4e11a"
+
+# Tables of the migrations P9-P12, in the order of the migrations.
+EXPECTED_TABLES = (
+    "growth_copilot_ai_reports",
+    "growth_copilot_applications",
+    "growth_copilot_credit_events",
+    "growth_copilot_credits",
+    "growth_copilot_documents",
+    "growth_copilot_enrichments",
+    "growth_copilot_evaluations",
+    "growth_copilot_forwarded_jobs",
+    "growth_copilot_grade_audits",
+    "growth_copilot_profiles",
+    "growth_copilot_rate_limits",
+)
+
+# Feature flags of the production environment. The LLM layer stays off until a
+# provider key exists, and the resume never reaches a model by default.
+EXPECTED_FLAGS = {
+    "COPILOT_ENABLED": "true",
+    "COPILOT_PDF_ENABLED": "true",
+    "COPILOT_FORWARD_ENABLED": "true",
+    "COPILOT_OUTCOME_ENABLED": "true",
+    "COPILOT_UPSKILL_ENABLED": "true",
+    "COPILOT_WEBAPP_ENABLED": "true",
+    "COPILOT_WEBAPP_URL": "https://junior-middle-it.vercel.app/copilot",
+    "COPILOT_LLM_ENABLED": "false",
+    "COPILOT_LLM_SEND_RESUME": "false",
+}
+
+# The statement that the Edge validator used to reject: its FROM is a scalar
+# comparison, not a table reference.
+VALIDATOR_PROBE = (
+    "SELECT balance FROM growth_copilot_credits "
+    "WHERE user_id = 1 AND free_granted_on IS DISTINCT FROM CURRENT_DATE"
+)
+
+PASS = "pass"
+FAIL = "fail"
+SKIP = "skip"
+
+
+# --------------------------------------------------------------------------- #
+# Pure checks, kept separate from the network so they can be unit tested.
+# --------------------------------------------------------------------------- #
+def health_problems(payload: Dict[str, object]) -> List[str]:
+    """Problems of the readiness payload of the production health endpoint."""
+    problems: List[str] = []
+    if payload.get("durable_growth") is not True:
+        problems.append("durable_growth is not true")
+    if payload.get("collector_ready") is not True:
+        problems.append("collector_ready is not true")
+    missing = payload.get("missing_required")
+    if missing:
+        problems.append("missing_required: %s" % ", ".join(str(item) for item in missing))
+    return problems
+
+
+def html_problems(body: str) -> List[str]:
+    """Problems of the delivered Mini App page."""
+    problems: List[str] = []
+    if "telegram-web-app.js" not in body:
+        problems.append("Telegram Web App script is missing")
+    if "/miniapp/app.js" not in body:
+        problems.append("Mini App script is missing")
+    if "Career Copilot" not in body:
+        problems.append("Mini App title is missing")
+    return problems
+
+
+def flag_problems(flags: Dict[str, str]) -> List[str]:
+    """Problems of the Copilot flags, given the visible values."""
+    problems: List[str] = []
+    for name, expected in EXPECTED_FLAGS.items():
+        if name not in flags:
+            problems.append("%s is missing" % name)
+            continue
+        value = flags[name]
+        if value == "":
+            problems.append("%s has a hidden value" % name)
+            continue
+        if value != expected:
+            problems.append("%s is %r, expected %r" % (name, value, expected))
+    return problems
+
+
+def table_problems(table_rows: List[Dict[str, object]], grant_rows: List[Dict[str, object]]) -> List[str]:
+    """Problems of the Copilot tables and of their privileges."""
+    problems: List[str] = []
+    names = {str(row.get("table_name", "")) for row in table_rows}
+    missing = [name for name in EXPECTED_TABLES if name not in names]
+    if missing:
+        problems.append("tables missing: %s" % ", ".join(missing))
+    extra = sorted(name for name in names if name not in EXPECTED_TABLES)
+    if extra:
+        problems.append("unexpected tables: %s" % ", ".join(extra))
+    for row in table_rows:
+        if row.get("rls_enabled") is not True:
+            problems.append("%s has no RLS" % row.get("table_name"))
+    for row in grant_rows:
+        problems.append(
+            "table %s grants %s to %s"
+            % (row.get("table_name"), row.get("privilege_type"), row.get("grantee"))
+        )
+    return problems
+
+
+def deployment_problems(deployment_created: Optional[int], env_created: Dict[str, int]) -> List[str]:
+    """Problems of the deployment that has to carry the new environment."""
+    if not deployment_created:
+        return []
+    problems: List[str] = []
+    for name, created in sorted(env_created.items()):
+        if created and created > deployment_created:
+            problems.append("%s was added after the last production deployment - redeploy" % name)
+    return problems
+
+
+# --------------------------------------------------------------------------- #
+# Network helpers
+# --------------------------------------------------------------------------- #
+def http(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: Optional[Dict[str, str]] = None,
+    body: Optional[bytes] = None,
+    timeout: int = 25,
+) -> Tuple[int, str]:
+    """Perform one request and return the status code and the body."""
+    request = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(response.status), response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return int(exc.code), exc.read().decode("utf-8", "replace")
+    except Exception as exc:  # network, DNS, TLS - all mean "unreachable"
+        return 0, "%s: %s" % (type(exc).__name__, exc)
+
+
+def json_body(payload: Dict[str, object]) -> bytes:
+    return json.dumps(payload).encode("utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# Checks
+# --------------------------------------------------------------------------- #
+def check_health(results: List[Dict[str, str]]) -> None:
+    status, body = http(PROD_BASE + "/api/health")
+    if status != 200:
+        results.append({"name": "prod.health", "status": FAIL, "detail": "HTTP %s" % status})
+        return
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        results.append({"name": "prod.health", "status": FAIL, "detail": "response is not JSON"})
+        return
+    problems = health_problems(payload)
+    results.append(
+        {
+            "name": "prod.health",
+            "status": FAIL if problems else PASS,
+            "detail": "; ".join(problems) if problems else "ready",
+        }
+    )
+
+
+def check_miniapp(results: List[Dict[str, str]]) -> None:
+    status, body = http(PROD_BASE + "/copilot")
+    if status != 200:
+        results.append({"name": "prod.miniapp.page", "status": FAIL, "detail": "HTTP %s" % status})
+    else:
+        problems = html_problems(body)
+        results.append(
+            {
+                "name": "prod.miniapp.page",
+                "status": FAIL if problems else PASS,
+                "detail": "; ".join(problems) if problems else "%d bytes" % len(body),
+            }
+        )
+    status, body = http(PROD_BASE + "/miniapp/app.js")
+    if status != 200 or len(body.strip()) < 500:
+        results.append({"name": "prod.miniapp.script", "status": FAIL, "detail": "HTTP %s" % status})
+    else:
+        results.append(
+            {"name": "prod.miniapp.script", "status": PASS, "detail": "%d bytes" % len(body)}
+        )
+
+
+def check_signature_gate(results: List[Dict[str, str]]) -> None:
+    status, body = http(
+        PROD_BASE + "/api/copilot",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        body=json_body({"init_data": "forged"}),
+    )
+    if status == 401:
+        results.append({"name": "prod.api.signature_gate", "status": PASS, "detail": "401 as expected"})
+        return
+    detail = "HTTP %s" % status
+    if status == 200:
+        detail = "forged initData was accepted"
+    results.append({"name": "prod.api.signature_gate", "status": FAIL, "detail": detail})
+
+
+def check_edge_health(results: List[Dict[str, str]]) -> None:
+    status, body = http(EDGE_BASE + "/growth-proxy/health")
+    if status != 200:
+        results.append({"name": "edge.growth_bridge.health", "status": FAIL, "detail": "HTTP %s" % status})
+        return
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        results.append({"name": "edge.growth_bridge.health", "status": FAIL, "detail": "response is not JSON"})
+        return
+    problems = []
+    if payload.get("ok") is not True:
+        problems.append("ok is not true")
+    if payload.get("render_bridge") is not True:
+        problems.append("render_bridge is not true")
+    results.append(
+        {
+            "name": "edge.growth_bridge.health",
+            "status": FAIL if problems else PASS,
+            "detail": "; ".join(problems) if problems else "ok",
+        }
+    )
+
+
+def check_interactive_bridge(results: List[Dict[str, str]]) -> None:
+    status, _ = http(
+        EDGE_BASE + "/interactive-growth-proxy",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        body=json_body({"query": "SELECT 1 FROM growth_copilot_credits", "params": []}),
+    )
+    if status == 401:
+        results.append(
+            {"name": "edge.interactive_bridge.auth", "status": PASS, "detail": "401 without a token"}
+        )
+        return
+    results.append(
+        {
+            "name": "edge.interactive_bridge.auth",
+            "status": FAIL,
+            "detail": "HTTP %s without a bot token" % status,
+        }
+    )
+
+
+def check_validator_fix(results: List[Dict[str, str]]) -> None:
+    key = str(os.getenv("GROWTH_BRIDGE_KEY") or "").strip()
+    if not key:
+        results.append(
+            {
+                "name": "edge.validator.distinct_from",
+                "status": SKIP,
+                "detail": "GROWTH_BRIDGE_KEY is not set",
+            }
+        )
+        return
+    status, body = http(
+        EDGE_BASE + "/growth-proxy",
+        method="POST",
+        headers={"Content-Type": "application/json", "x-growth-key": key},
+        body=json_body({"query": VALIDATOR_PROBE, "params": []}),
+    )
+    if status == 200:
+        results.append({"name": "edge.validator.distinct_from", "status": PASS, "detail": "query accepted"})
+        return
+    detail = "HTTP %s" % status
+    if status == 400 and "rejected" in body:
+        detail = "query rejected - the validator fix is not deployed"
+    elif status == 503:
+        detail = "query failed - the Copilot tables are probably not applied yet"
+    results.append({"name": "edge.validator.distinct_from", "status": FAIL, "detail": detail})
+
+
+def check_tables(results: List[Dict[str, str]]) -> None:
+    token = str(os.getenv("SUPABASE_ACCESS_TOKEN") or "").strip()
+    if not token:
+        results.append(
+            {"name": "supabase.copilot_tables", "status": SKIP, "detail": "SUPABASE_ACCESS_TOKEN is not set"}
+        )
+        return
+    url = "https://api.supabase.com/v1/projects/%s/database/query" % SUPABASE_PROJECT_REF
+    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+    table_query = (
+        "SELECT c.relname AS table_name, c.relrowsecurity AS rls_enabled "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'public' AND c.relname LIKE 'growth_copilot_%' "
+        "ORDER BY c.relname"
+    )
+    grant_query = (
+        "SELECT table_name, grantee, privilege_type "
+        "FROM information_schema.role_table_grants "
+        "WHERE table_schema = 'public' AND table_name LIKE 'growth_copilot_%' "
+        "AND grantee IN ('anon', 'authenticated')"
+    )
+    status, body = http(url, method="POST", headers=headers, body=json_body({"query": table_query}))
+    if status != 200:
+        results.append(
+            {"name": "supabase.copilot_tables", "status": FAIL, "detail": "query failed with HTTP %s" % status}
+        )
+        return
+    try:
+        table_rows = json.loads(body)
+    except ValueError:
+        results.append({"name": "supabase.copilot_tables", "status": FAIL, "detail": "response is not JSON"})
+        return
+    status, body = http(url, method="POST", headers=headers, body=json_body({"query": grant_query}))
+    if status != 200:
+        results.append(
+            {"name": "supabase.copilot_tables", "status": FAIL, "detail": "grant query failed with HTTP %s" % status}
+        )
+        return
+    try:
+        grant_rows = json.loads(body)
+    except ValueError:
+        grant_rows = []
+    problems = table_problems(table_rows, grant_rows)
+    results.append(
+        {
+            "name": "supabase.copilot_tables",
+            "status": FAIL if problems else PASS,
+            "detail": "; ".join(problems) if problems else "%d tables, RLS on" % len(table_rows),
+        }
+    )
+
+
+def _vercel_team_id(token: str) -> str:
+    status, body = http("https://api.vercel.com/v2/teams", headers={"Authorization": "Bearer " + token})
+    if status != 200:
+        return ""
+    try:
+        teams = json.loads(body)
+    except ValueError:
+        return ""
+    if isinstance(teams, dict):
+        teams = teams.get("teams") or []
+    for team in teams:
+        if isinstance(team, dict) and str(team.get("slug", "")) == VERCEL_SCOPE:
+            return str(team.get("id", ""))
+    if len(teams) == 1 and isinstance(teams[0], dict):
+        return str(teams[0].get("id", ""))
+    return ""
+
+
+def check_vercel_flags(results: List[Dict[str, str]]) -> None:
+    token = str(os.getenv("VERCEL_TOKEN") or "").strip()
+    if not token:
+        results.append(
+            {"name": "vercel.production_flags", "status": SKIP, "detail": "VERCEL_TOKEN is not set"}
+        )
+        return
+    headers = {"Authorization": "Bearer " + token}
+    team_id = _vercel_team_id(token)
+    query = ("?teamId=" + urllib.parse.quote(team_id)) if team_id else ""
+    status, body = http(
+        "https://api.vercel.com/v9/projects/%s/env%s" % (VERCEL_PROJECT, query), headers=headers
+    )
+    if status == 404:
+        results.append(
+            {
+                "name": "vercel.production_flags",
+                "status": FAIL,
+                "detail": "project %s is not visible for this token" % VERCEL_PROJECT,
+            }
+        )
+        return
+    if status != 200:
+        results.append(
+            {"name": "vercel.production_flags", "status": FAIL, "detail": "env list failed with HTTP %s" % status}
+        )
+        return
+    try:
+        entries = json.loads(body)
+    except ValueError:
+        results.append({"name": "vercel.production_flags", "status": FAIL, "detail": "response is not JSON"})
+        return
+    if isinstance(entries, dict):
+        entries = entries.get("envs") or entries.get("env") or []
+    flags: Dict[str, str] = {}
+    env_created: Dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        targets = entry.get("target") or []
+        targets = [targets] if isinstance(targets, str) else list(targets)
+        if "production" not in targets:
+            continue
+        key = str(entry.get("key", ""))
+        if key not in EXPECTED_FLAGS:
+            continue
+        flags[key] = str(entry.get("value", "") or "")
+        created = entry.get("created") or entry.get("createdAt")
+        try:
+            env_created[key] = int(created)
+        except (TypeError, ValueError):
+            env_created[key] = 0
+
+    problems = flag_problems(flags)
+
+    deployment_created = 0
+    status, body = http(
+        "https://api.vercel.com/v6/deployments?projectId=%s&target=production&limit=5%s"
+        % (urllib.parse.quote(VERCEL_PROJECT), query),
+        headers=headers,
+    )
+    if status == 200:
+        try:
+            deployments = json.loads(body)
+        except ValueError:
+            deployments = []
+        if isinstance(deployments, dict):
+            deployments = deployments.get("deployments") or []
+        for deployment in deployments:
+            if not isinstance(deployment, dict):
+                continue
+            try:
+                created = int(deployment.get("created") or 0)
+            except (TypeError, ValueError):
+                created = 0
+            deployment_created = max(deployment_created, created)
+        problems.extend(deployment_problems(deployment_created or None, env_created))
+    results.append(
+        {
+            "name": "vercel.production_flags",
+            "status": FAIL if problems else PASS,
+            "detail": "; ".join(problems) if problems else "%d flags in production" % len(flags),
+        }
+    )
+
+
+def run_checks() -> List[Dict[str, str]]:
+    results: List[Dict[str, str]] = []
+    check_health(results)
+    check_miniapp(results)
+    check_signature_gate(results)
+    check_edge_health(results)
+    check_interactive_bridge(results)
+    check_validator_fix(results)
+    check_tables(results)
+    check_vercel_flags(results)
+    return results
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Verify the v7.0 Copilot rollout.")
+    parser.add_argument("--json", action="store_true", help="print the raw result matrix")
+    args = parser.parse_args(argv)
+
+    results = run_checks()
+    failed = [item for item in results if item["status"] == FAIL]
+    skipped = [item for item in results if item["status"] == SKIP]
+
+    if args.json:
+        print(json.dumps({"results": results, "failed": len(failed), "skipped": len(skipped)}, indent=2))
+        return 1 if failed else 0
+
+    width = max(len(item["name"]) for item in results) if results else 10
+    for item in results:
+        marker = {PASS: "OK  ", FAIL: "FAIL", SKIP: "SKIP"}[item["status"]]
+        print("%s  %-*s  %s" % (marker, width, item["name"], item["detail"]))
+    print("-" * (width + 8))
+    print("checks: %d, failed: %d, skipped: %d" % (len(results), len(failed), len(skipped)))
+    if skipped:
+        print("skipped checks need: SUPABASE_ACCESS_TOKEN, VERCEL_TOKEN or GROWTH_BRIDGE_KEY")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
