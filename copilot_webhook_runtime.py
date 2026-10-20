@@ -10,8 +10,10 @@ back to the normal behaviour when the feature is off.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+from urllib.parse import quote
 
 import channel_bot as core
 import durable_product_state as durable
@@ -23,10 +25,13 @@ from telegram.ext import CommandHandler
 from copilot import flag_enabled
 from copilot import enrich as copilot_enrich
 from copilot import fit as copilot_fit
+from copilot import forward as copilot_forward
 from copilot import grade_audit as copilot_grade
 from copilot import hr_link as copilot_hr
 from copilot import llm as copilot_llm
+from copilot import outcome as copilot_outcome
 from copilot import pdf as copilot_pdf
+from copilot import upskill as copilot_upskill
 from copilot.credits import REASON_LLM_CALL, CreditManager
 from copilot.store import CopilotStore
 from resume_documents import MAX_FILE_BYTES, ResumeDocumentError, extract_resume_document
@@ -35,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 DEEPLINK_PREFIX = "copilot_"
 CALLBACK_PREFIX = "copilot_"
+UPSKILL_PREFIX = "upskill_"
 MAX_HASH_CHARS = 40
 MAX_ENRICHMENT_CHARS = 3000
 CV_FILENAME = "cv.pdf"
@@ -63,6 +69,53 @@ def pdf_enabled() -> bool:
 def ai_enabled() -> bool:
     """The AI layer is off unless it is switched on and a provider is set."""
     return copilot_llm.llm_ready()
+
+
+def forward_enabled() -> bool:
+    """Forward-to-Analyze is a new interception, so it has its own switch."""
+    return flag_enabled("COPILOT_FORWARD_ENABLED")
+
+
+def outcome_enabled() -> bool:
+    """The application tracker writes to the database, so it has its own switch."""
+    return flag_enabled("COPILOT_OUTCOME_ENABLED")
+
+
+def upskill_enabled() -> bool:
+    """The upskill radar reads the vacancy feed, so it has its own switch."""
+    return flag_enabled("COPILOT_UPSKILL_ENABLED")
+
+
+def followup_days() -> int:
+    """How many days pass before the tracker asks about the result."""
+    from copilot import flag_int
+
+    return flag_int("COPILOT_FOLLOWUP_DAYS", 7, minimum=1, maximum=30)
+
+
+def upskill_days() -> int:
+    """Window of the vacancy feed the radar looks at."""
+    from copilot import flag_int
+
+    return flag_int("COPILOT_UPSKILL_DAYS", 30, minimum=1, maximum=45)
+
+
+def _load_job(job_bot, job_hash: str) -> Optional[Dict]:
+    """Resolve a vacancy from the channel payloads or from the forward cache."""
+    job = job_bot.db.get_job_payload(job_hash)
+    if job:
+        return job
+    store = CopilotStore.from_database(job_bot.db)
+    if store is None:
+        return None
+    try:
+        row = store.get_forwarded_job(job_hash)
+    except Exception as exc:
+        logger.info("Copilot forwarded job read failed: %s", type(exc).__name__)
+        return None
+    if not row:
+        return None
+    return copilot_forward.job_payload_from_row(row)
 
 
 def _ai_cache_hours() -> int:
@@ -159,6 +212,7 @@ def analysis_keyboard(
     can_enrich: bool = False,
     can_pdf: bool = False,
     can_ai: bool = False,
+    can_outcome: bool = False,
 ):
     """Buttons for the analysis card."""
     rows: List[List] = []
@@ -210,6 +264,15 @@ def analysis_keyboard(
                 )
             ]
         )
+    if can_outcome:
+        rows.append(
+            [
+                core.InlineKeyboardButton(
+                    "✉️ Отклик отправлен",
+                    callback_data=f"copilot_applied:{job_hash}",
+                )
+            ]
+        )
     return core.InlineKeyboardMarkup(rows)
 
 
@@ -245,7 +308,7 @@ def _persist_analysis(job_bot, user_id: int, job_hash: str, job: Dict, profile: 
 async def _send_analysis(job_bot, update, job_hash: str) -> None:
     """Build and deliver the analysis card for one vacancy."""
     user_id = update.effective_user.id if update.effective_user else None
-    job = job_bot.db.get_job_payload(job_hash)
+    job = _load_job(job_bot, job_hash)
     if not job:
         await update.message.reply_text(
             "Карточка вакансии уже устарела. Открой свежую вакансию в канале и снова нажми «Разбор вакансии»."
@@ -258,6 +321,7 @@ async def _send_analysis(job_bot, update, job_hash: str) -> None:
     can_enrich = bool(enrichment_enabled() and str(job.get("url") or "").startswith("http"))
     can_pdf = bool(pdf_enabled() and analysis["report"].matched_skills)
     can_ai = bool(ai_enabled())
+    can_outcome = bool(outcome_enabled())
 
     await update.message.reply_text(
         format_analysis(job, analysis),
@@ -267,6 +331,7 @@ async def _send_analysis(job_bot, update, job_hash: str) -> None:
             can_enrich=can_enrich,
             can_pdf=can_pdf,
             can_ai=can_ai,
+            can_outcome=can_outcome,
         ),
         disable_web_page_preview=True,
     )
@@ -300,12 +365,21 @@ async def _cmd_copilot(self, update, context):
 
 
 async def _copilot_cmd_start(self, update, context):
-    """Handle the ``/start copilot_<hash>`` deep link."""
+    """Handle the ``/start copilot_<hash>`` and ``/start upskill_<code>`` links."""
     payload = context.args[0] if context.args else None
     if payload and str(payload).startswith(DEEPLINK_PREFIX) and copilot_enabled():
         job_hash = _job_hash(str(payload)[len(DEEPLINK_PREFIX):])
         if job_hash:
             await _send_analysis(self, update, job_hash)
+            return
+    if payload and str(payload).startswith(UPSKILL_PREFIX) and copilot_enabled():
+        if upskill_enabled():
+            self.db.log_event(
+                update.effective_user.id if update.effective_user else None,
+                "upskill_campaign_opened",
+                {"campaign": "upskill"},
+            )
+            await _cmd_upskill(self, update, context)
             return
     return await _original_cmd_start(self, update, context)
 
@@ -313,7 +387,7 @@ async def _copilot_cmd_start(self, update, context):
 async def _handle_hr(job_bot, update, job_hash: str) -> None:
     query = update.callback_query
     user_id = update.effective_user.id if update.effective_user else None
-    job = job_bot.db.get_job_payload(job_hash)
+    job = _load_job(job_bot, job_hash)
     if not job:
         await query.answer("Карточка вакансии устарела.", show_alert=True)
         return
@@ -339,7 +413,7 @@ async def _handle_save(job_bot, update, job_hash: str) -> None:
     if not user_id:
         await query.answer("Не удалось определить пользователя.", show_alert=True)
         return
-    job = job_bot.db.get_job_payload(job_hash)
+    job = _load_job(job_bot, job_hash)
     if not job:
         await query.answer("Карточка вакансии устарела.", show_alert=True)
         return
@@ -362,7 +436,7 @@ async def _handle_enrich(job_bot, update, job_hash: str) -> None:
     if not enrichment_enabled():
         await query.answer("Загрузка описания выключена.", show_alert=True)
         return
-    job = job_bot.db.get_job_payload(job_hash)
+    job = _load_job(job_bot, job_hash)
     if not job:
         await query.answer("Карточка вакансии устарела.", show_alert=True)
         return
@@ -401,7 +475,7 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
         await query.answer("AI-разбор временно недоступен.", show_alert=True)
         return
 
-    job = job_bot.db.get_job_payload(job_hash)
+    job = _load_job(job_bot, job_hash)
     if not job:
         await query.answer("Карточка вакансии устарела.", show_alert=True)
         return
@@ -508,6 +582,186 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
     )
 
 
+async def _handle_applied(job_bot, update, job_hash: str) -> None:
+    """Remember that the user sent an application."""
+    query = update.callback_query
+    user_id = update.effective_user.id if update.effective_user else None
+    if not user_id:
+        await query.answer("Не удалось определить пользователя.", show_alert=True)
+        return
+    if not outcome_enabled():
+        await query.answer("Трекер откликов выключен.", show_alert=True)
+        return
+    job = _load_job(job_bot, job_hash)
+    if not job:
+        await query.answer("Карточка вакансии устарела.", show_alert=True)
+        return
+    store = CopilotStore.from_database(job_bot.db)
+    if store is None:
+        await query.answer("Трекер откликов доступен только с базой данных.", show_alert=True)
+        return
+    try:
+        store.save_application(
+            user_id,
+            job_hash,
+            company=str(job.get("company") or ""),
+            title=str(job.get("title") or ""),
+        )
+    except Exception as exc:
+        logger.info("Copilot application write failed: %s", type(exc).__name__)
+        await query.answer("Не удалось сохранить отметку.", show_alert=True)
+        return
+    await query.answer("Отметил", show_alert=True)
+    await query.message.reply_text(
+        "Отметил. Через {days} дн. спрошу, что с ответом — отметь результат, "
+        "и я перестану напоминать.".format(days=followup_days())
+    )
+    job_bot.db.log_event(user_id, "copilot_application_marked", {"hash": job_hash})
+
+
+async def _handle_outcome(job_bot, update, stage: str, job_hash: str) -> None:
+    """Close the loop: the user reports what happened to the application."""
+    query = update.callback_query
+    user_id = update.effective_user.id if update.effective_user else None
+    if not user_id:
+        await query.answer("Не удалось определить пользователя.", show_alert=True)
+        return
+    if not outcome_enabled():
+        await query.answer("Трекер откликов выключен.", show_alert=True)
+        return
+    normalized = copilot_outcome.normalize_stage(stage)
+    if normalized not in copilot_outcome.OUTCOME_STAGES:
+        await query.answer("Неизвестный результат.", show_alert=True)
+        return
+    store = CopilotStore.from_database(job_bot.db)
+    if store is not None:
+        try:
+            store.set_application_stage(user_id, job_hash, normalized)
+        except Exception as exc:
+            logger.info("Copilot application update failed: %s", type(exc).__name__)
+    await query.answer("Записал", show_alert=True)
+    label = copilot_outcome.STAGE_LABELS.get(normalized, normalized)
+    await query.message.reply_text(f"Записал: {label}. Спасибо — больше не напомню про этот отклик.")
+    job_bot.db.log_event(
+        user_id, "copilot_application_answered", {"hash": job_hash, "stage": normalized}
+    )
+
+
+def _upskill_share_url(user_id: int) -> str:
+    """Share link of the radar with the campaign payload of the magnets."""
+    username = str(os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
+    if not username:
+        return ""
+    target = f"https://t.me/{username}?start={UPSKILL_PREFIX}{int(user_id)}"
+    text = "Мой upskill-радар по junior/middle IT — посчитай свой: " + target
+    return (
+        "https://t.me/share/url?url="
+        + quote(target, safe="")
+        + "&text="
+        + quote(text, safe="")
+    )
+
+
+def _upskill_keyboard(user_id: int):
+    """Keyboard of the radar: a share button and the campaign payload."""
+    share_url = _upskill_share_url(user_id)
+    if not share_url:
+        return None
+    return core.InlineKeyboardMarkup(
+        [[core.InlineKeyboardButton("📤 Поделиться радаром", url=share_url)]]
+    )
+
+
+async def _cmd_upskill(self, update, context):
+    """``/upskill`` - what the current stack covers on the vacancy feed."""
+    if not (copilot_enabled() and upskill_enabled()):
+        await update.message.reply_text("Upskill-радар выключен.")
+        return
+    user_id = update.effective_user.id if update.effective_user else None
+    settings = self.db.get_user_settings(user_id) if user_id else {}
+    profile = _profile_from_settings(settings)
+    days = upskill_days()
+    try:
+        jobs = self.db.recent_jobs_for_digest(hours=days * 24, limit=200)
+    except Exception as exc:
+        logger.info("Upskill feed read failed: %s", type(exc).__name__)
+        jobs = []
+    radar = copilot_upskill.build_radar(jobs, profile)
+    await update.message.reply_text(
+        copilot_upskill.format_radar(radar, days=days),
+        reply_markup=_upskill_keyboard(user_id) if user_id else None,
+        disable_web_page_preview=True,
+    )
+    self.db.log_event(
+        user_id,
+        "copilot_upskill_viewed",
+        {"total": radar.total, "covered": radar.covered},
+    )
+
+
+async def run_followup_reminders(job_bot, application, db, ledger=None) -> Dict:
+    """Ask about applications that stayed unanswered.
+
+    The step runs inside the existing daily delivery job, so no new scheduler
+    is introduced. The receipt ledger keeps the reminder at-most-once.
+    """
+    result = {"sent": 0, "skipped": 0, "unresolved": 0}
+    if not (copilot_enabled() and outcome_enabled()):
+        return result
+    store = CopilotStore.from_database(db)
+    if store is None:
+        return result
+    try:
+        applications = store.list_applications_due(days=followup_days())
+    except Exception as exc:
+        logger.info("Copilot follow-up read failed: %s", type(exc).__name__)
+        return result
+
+    for item in applications:
+        user_id = int(item.get("user_id") or 0)
+        job_hash = str(item.get("job_id") or "")
+        if not user_id or not job_hash:
+            continue
+        if ledger is not None:
+            try:
+                if not ledger.claim("copilot_followup", f"app_{job_hash}", user_id):
+                    result["skipped"] += 1
+                    continue
+            except Exception as exc:
+                logger.info("Copilot follow-up claim failed: %s", type(exc).__name__)
+        keyboard = core.InlineKeyboardMarkup(
+            [
+                [
+                    core.InlineKeyboardButton(
+                        label,
+                        callback_data=copilot_outcome.outcome_callback(stage, job_hash),
+                    )
+                    for stage, label in copilot_outcome.OUTCOME_BUTTONS
+                ]
+            ]
+        )
+        try:
+            await application.bot.send_message(
+                chat_id=user_id,
+                text=copilot_outcome.reminder_text(
+                    title=item.get("title"),
+                    company=item.get("company"),
+                    days=followup_days(),
+                ),
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            result["sent"] += 1
+        except Exception:
+            result["unresolved"] += 1
+            continue
+        try:
+            store.mark_application_reminded(user_id, job_hash)
+        except Exception as exc:
+            logger.info("Copilot follow-up mark failed: %s", type(exc).__name__)
+    return result
+
+
 async def _handle_pdf(job_bot, update, job_hash: str) -> None:
     """Send the cached CV or ask for the resume that is needed to build one."""
     query = update.callback_query
@@ -539,7 +793,7 @@ async def _handle_pdf(job_bot, update, job_hash: str) -> None:
             job_bot.db.log_event(user_id, "copilot_cv_cached", {"hash": job_hash})
             return
 
-    job = job_bot.db.get_job_payload(job_hash)
+    job = _load_job(job_bot, job_hash)
     if not job:
         await query.answer("Карточка вакансии устарела.", show_alert=True)
         return
@@ -695,13 +949,84 @@ async def _run_in_thread(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
+async def _maybe_handle_forward(job_bot, update) -> bool:
+    """Analyze a forwarded vacancy; returns True when the message was consumed.
+
+    Commands and documents are left alone, and a text that looks like a resume
+    is refused instead of being analyzed: the product never stores resume
+    content.
+    """
+    if not (copilot_enabled() and forward_enabled()):
+        return False
+    message = getattr(update, "message", None)
+    if message is None:
+        return False
+    user_id = update.effective_user.id if update.effective_user else None
+    setup_steps = getattr(job_bot, "setup_steps", None) or {}
+    if user_id and user_id in setup_steps:
+        # The setup wizard owns the text input while it is running.
+        return False
+    document = getattr(message, "document", None)
+    text = str(getattr(message, "text", "") or "")
+    forwarded = bool(getattr(message, "forward_date", None))
+    if not copilot_forward.is_forward_candidate(
+        text, forwarded=forwarded, has_document=document is not None
+    ):
+        return False
+    if copilot_forward.looks_like_resume(text):
+        await message.reply_text(
+            "Это похоже на резюме, а не на вакансию. "
+            "Пришли файл (PDF или DOCX) — проверю его как резюме."
+        )
+        return True
+
+    job = copilot_forward.build_job(text)
+    job_hash = job["hash"]
+
+    store = CopilotStore.from_database(job_bot.db)
+    if store is not None:
+        try:
+            store.save_forwarded_job(
+                job_hash,
+                title=job["title"],
+                company=job["company"],
+                url=job["url"],
+                text=job["description"],
+            )
+        except Exception as exc:
+            logger.info("Copilot forwarded job cache failed: %s", type(exc).__name__)
+
+    settings = job_bot.db.get_user_settings(user_id) if user_id else {}
+    profile = _profile_from_settings(settings)
+    analysis = analyse_job(job, profile)
+    await message.reply_text(
+        format_analysis(job, analysis),
+        reply_markup=analysis_keyboard(
+            job_hash,
+            analysis,
+            can_pdf=bool(pdf_enabled() and analysis["report"].matched_skills),
+            can_ai=bool(ai_enabled()),
+            can_outcome=bool(outcome_enabled()),
+        ),
+        disable_web_page_preview=True,
+    )
+    job_bot.db.log_event(
+        user_id,
+        "copilot_forward_analyzed",
+        {"hash": job_hash, "score": analysis["report"].score},
+    )
+    return True
+
+
 async def _copilot_handle_setup_text(self, update, context):
-    """Route a resume upload to the pending CV build when one is waiting."""
+    """Route a resume upload to the CV build and a forward to the Copilot."""
     user_id = update.effective_user.id if update.effective_user else None
     requests = _pdf_requests(self)
     pending = requests.pop(user_id, None) if user_id else None
     if pending:
         await _build_cv_from_message(self, update, context, pending)
+        return
+    if await _maybe_handle_forward(self, update):
         return
     return await _original_handle_setup_text(self, update, context)
 
@@ -713,7 +1038,12 @@ async def _copilot_handle_callback(self, update, context):
     if not data.startswith(CALLBACK_PREFIX):
         return await _original_handle_callback(self, update, context)
 
-    action, _, job_hash = data.partition(":")
+    action, _, rest = data.partition(":")
+    if action == "copilot_outcome":
+        stage, _, job_hash = rest.partition(":")
+        await _handle_outcome(self, update, stage, job_hash)
+        return
+    job_hash = rest
     if action == "copilot_hr":
         await _handle_hr(self, update, job_hash)
         return
@@ -729,20 +1059,25 @@ async def _copilot_handle_callback(self, update, context):
     if action == "copilot_pdf":
         await _handle_pdf(self, update, job_hash)
         return
+    if action == "copilot_applied":
+        await _handle_applied(self, update, job_hash)
+        return
     if query:
         await query.answer()
     return None
 
 
 def _copilot_build_runtime():
-    """Build the runtime with the Copilot command registered."""
+    """Build the runtime with the Copilot commands registered."""
     application, db, job_bot = _localized_build_runtime()
     application.add_handler(CommandHandler("copilot", job_bot.cmd_copilot))
+    application.add_handler(CommandHandler("upskill", job_bot.cmd_upskill))
     return application, db, job_bot
 
 
 durable.JobBot.cmd_start = _copilot_cmd_start
 durable.JobBot.cmd_copilot = _cmd_copilot
+durable.JobBot.cmd_upskill = _cmd_upskill
 durable.JobBot.handle_callback = _copilot_handle_callback
 durable.JobBot.handle_setup_text = _copilot_handle_setup_text
 base.build_runtime = _copilot_build_runtime

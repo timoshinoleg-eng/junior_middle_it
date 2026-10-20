@@ -86,7 +86,10 @@ jobs:
              test_copilot_runtime \
              test_copilot_pdf \
              test_copilot_security \
-             test_copilot_llm
+             test_copilot_llm \
+             test_copilot_forward \
+             test_copilot_outcome \
+             test_copilot_upskill
 
 
 

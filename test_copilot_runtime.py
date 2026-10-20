@@ -24,6 +24,17 @@ class FakeDb:
         self.events = []
         self.saved = []
         self.settings = {"skills": "python, fastapi", "enabled_categories": ["development"]}
+        self.feed = [
+            {
+                "title": "Junior Python Developer",
+                "description": "Python и FastAPI, удалённо",
+                "salary_min_usd": 1200,
+            },
+            {
+                "title": "DevOps Engineer",
+                "description": "Kubernetes, Terraform, Docker",
+            },
+        ]
 
     def get_job_payload(self, job_hash):
         if self.job and str(job_hash) == str(self.job.get("hash")):
@@ -43,10 +54,16 @@ class FakeDb:
         self.saved.append(spec)
         return SimpleNamespace(id=len(self.saved))
 
+    def recent_jobs_for_digest(self, hours=36, limit=80):
+        return [dict(job) for job in self.feed[:limit]]
+
 
 class FakeMessage:
-    def __init__(self):
+    def __init__(self, text="", document=None, forward_date=None):
         self.replies = []
+        self.text = text
+        self.document = document
+        self.forward_date = forward_date
 
     async def reply_text(self, text, **kwargs):
         self.replies.append((text, kwargs))
@@ -317,6 +334,214 @@ class CopilotAIRuntimeTests(unittest.TestCase):
             for key in props:
                 self.assertNotIn("resume", key.lower())
                 self.assertNotIn("cv", key.lower())
+
+
+class CopilotForwardRuntimeTests(unittest.TestCase):
+    """Forward-to-Analyze never swallows commands, documents or resumes."""
+
+    VACANCY = (
+        "Junior Python Developer\n"
+        "Acme, remote\n"
+        "Python, FastAPI, PostgreSQL. Опыт 1-2 года. "
+        "Вопросы по вакансии пишите @hr_ivan https://example.com/jobs/1"
+    )
+
+    def _run(self, message, env=None, context=None):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        db = FakeDb(JOB)
+        update = FakeUpdate(message=message)
+        original = AsyncMock()
+        environment = {
+            "COPILOT_ENABLED": "true",
+            "COPILOT_FORWARD_ENABLED": "true",
+        }
+        environment.update(env or {})
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            copilot_runtime, "_original_handle_setup_text", new=original
+        ):
+            asyncio.run(
+                copilot_runtime._copilot_handle_setup_text(
+                    FakeBot(db), update, context or SimpleNamespace()
+                )
+            )
+        return db, message, original
+    def test_forwarded_vacancy_is_analyzed(self):
+        from datetime import datetime, timezone
+
+        message = FakeMessage(
+            text=self.VACANCY, forward_date=datetime.now(timezone.utc)
+        )
+        db, message, original = self._run(message)
+        self.assertTrue(message.replies)
+        self.assertIn("Разбор вакансии", message.replies[0][0])
+        self.assertTrue(any(name == "copilot_forward_analyzed" for name, _ in db.events))
+        original.assert_not_awaited()
+
+    def test_command_is_not_consumed(self):
+        message = FakeMessage(text="/setup python fastapi")
+        db, message, original = self._run(message)
+        self.assertEqual(message.replies, [])
+        original.assert_awaited_once()
+
+    def test_document_is_not_consumed(self):
+        message = FakeMessage(text="", document=object())
+        db, message, original = self._run(message)
+        self.assertEqual(message.replies, [])
+        original.assert_awaited_once()
+
+    def test_resume_forward_is_refused(self):
+        from datetime import datetime, timezone
+
+        message = FakeMessage(
+            text="Резюме\nО себе: python, fastapi\nЗарплатные ожидания: 2000 USD",
+            forward_date=datetime.now(timezone.utc),
+        )
+        db, message, original = self._run(message)
+        self.assertTrue(message.replies)
+        self.assertIn("резюме", message.replies[0][0].lower())
+        self.assertFalse(any(name == "copilot_forward_analyzed" for name, _ in db.events))
+
+    def test_forward_is_off_by_default(self):
+        from datetime import datetime, timezone
+
+        message = FakeMessage(
+            text=self.VACANCY, forward_date=datetime.now(timezone.utc)
+        )
+        db, message, original = self._run(
+            message, env={"COPILOT_FORWARD_ENABLED": "false"}
+        )
+        self.assertEqual(message.replies, [])
+        original.assert_awaited_once()
+
+    def test_the_same_post_gets_the_same_hash(self):
+        from datetime import datetime, timezone
+
+        first = FakeMessage(text=self.VACANCY, forward_date=datetime.now(timezone.utc))
+        second = FakeMessage(text=self.VACANCY + " ", forward_date=datetime.now(timezone.utc))
+        db_one, message_one, _ = self._run(first)
+        db_two, message_two, _ = self._run(second)
+        hash_one = db_one.events[-1][1]["hash"]
+        hash_two = db_two.events[-1][1]["hash"]
+        self.assertEqual(hash_one, hash_two)
+
+    def test_setup_wizard_keeps_the_text_input(self):
+        import asyncio
+        from datetime import datetime, timezone
+        from unittest.mock import AsyncMock
+
+        message = FakeMessage(
+            text=self.VACANCY, forward_date=datetime.now(timezone.utc)
+        )
+        bot = FakeBot(FakeDb(JOB))
+        bot.setup_steps = {4242: "skills"}
+        db = bot.db
+        update = FakeUpdate(message=message)
+        original = AsyncMock()
+        env = {"COPILOT_ENABLED": "true", "COPILOT_FORWARD_ENABLED": "true"}
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            copilot_runtime, "_original_handle_setup_text", new=original
+        ):
+            asyncio.run(
+                copilot_runtime._copilot_handle_setup_text(
+                    bot, update, SimpleNamespace()
+                )
+            )
+        self.assertEqual(message.replies, [])
+        original.assert_awaited_once()
+        self.assertFalse(any(name == "copilot_forward_analyzed" for name, _ in db.events))
+
+
+class CopilotOutcomeRuntimeTests(unittest.TestCase):
+    def test_applied_callback_without_a_database_is_honest(self):
+        import asyncio
+
+        db = FakeDb(JOB)
+        message = FakeMessage()
+        query = FakeQuery(message)
+        query.data = "copilot_applied:" + JOB["hash"]
+        update = FakeUpdate(message=message, query=query)
+        env = {"COPILOT_ENABLED": "true", "COPILOT_OUTCOME_ENABLED": "true"}
+        with patch.dict(os.environ, env, clear=False):
+            asyncio.run(
+                copilot_runtime._copilot_handle_callback(
+                    FakeBot(db), update, SimpleNamespace()
+                )
+            )
+        self.assertTrue(query.answers)
+        self.assertIn("баз", " ".join(str(item) for item in query.answers).lower())
+
+    def test_outcome_callback_is_ignored_while_the_tracker_is_off(self):
+        import asyncio
+
+        db = FakeDb(JOB)
+        message = FakeMessage()
+        query = FakeQuery(message)
+        query.data = "copilot_outcome:interview:" + JOB["hash"]
+        update = FakeUpdate(message=message, query=query)
+        env = {"COPILOT_ENABLED": "true", "COPILOT_OUTCOME_ENABLED": "false"}
+        with patch.dict(os.environ, env, clear=False):
+            asyncio.run(
+                copilot_runtime._copilot_handle_callback(
+                    FakeBot(db), update, SimpleNamespace()
+                )
+            )
+        self.assertTrue(query.answers)
+        self.assertEqual(message.replies, [])
+
+    def test_outcome_callback_is_parsed(self):
+        from copilot import outcome
+
+        stage, job_hash = outcome.stage_from_callback(
+            "copilot_outcome:no_response:" + JOB["hash"]
+        )
+        self.assertEqual(stage, "no_response")
+        self.assertEqual(job_hash, JOB["hash"])
+
+
+class CopilotUpskillRuntimeTests(unittest.TestCase):
+    def test_upskill_command_reports_the_feed(self):
+        import asyncio
+
+        db = FakeDb(JOB)
+        message = FakeMessage()
+        update = FakeUpdate(message=message)
+        env = {"COPILOT_ENABLED": "true", "COPILOT_UPSKILL_ENABLED": "true"}
+        with patch.dict(os.environ, env, clear=False):
+            asyncio.run(
+                copilot_runtime._cmd_upskill(FakeBot(db), update, SimpleNamespace())
+            )
+        self.assertTrue(message.replies)
+        self.assertIn("upskill-радар", message.replies[0][0])
+        self.assertTrue(any(name == "copilot_upskill_viewed" for name, _ in db.events))
+
+    def test_upskill_command_is_off_by_default(self):
+        import asyncio
+
+        db = FakeDb(JOB)
+        message = FakeMessage()
+        update = FakeUpdate(message=message)
+        env = {"COPILOT_ENABLED": "true", "COPILOT_UPSKILL_ENABLED": "false"}
+        with patch.dict(os.environ, env, clear=False):
+            asyncio.run(
+                copilot_runtime._cmd_upskill(FakeBot(db), update, SimpleNamespace())
+            )
+        self.assertTrue(message.replies)
+        self.assertIn("выключен", message.replies[0][0])
+
+    def test_share_link_carries_the_campaign_payload(self):
+        from urllib.parse import unquote
+
+        env = {"BOT_USERNAME": "junior_jobs_channel_bot"}
+        with patch.dict(os.environ, env, clear=False):
+            url = copilot_runtime._upskill_share_url(4242)
+        self.assertIn("t.me/share/url", url)
+        self.assertIn("start=upskill_4242", unquote(url))
+
+    def test_share_link_needs_a_bot_username(self):
+        with patch.dict(os.environ, {"BOT_USERNAME": ""}, clear=False):
+            self.assertEqual(copilot_runtime._upskill_share_url(4242), "")
 
 
 class ChannelButtonTests(unittest.TestCase):
