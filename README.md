@@ -1,24 +1,86 @@
-# Junior/Middle IT Job Vacancy Bot v6.6
+# Junior/Middle IT Job Vacancy Bot — v7.0 (AI Career Copilot)
 
-Telegram-бот для сбора Junior/Middle remote IT-вакансий: API + ATS + Telegram-каналы, персональные дайджесты, multi-track каналы, source health.
+Telegram-бот для сбора Junior/Middle remote IT-вакансий: 40+ каналов и 60+
+источников (API/ATS/RSS), персональные дайджесты, Saved Searches, Resume Match и
+**AI Career Copilot** — персональный разбор вакансии, CV под вакансию, трекер
+откликов, upskill-радар и Telegram Mini App.
 
-## 🚀 Возможности
+Версия 7.0 добавляет Copilot поверх действующей архитектуры: Postgres в
+Supabase, Edge-мост `growth-proxy`, webhook-рантайм бота и единственный
+издатель в канал из Vercel production. Ниже описана **фактическая** схема
+работы, а не состояние v6.x.
 
-### v6.1–v6.6 (growth stack)
-- **v6.1** — fuzzy dedup (RapidFuzz), referrals, FloodWait, events
-- **v6.2** — `/setup` профиль, personal digest, invite CTA
-- **v6.3** — `/stats_growth`, salary magnet, premium refs, realtime alerts
-- **v6.4** — multi-track `CHANNEL_ROUTES` (specialty channels by category)
-- **v6.5** — free sources: 4dayweek, The Muse, RemoteOK multi-cat, Working Nomads, WWR/Himalayas RSS; `/sources`
-- **v6.6** — publish quality score, source auto-skip (`SOURCE_FAIL_SKIP`), title/company normalize
+---
 
-### База v6.0
-- 📱 **40+ Telegram-каналов** (Telethon)
-- 🧠 **Классификация** по категориям (dev, QA, DevOps, data, design, PM, …)
-- 🎨 **MarkdownV2** + inline-кнопки (сохранить / поделиться / скрыть)
-- 💾 **Избранное** + настройки категорий
-- 🔍 **60+ источников** (API/ATS + TG)
-- 📊 **SQLite** dedup + retention
+## 🏗️ Архитектура
+
+```text
+40+ Telegram-каналов (Telethon) + 60+ API/ATS/RSS источников
+                │
+                ▼
+        сбор и фильтрация вакансий
+                │
+                ▼
+   Vercel function /api/cron  (4 запуска в сутки, GitHub Actions)
+                │
+                ▼
+   Edge-мост growth-proxy → Supabase Postgres (growth_job_payloads)
+                │
+                ▼
+   publication_authority.py → единственный издатель в канал (Vercel production)
+                │
+                ▼
+   /api/delivery (ежедневно 09:00 UTC) → канальный дайджест + персональные
+                │
+                ▼
+   /api/webhook ← Telegram  →  interactive_webhook_runtime → JobBot
+                │
+                ▼
+   Supabase Postgres: growth_user_settings, growth_saved_searches,
+   growth_events, growth_delivery_receipts, growth_telegram_updates,
+   growth_copilot_*
+```
+
+### Ключевые правила
+
+| Правило | Как реализовано |
+|---|---|
+| Durable state обязателен | `REQUIRE_DURABLE_GROWTH=true`; без Postgres рантайм падает (fail-closed) |
+| Писать в канал может только Vercel production | `publication_authority.py`: публикация только при `VERCEL=1` и `VERCEL_ENV=production` |
+| SQL идёт только через Edge-мост | `growth-proxy` (ключ) и `interactive-growth-proxy` (токен бота) принимают только relations `growth_*`, одно утверждение, без `--`, `/*`, `;` и служебных слов |
+| Один планировщик | GitHub Actions: `vercel-cron.yml` (сбор), `delivery-cron.yml` (доставка), `funnel-audit.yml` (отчёт) |
+| Один Update = один HTTP-запрос | дедуп через леас-лэджер `growth_telegram_updates` (`claimed/processing/processed`, lease 10 минут) |
+
+### Режимы рантайма
+
+- **Vercel (webhook)** — `api/webhook.py` → `localized_webhook_runtime` →
+  `interactive_webhook_runtime.build_runtime()`. Секрет `X-Telegram-Bot-Api-Secret-Token`.
+- **Render (long polling)** — тот же `build_runtime()`, но опрос Telegram.
+  В текущем проде этот режим **выключен** (нет `TELEGRAM_BOT_TOKEN`): интерактив
+  рантайм живёт в Vercel webhook, Render-инстанс fail-closed.
+
+---
+
+## 🤖 AI Career Copilot (v7.0)
+
+Copilot — это надстройка над детерминированным ядром. **Ядро никогда не
+вызывает сеть и модель**: все оценки воспроизводимы и офлайн. LLM подключается
+только по явной кнопке пользователя и за отдельным флагом.
+
+| Поверхность | Что делает | Флаг |
+|---|---|---|
+| `/copilot`, кнопка «✨ Разбор вакансии» | Персональный fit-score, честный разбор грейда, контакт HR, сохранение поиска | `COPILOT_ENABLED` |
+| «🧾 Собрать CV под вакансию» | PDF-резюме на `fpdf2` + ATS-проверка, кэш `file_id`, один кредит | `COPILOT_PDF_ENABLED` |
+| «🤖 Разобрать глубже (AI)» | Опциональный LLM-разбор, деградация к детерминированному отчёту | `COPILOT_LLM_ENABLED` + ключ |
+| Пересылка вакансии в личку | Тот же разбор для пересланного поста, дедуп по хэшу текста | `COPILOT_FORWARD_ENABLED` |
+| «✉️ Отклик отправлен» | Трекер отклика, напоминание через 7 дней, исход «интервью/тишина/отказ» | `COPILOT_OUTCOME_ENABLED` |
+| `/upskill` | Радар по базе вакансий: сколько вакансий закрывает стек и чего не хватает | `COPILOT_UPSKILL_ENABLED` |
+| Mini App `/copilot` | Три вкладки (Fit / Резюме / Поиск), доступ только по подписи Telegram | `COPILOT_WEBAPP_ENABLED` + URL |
+
+Подробности: [`docs/COPIOT.md`](docs/COPIOT.md). Приватность и недоверенный
+ввод: [`SECURITY.md`](SECURITY.md).
+
+---
 
 ## 📦 Источники вакансий
 
@@ -33,251 +95,193 @@ Telegram-бот для сбора Junior/Middle remote IT-вакансий: API 
 - HeadHunter, SuperJob, Adzuna, Reed, Jooble, FindWork, USAJobs
 - Apify actors (USAJobs, All Jobs; paid: CryptocurrencyJobs, Wellfound)
 
-### Telegram-каналы:
-1. **remote_developers** - 100% remote, EN/RU
-2. **programmer_remote** - remote, EN/RU
-3. **digital_nomads** - remote worldwide
-4. **itfreelance** - фильтр по ключевым словам
-5. **prog_jobs** - структурированные, фильтр remote
-6. **coders_jobs** - junior/middle, фильтр remote
-7. **design_vacancies** - UX/UI, фильтр remote
-8. **project_managers** - PM/Agile, фильтр remote
-9. **hitech_jobs** - AI/ML, стартапы, фильтр remote
-10. **it_jobs** - агрегатор, усиленная дедупликация
+### Telegram-каналы (40+)
+`remote_developers`, `programmer_remote`, `digital_nomads`, `itfreelance`,
+`prog_jobs`, `coders_jobs`, `design_vacancies`, `project_managers`,
+`hitech_jobs`, `it_jobs` и подключённые Python/Frontend/Backend/QA/DevOps/Data/
+Product/Design/GameDev/relocation/junior каналы.
 
-Дополнительно подключены Python, Frontend, Backend, QA, DevOps, Data, Product, Design, GameDev, relocation и junior-focused каналы из прежней VM-конфигурации.
+---
 
-## 🛠️ Установка
+## 🛠️ Установка и запуск
 
-### 1. Клонировать репозиторий
+### 1. Клонировать и создать окружение
 ```bash
 git clone https://github.com/timoshinoleg-eng/junior_middle_it.git
 cd junior_middle_it
-```
-
-### 2. Создать виртуальное окружение
-```bash
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-```
-
-### 3. Установить зависимости
-```bash
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Для работы с Telegram-каналами также установите:
-```bash
-pip install telethon
-```
+### 2. Переменные окружения
+Полный список с комментариями — `.env.example.txt`. Минимум:
 
-### 4. Настроить переменные окружения
-```bash
-cp .env.example .env
-nano .env  # Отредактируйте файл
-```
-
-Обязательные переменные:
 ```env
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-CHANNEL_ID=@your_channel_username_or_id
+TELEGRAM_BOT_TOKEN=            # токен бота (обязателен для webhook и Mini App)
+CHANNEL_ID=                    # канал-издатель
+BOT_USERNAME=junior_jobs_channel_bot
+ADMIN_USER_ID=                 # доступ к /stats_growth и служебным командам
+
+# durable growth state (Supabase Postgres через Edge-мост)
+GROWTH_DATABASE_URL=https://<project>.supabase.co/functions/v1/interactive-growth-proxy
+GROWTH_HTTP_AUTH_MODE=telegram
+REQUIRE_DURABLE_GROWTH=true
+GROWTH_PUBLIC_URL=https://<project>.supabase.co/functions/v1/growth-proxy
+GROWTH_HTTP_KEY=               # ключ Edge-моста (только в секретах)
+
+# доставка
+CRON_SECRET=                   # Bearer-токен для /api/cron и /api/delivery
 ```
 
-Для Telegram-каналов (получите на https://my.telegram.org/apps):
-```env
-TELEGRAM_API_ID=your_api_id_here
-TELEGRAM_API_HASH=your_api_hash_here
-TELEGRAM_SESSION_NAME=job_parser_session
-TELEGRAM_SESSION_STRING=optional_string_session_for_serverless
-TELEGRAM_PROXY=socks5://127.0.0.1:9050  # опционально, если VM не ходит в Telegram напрямую
-TELEGRAM_HOURS_BACK=48
-ENABLE_TELEGRAM_CHANNELS=true
-```
+Ключи API-источников (опционально): `HEADHUNTER_ACCESS_TOKEN`, `REED_API_KEY`,
+`JOOBLE_API_KEY`, `FINDWORK_API_TOKEN`, `USAJOBS_API_KEY`, `APIFY_API_TOKEN`.
+HeadHunter требует `User-Agent`; Apify-paid акторы включаются только
+`APIFY_ENABLE_PAID_ACTORS=true`.
 
-Опциональные ключи для расширенных источников:
-```env
-HEADHUNTER_USER_AGENT=RestoBotVacancyParser/1.0 (https://github.com/timoshinoleg-eng/junior_middle_it)
-HEADHUNTER_ACCESS_TOKEN=optional_hh_oauth_token
-REED_API_KEY=your_reed_api_key
-JOOBLE_API_KEY=your_jooble_api_key
-FINDWORK_API_TOKEN=your_findwork_token
-USAJOBS_API_KEY=your_usajobs_api_key
-USAJOBS_USER_AGENT=your.email@example.com
-APIFY_API_TOKEN=your_apify_token
-APIFY_MAX_ITEMS=30
-APIFY_ENABLE_PAID_ACTORS=false
-GREENHOUSE_BOARDS=gitlab,canonical,elastic
-LEVER_COMPANIES=Instrumentl,2brains,360learning
-ASHBY_COMPANIES=cursor,linear,supabase,openai
-```
+### 3. База данных
+Схема — **Supabase Postgres**, миграции в `supabase/migrations/`. Применяются
+на стороне Supabase (в репозитории лежат только SQL-файлы, идемпотентные,
+`CREATE TABLE IF NOT EXISTS` + RLS + `REVOKE` для `anon`/`authenticated`).
 
-HeadHunter `/vacancies` использует обязательный `User-Agent`. Если API возвращает `403 forbidden` для анонимного поиска вакансий, укажите OAuth token в `HEADHUNTER_ACCESS_TOKEN`.
-Apify token включает `Apify USAJobs` и `Apify All Jobs`. `CryptocurrencyJobs` и `Wellfound` включайте через `APIFY_ENABLE_PAID_ACTORS=true` только после аренды соответствующих платных actors в Apify.
+Локальный SQLite — только dev-фолбэк, в проде его быть не должно.
 
-### Vercel deployment
-
-Serverless endpoint:
-
-```text
-https://junior-middle-it.vercel.app/api/health
-https://junior-middle-it.vercel.app/api/cron
-```
-
-`/api/cron` защищен `CRON_SECRET`; передавайте его как `Authorization: Bearer <CRON_SECRET>`.
-
-**Cron расписание:** 4 запуска в сутки (00:00, 06:00, 12:00, 18:00 UTC) через GitHub Actions workflow `.github/workflows/vercel-cron.yml`. Vercel Hobby cron ограничен 1 запуском/сутки, поэтому используется внешний триггер.
-
-Для ручного запуска: `workflow_dispatch` в GitHub Actions или прямой GET/POST на `/api/cron` с `Authorization: Bearer <CRON_SECRET>`.
-
-### 5. Выполнить миграцию базы данных
-```bash
-python migrate_db.py
-```
-
-### 6. Авторизоваться в Telegram (для парсинга каналов)
+### 4. Авторизация Telethon (нужна только для парсинга каналов)
 ```bash
 python telegram_auth.py
 ```
-Введите номер телефона и код подтверждения. Это нужно сделать один раз.
 
-### 7. Запустить бота
+### 5. Локальный запуск интерактивного бота
 ```bash
-python channel_bot.py
+python channel_bot.py           # long polling, требует durable Postgres
 ```
+
+---
+
+## ☁️ Деплой (Vercel + GitHub Actions)
+
+Функции в `api/`:
+
+| Endpoint | Назначение | Защита |
+|---|---|---|
+| `/api/site` | публичный лендинг | — |
+| `/api/health` | health-контракт | — |
+| `/api/cron` | сбор вакансий и публикация | `Authorization: Bearer CRON_SECRET` |
+| `/api/delivery` | ежедневный канальный + персональный дайджест | `Authorization: Bearer CRON_SECRET` |
+| `/api/webhook` | приём Telegram-обновлений | `X-Telegram-Bot-Api-Secret-Token` |
+| `/api/copilot` | API Mini App (fit, поиски) | подпись `initData` Telegram |
+| `/api/copilot/pdf` | CV под вакансию | подпись `initData` Telegram |
+| `/api/robots.txt` | robots.txt | — |
+
+Планировщики (GitHub Actions, без нового планировщика):
+
+| Workflow | Расписание | Что делает |
+|---|---|---|
+| `vercel-cron.yml` | 00:00, 06:00, 12:00, 18:00 UTC | дёргает `/api/cron` |
+| `delivery-cron.yml` | ежедневно 09:00 UTC | дёргает `/api/delivery` |
+| `funnel-audit.yml` | ежедневно | отчёт по воронке |
+| `production-smoke.yml` | после зелёного CI в `main` | smoke прод-контракта |
+| `ci.yml` | PR и `main` | тесты на Python 3.12 и 3.13 |
+
+Статика Mini App лежит в `miniapp/`, маршрут `/copilot` задан rewrite-ом в
+`vercel.json`.
+
+---
 
 ## 📚 Команды бота
 
 ### Публичные
-- `/start` — онбординг + referral deep-link
-- `/setup` / `/profile` — профиль (категории, skills, min salary)
+- `/start` — онбординг, referral и campaign deep-links
+- `/setup` / `/profile` — профиль (категории, навыки, минимальная зарплата)
 - `/digest` — персональный дайджест
-- `/alerts` — realtime alerts on/off
+- `/alerts` — realtime-алерты вкл/выкл
 - `/ref` — реферальная ссылка
-- `/favorites` / `/categories`
+- `/favorites` / `/categories` / `/tracks` / `/sources` / `/status` / `/last`
+- `/copilot` — персональный разбор вакансии
+- `/upskill` — радар по стеку
 
 ### Админ
-- `/status` `/last N` `/pause` `/resume`
-- `/sources` — health + fail streaks + configured fetchers
-- `/tracks` — multi-track routes
-- `/stats_growth` — growth metrics
+- `/pause` / `/resume` — пауза публикаций
+- `/stats_growth` — воронка и метрики Copilot
 
-## Ключевые env (полный список — `.env.example.txt`)
-
-```env
-TELEGRAM_BOT_TOKEN=
-CHANNEL_ID=
-# multi-track (v6.4)
-CHANNEL_ROUTES=development,qa,devops:@dev;data:@data;*:@main
-MULTI_TRACK_ENABLED=true
-# free extras (v6.5)
-ENABLE_EXTRA_SOURCES=true
-ENABLE_RSS_SOURCES=true
-# quality ops (v6.6)
-SOURCE_FAIL_SKIP=3
-ENABLE_SOURCE_DIVERSIFY=true
-# 0 = публиковать все вакансии, прошедшие quality gate; включать только при инциденте
-EMERGENCY_MAX_POSTS_PER_CYCLE=0
-```
+---
 
 ## 🗂️ Структура проекта
 
-```
+```text
 junior_middle_it/
-├── channel_bot.py           # pipeline + bot commands
-├── growth_utils.py          # fuzzy, salary, multi-track, scores
-├── job_sources_extra.py     # free APIs / RSS / source health
-├── job_classifier.py
-├── telegram_job_parser.py
-├── message_formatter.py
-├── CHANGELOG_v6.1.md … v6.6.md
-├── requirements.txt
-├── .env.example.txt
-└── README.md
+├── api/                       # Vercel serverless functions
+│   ├── site.py  health.py  cron.py  delivery.py
+│   ├── webhook.py  webhook_admin.py  robots.py
+│   └── copilot.py              # API Mini App (подпись initData)
+├── miniapp/                   # статика Telegram Mini App
+├── copilot/                   # ядро Copilot (чистые модули, без Telegram и SQL)
+│   ├── fit.py grade_audit.py hr_link.py enrich.py
+│   ├── forward.py outcome.py upskill.py metrics.py
+│   ├── llm.py security.py webapp.py webapp_auth.py
+│   ├── pdf.py store.py credits.py
+├── supabase/
+│   ├── migrations/            # P7…P12
+│   └── functions/             # growth-proxy, interactive-growth-proxy
+├── channel_bot.py             # редакционный пайплайн и команды
+├── durable_product_state.py   # интерактивный рантайм поверх Postgres
+├── interactive_webhook_runtime.py
+├── localized_webhook_runtime.py
+├── copilot_webhook_runtime.py # Telegram-клей Copilot
+├── publication_authority.py   # единственный издатель в канал
+├── message_formatter.py  growth_utils.py  resume_matcher.py
+├── saved_searches.py  content_magnets.py  resume_documents.py
+├── docs/COPIOT.md  SECURITY.md
+├── requirements.txt  .env.example.txt  vercel.json
+└── README.md  HANDOFF.md  CHANGELOG_v7.0.md  GROWTH_PLAN.md
 ```
 
-## 🎯 Категории вакансий
+---
 
-Бот автоматически классифицирует вакансии по категориям:
+## 🔒 Приватность и безопасность
 
-| Категория | Эмодзи | Описание |
-|-----------|--------|----------|
-| development | 💻 | Разработка (Python, JS, Java, etc.) |
-| qa | 🧪 | QA / Тестирование |
-| devops | 🔧 | DevOps / Инфраструктура |
-| data | 📊 | Данные / Аналитика / ML |
-| marketing | 📢 | Маркетинг |
-| sales | 💼 | Продажи |
-| pm | 📋 | Управление проектами |
-| design | 🎨 | Дизайн / UX-UI |
-| support | 🎧 | Поддержка |
-| security | 🔒 | Безопасность |
+- **Резюме не персистится.** Текст и байты файла живут только в памяти
+  запроса; в БД попадает максимум хэш вакансии и `file_id` готового файла.
+- **LLM — по явной кнопке**, с санитайзом недоверенного текста, без контактов
+  вакансии и без резюме по умолчанию.
+- **Подпись Mini App** — единственный источник личности; подделка `initData`
+  даёт 401, просроченная подпись отклоняется.
+- **Секреты** — только в окружении, в репозитории лежат лишь имена переменных.
+- Подробно: [`SECURITY.md`](SECURITY.md).
 
-## 🔧 Настройка cron
+---
 
-Для запуска бота каждые 30 минут:
+## 🧪 Тесты
 
 ```bash
-crontab -e
+python -m compileall -q .
+python -m unittest -v test_growth_utils test_copilot_runtime test_copilot_webapp_api
 ```
 
-Добавьте строку:
-```bash
-*/30 * * * * cd /path/to/junior_middle_it && /path/to/venv/bin/python channel_bot.py >> cron.log 2>&1
-```
+Полный набор CI (allowlist в `.github/workflows/ci.yml`) — офлайн: без сети,
+реальных LLM- и Telegram-вызовов.
 
-## 📝 Логирование
-
-Логи сохраняются в файл `bot.log`:
-- INFO: основные события
-- DEBUG: детальная информация
-- ERROR: ошибки
-
-## 🔒 Безопасность
-
-- API ключи хранятся в `.env` файле
-- Файл сессии Telegram (`*.session`) добавлен в `.gitignore`
-- HTML/Markdown экранирование для защиты от XSS
-
-## 🤝 Расширение функциональности
-
-### Добавление нового API источника:
-1. Создайте функцию `fetch_source_name()` в `channel_bot.py`
-2. Добавьте функцию в список `api_fetch_functions`
-
-### Добавление нового Telegram-канала:
-1. Отредактируйте `TELEGRAM_CHANNELS` в `telegram_job_parser.py`
-2. Настройте фильтры и приоритет
-
-### Изменение категорий:
-1. Отредактируйте `JobClassifier` в `job_classifier.py`
-2. Обновите ключевые слова и веса
+---
 
 ## ⚠️ Troubleshooting
 
-### Ошибка "Telethon не установлен"
-```bash
-pip install telethon
-```
+| Симптом | Причина и решение |
+|---|---|
+| `interactive runtime requires durable growth backend` | нет `GROWTH_DATABASE_URL`/`GROWTH_HTTP_KEY` или `REQUIRE_DURABLE_GROWTH=true` без Postgres |
+| `Growth proxy must be the HTTPS Supabase ... endpoint` | `GROWTH_DATABASE_URL` должен указывать на `growth-proxy` или `interactive-growth-proxy` проекта Supabase |
+| Вакансии не публикуются | проверить `/api/health`, `/status`, `/sources`; канал пишет только Vercel production |
+| Mini App отвечает 401 | истёк `auth_date` (>24 ч) или страница открыта вне Telegram |
+| 402 в Mini App | кончились бесплатные кредиты |
 
-### Ошибка "Пользователь не авторизован"
-Выполните авторизацию:
-```bash
-python telegram_auth.py
-```
-
-### Ошибка flood control от Telegram
-Бот автоматически обрабатывает ограничения с экспоненциальной задержкой.
-
-### Нет вакансий из Telegram-каналов
-1. Проверьте `TELEGRAM_API_ID` и `TELEGRAM_API_HASH`
-2. Убедитесь, что файл сессии создан
-3. Проверьте логи на ошибки доступа
+---
 
 ## 📄 Лицензия
 
-MIT License - см. файл [MIT.txt](MIT.txt)
+MIT License — см. [MIT.txt](MIT.txt). Шрифт `copilot/fonts/DejaVuSans.ttf` —
+DejaVu Fonts License (см. `copilot/fonts/LICENSE_DEJAVU.txt`).
 
 ## 🙏 Благодарности
 
-- [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) - Telegram Bot API
-- [Telethon](https://github.com/LonamiWebs/Telethon) - Telegram client library
+- [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot)
+- [Telethon](https://github.com/LonamiWebs/Telethon)
+- [fpdf2](https://github.com/py-pdf/fpdf2), [trafilatura](https://github.com/adbar/trafilatura)
