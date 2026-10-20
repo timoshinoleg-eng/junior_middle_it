@@ -94,6 +94,18 @@ class VercelWebhookSurfaceTests(unittest.TestCase):
             self.assertIn(r"/\bIS\s+(?:NOT\s+)?DISTINCT\s+FROM\b/gi", text, path)
             self.assertIn("relationScan", text, path)
 
+    def test_edge_functions_report_the_deployed_validator_version(self):
+        for path in EDGE_VALIDATORS:
+            text = Path(path).read_text(encoding="utf-8")
+            self.assertIn("const VALIDATOR_VERSION = 2;", text, path)
+            self.assertIn("validator: VALIDATOR_VERSION", text, path)
+
+    def test_both_edge_functions_expose_a_public_health_route(self):
+        for path in EDGE_VALIDATORS:
+            text = Path(path).read_text(encoding="utf-8")
+            self.assertIn('url.pathname.endsWith("/health")', text, path)
+            self.assertIn("ok: Boolean(DB_URL)", text, path)
+
     def test_daily_free_credit_statement_survives_the_relation_scan(self):
         source = Path("copilot/store.py").read_text(encoding="utf-8")
         match = re.search(

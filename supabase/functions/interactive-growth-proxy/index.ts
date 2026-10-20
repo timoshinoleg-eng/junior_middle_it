@@ -6,6 +6,10 @@ const MAX_SQL_BYTES = 40_000;
 const MAX_PARAMS = 80;
 const MAX_RESPONSE_BYTES = 2_000_000;
 const AUTH_CACHE_MS = 5 * 60_000;
+// Bumped whenever the private SQL validator changes. Version 2 understands
+// "IS [NOT] DISTINCT FROM" as a scalar comparison instead of a table
+// reference, so an operator can see from the outside which build is deployed.
+const VALIDATOR_VERSION = 2;
 const sql = postgres(DB_URL, { prepare: false, max: 1, idle_timeout: 20, connect_timeout: 10 });
 const telegramAuthCache = new Map<string, number>();
 
@@ -130,6 +134,14 @@ function validateGrowthSql(value: unknown): string {
 }
 
 Deno.serve(async (req: Request) => {
+  const url = new URL(req.url);
+  if (req.method === "GET" && url.pathname.endsWith("/health")) {
+    return new Response(JSON.stringify({
+      ok: Boolean(DB_URL),
+      service: "interactive-growth-proxy",
+      validator: VALIDATOR_VERSION,
+    }), { status: DB_URL ? 200 : 503, headers: jsonHeaders });
+  }
   if (req.method !== "POST") return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405, headers: jsonHeaders });
   const token = (req.headers.get("x-telegram-bot-token") ?? "").trim();
   if (!(await telegramBotAuthorized(token))) return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: jsonHeaders });

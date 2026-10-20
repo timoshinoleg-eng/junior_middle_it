@@ -146,5 +146,56 @@ class DeploymentCheckTests(unittest.TestCase):
         self.assertEqual(verify.deployment_problems(None, {"COPILOT_ENABLED": 0}), [])
 
 
+class RolloutStateTests(unittest.TestCase):
+    def _complete_state(self):
+        state = {name: True for name in verify.REQUIRED_ROLLOUT_FLAGS}
+        state["webapp_url"] = True
+        state["llm"] = False
+        state["ready"] = True
+        return state
+
+    def test_finished_rollout_has_no_problems(self):
+        self.assertEqual(verify.rollout_problems(self._complete_state()), [])
+
+    def test_switched_off_feature_is_reported(self):
+        state = self._complete_state()
+        state["webapp"] = False
+        problems = verify.rollout_problems(state)
+        self.assertTrue(any("webapp" in item for item in problems))
+
+    def test_missing_webapp_url_is_reported(self):
+        state = self._complete_state()
+        state["webapp_url"] = False
+        problems = verify.rollout_problems(state)
+        self.assertTrue(any("COPILOT_WEBAPP_URL" in item for item in problems))
+
+    def test_llm_layer_must_stay_off(self):
+        state = self._complete_state()
+        state["llm"] = True
+        problems = verify.rollout_problems(state)
+        self.assertTrue(any("LLM" in item for item in problems))
+
+    def test_missing_section_is_reported(self):
+        problems = verify.rollout_problems(None)
+        self.assertTrue(any("copilot" in item for item in problems))
+
+
+class ValidatorVersionTests(unittest.TestCase):
+    def test_current_version_has_no_problems(self):
+        self.assertEqual(verify.validator_version_problems({"validator": 2}), [])
+
+    def test_old_build_is_reported(self):
+        problems = verify.validator_version_problems({"validator": 1})
+        self.assertTrue(any("redeploy" in item for item in problems))
+
+    def test_missing_version_is_reported(self):
+        problems = verify.validator_version_problems({"ok": True})
+        self.assertTrue(any("validator" in item for item in problems))
+
+    def test_broken_response_is_reported(self):
+        problems = verify.validator_version_problems("not json")
+        self.assertTrue(problems)
+
+
 if __name__ == "__main__":
     unittest.main()
