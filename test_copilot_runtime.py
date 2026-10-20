@@ -176,6 +176,149 @@ class CopilotRuntimeTests(unittest.TestCase):
                 self.assertNotIn("cv", key.lower())
 
 
+class CopilotAIRuntimeTests(unittest.TestCase):
+    """The AI layer only runs behind its own button."""
+
+    def _result(self, ok=True, error=""):
+        from copilot import llm as copilot_llm
+
+        if not ok:
+            return copilot_llm.LLMResult(ok=False, error=error)
+        return copilot_llm.LLMResult(
+            ok=True,
+            summary="Нормальная junior-вакансия",
+            sections={
+                "strengths": ["Совпадает Python"],
+                "gaps": [],
+                "risks": [],
+                "next_steps": [],
+                "questions": [],
+            },
+            model="test-model",
+        )
+
+    def test_ai_callback_is_refused_while_the_layer_is_off(self):
+        import asyncio
+
+        db = FakeDb(JOB)
+        message = FakeMessage()
+        query = FakeQuery(message)
+        query.data = "copilot_ai:" + JOB["hash"]
+        update = FakeUpdate(message=message, query=query)
+        env = {"COPILOT_ENABLED": "true", "COPILOT_LLM_ENABLED": "false"}
+        with patch.dict(os.environ, env, clear=False):
+            asyncio.run(copilot_runtime._copilot_handle_callback(FakeBot(db), update, SimpleNamespace()))
+        self.assertEqual(message.replies, [])
+        self.assertTrue(query.answers)
+
+    def test_ai_callback_runs_the_model_and_answers(self):
+        import asyncio
+
+        db = FakeDb(JOB)
+        message = FakeMessage()
+        query = FakeQuery(message)
+        query.data = "copilot_ai:" + JOB["hash"]
+        update = FakeUpdate(message=message, query=query)
+        calls = []
+
+        def fake_analyze(job, skills, deterministic, resume_text, **kwargs):
+            calls.append(job)
+            return self._result()
+
+        env = {
+            "COPILOT_ENABLED": "true",
+            "COPILOT_LLM_ENABLED": "true",
+            "COPILOT_LLM_API_KEY": "test-key",
+        }
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            copilot_runtime.copilot_llm, "analyze", new=fake_analyze
+        ):
+            asyncio.run(copilot_runtime._copilot_handle_callback(FakeBot(db), update, SimpleNamespace()))
+        self.assertTrue(calls)
+        self.assertTrue(message.replies)
+        self.assertIn("AI-разбор", message.replies[0][0])
+        self.assertTrue(any(name == "copilot_ai_viewed" for name, _props in db.events))
+
+    def test_ai_failure_falls_back_to_the_deterministic_report(self):
+        import asyncio
+
+        db = FakeDb(JOB)
+        message = FakeMessage()
+        query = FakeQuery(message)
+        query.data = "copilot_ai:" + JOB["hash"]
+        update = FakeUpdate(message=message, query=query)
+
+        def fake_analyze(job, skills, deterministic, resume_text, **kwargs):
+            return self._result(ok=False, error="http_500")
+
+        env = {
+            "COPILOT_ENABLED": "true",
+            "COPILOT_LLM_ENABLED": "true",
+            "COPILOT_LLM_API_KEY": "test-key",
+        }
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            copilot_runtime.copilot_llm, "analyze", new=fake_analyze
+        ):
+            asyncio.run(copilot_runtime._copilot_handle_callback(FakeBot(db), update, SimpleNamespace()))
+        self.assertTrue(message.replies)
+        self.assertIn("не получился", message.replies[0][0])
+        self.assertIn("fit", message.replies[0][0].lower())
+        self.assertTrue(any(name == "copilot_ai_failed" for name, _props in db.events))
+
+    def test_ai_button_is_only_offered_when_the_layer_is_ready(self):
+        with patch.dict(os.environ, {"COPILOT_LLM_ENABLED": "false"}, clear=False):
+            self.assertFalse(copilot_runtime.ai_enabled())
+        with patch.dict(
+            os.environ,
+            {"COPILOT_LLM_ENABLED": "true", "COPILOT_LLM_API_KEY": ""},
+            clear=False,
+        ):
+            self.assertFalse(copilot_runtime.ai_enabled())
+        with patch.dict(
+            os.environ,
+            {"COPILOT_LLM_ENABLED": "true", "COPILOT_LLM_API_KEY": "test-key"},
+            clear=False,
+        ):
+            self.assertTrue(copilot_runtime.ai_enabled())
+
+    def test_ai_callback_is_present_in_the_keyboard(self):
+        markup = copilot_runtime.analysis_keyboard(
+            JOB["hash"], {"hr_handle": None}, can_ai=True
+        )
+        callbacks = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("copilot_ai:" + JOB["hash"], callbacks)
+
+    def test_ai_events_never_carry_resume_content(self):
+        import asyncio
+
+        db = FakeDb(JOB)
+        message = FakeMessage()
+        query = FakeQuery(message)
+        query.data = "copilot_ai:" + JOB["hash"]
+        update = FakeUpdate(message=message, query=query)
+
+        def fake_analyze(job, skills, deterministic, resume_text, **kwargs):
+            return self._result()
+
+        env = {
+            "COPILOT_ENABLED": "true",
+            "COPILOT_LLM_ENABLED": "true",
+            "COPILOT_LLM_API_KEY": "test-key",
+        }
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            copilot_runtime.copilot_llm, "analyze", new=fake_analyze
+        ):
+            asyncio.run(copilot_runtime._copilot_handle_callback(FakeBot(db), update, SimpleNamespace()))
+        for _name, props in db.events:
+            for key in props:
+                self.assertNotIn("resume", key.lower())
+                self.assertNotIn("cv", key.lower())
+
+
 class ChannelButtonTests(unittest.TestCase):
     def test_copilot_url_uses_the_deep_link(self):
         url = build_copilot_url(JOB, bot_username="junior_jobs_channel_bot")

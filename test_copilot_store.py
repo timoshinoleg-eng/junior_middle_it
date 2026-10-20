@@ -166,6 +166,24 @@ class CopilotStoreTests(unittest.TestCase):
         store = self._store({"SELECT balance FROM growth_copilot_credits": [(9,)]})
         self.assertEqual(store.get_balance(1), 9)
 
+    def test_ai_report_is_cached(self):
+        store = self._store()
+        self.assertTrue(
+            store.save_ai_report(1, "hash", model="m", answer="answer", used_resume=False)
+        )
+        query, params = self.backend.queries[-1]
+        self.assertIn("growth_copilot_ai_reports", query)
+        self.assertIn("answer", params)
+
+    def test_ai_report_is_read_back(self):
+        store = self._store(
+            {"FROM growth_copilot_ai_reports": [("m", "answer", False, "2026-01-01")]}
+        )
+        report = store.get_ai_report(1, "hash")
+        self.assertEqual(report["model"], "m")
+        self.assertEqual(report["answer"], "answer")
+        self.assertFalse(report["used_resume"])
+
     def test_prune_removes_only_growth_tables(self):
         store = self._store()
         removed = store.prune_expired()
@@ -173,7 +191,8 @@ class CopilotStoreTests(unittest.TestCase):
         for table in removed:
             self.assertTrue(table.startswith("growth_"))
         deletes = [q for q, _ in self.backend.queries if q.upper().startswith("DELETE")]
-        self.assertEqual(len(deletes), 4)
+        self.assertEqual(len(deletes), 5)
+        self.assertIn("growth_copilot_ai_reports", " ".join(deletes))
 
 
 if __name__ == "__main__":
