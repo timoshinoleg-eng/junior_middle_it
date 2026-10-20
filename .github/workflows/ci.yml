@@ -89,7 +89,9 @@ jobs:
              test_copilot_llm \
              test_copilot_forward \
              test_copilot_outcome \
-             test_copilot_upskill
+             test_copilot_upskill \
+             test_copilot_webapp_auth \
+             test_copilot_webapp_api
 
 
 

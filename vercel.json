@@ -18,6 +18,10 @@
     {
       "source": "/api/webhook-admin",
       "destination": "/api/webhook_admin"
+    },
+    {
+      "source": "/copilot",
+      "destination": "/miniapp/index.html"
     }
   ],
   "functions": {

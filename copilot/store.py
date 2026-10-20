@@ -23,6 +23,7 @@ ENRICHMENTS_TABLE = "growth_copilot_enrichments"
 AI_REPORTS_TABLE = "growth_copilot_ai_reports"
 FORWARDED_JOBS_TABLE = "growth_copilot_forwarded_jobs"
 APPLICATIONS_TABLE = "growth_copilot_applications"
+RATE_LIMITS_TABLE = "growth_copilot_rate_limits"
 
 EVALUATION_RETENTION_DAYS = 90
 DOCUMENT_RETENTION_DAYS = 90
@@ -567,6 +568,50 @@ class CopilotStore:
                 (str(stage or ""), int(user_id), str(job_id)),
             )
             return bool(cur.fetchone())
+
+    # ------------------------------------------------------------------
+    # Rate limiting
+    # ------------------------------------------------------------------
+    def bump_rate_limit(
+        self,
+        user_id: int,
+        *,
+        limit: int = 10,
+        window_minutes: int = 10,
+    ) -> Tuple[bool, int]:
+        """Count one request and report whether the caller stays in the limit.
+
+        The window is a fixed one: the counter restarts as soon as the stored
+        window start is older than the window itself.
+        """
+        minutes = max(1, min(int(window_minutes), 120))
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_rate_limits
+                    (user_id, window_start, hits, updated_at)
+                VALUES (%s, NOW(), 1, NOW())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    hits = CASE
+                        WHEN growth_copilot_rate_limits.window_start
+                             > NOW() - (%s * INTERVAL '1 minute')
+                        THEN growth_copilot_rate_limits.hits + 1
+                        ELSE 1
+                    END,
+                    window_start = CASE
+                        WHEN growth_copilot_rate_limits.window_start
+                             > NOW() - (%s * INTERVAL '1 minute')
+                        THEN growth_copilot_rate_limits.window_start
+                        ELSE NOW()
+                    END,
+                    updated_at = NOW()
+                RETURNING hits
+                """,
+                (int(user_id), minutes, minutes),
+            )
+            row = cur.fetchone()
+        hits = int(row[0] or 0) if row else 0
+        return hits <= int(limit), hits
 
     # ------------------------------------------------------------------
     # Credits
