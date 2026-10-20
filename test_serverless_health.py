@@ -226,6 +226,22 @@ class CopilotTableProbeTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             self.assertIsNone(health.copilot_tables_present())
 
+    def test_probe_derives_the_bridge_from_the_public_growth_url(self):
+        env = {
+            "GROWTH_PUBLIC_URL": "https://project.supabase.co/functions/v1/growth-proxy",
+            "TELEGRAM_BOT_TOKEN": "token",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(health._interactive_bridge_url(), self.BRIDGE)
+
+    def test_probe_ignores_a_public_url_of_another_host(self):
+        env = {
+            "GROWTH_PUBLIC_URL": "https://example.com/functions/v1/growth-proxy",
+            "TELEGRAM_BOT_TOKEN": "token",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(health._interactive_bridge_url(), "")
+
     def test_probe_reports_present_tables(self):
         with patch.dict(os.environ, self.ENV, clear=True), patch(
             "serverless_health.urlopen", return_value=_FakeResponse({"rows": [[0]]})
