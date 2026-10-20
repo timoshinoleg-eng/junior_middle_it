@@ -104,6 +104,9 @@ function validateGrowthSql(value: unknown): string {
   const ctes = new Set<string>();
   for (const match of normalized.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(/gi)) ctes.add(match[1].toLowerCase());
 
+  // IS [NOT] DISTINCT FROM compares values; its FROM is not a table reference.
+  // Only adjust the relation scan; security checks still inspect original SQL.
+  const relationScan = normalized.replace(/\bIS\s+(?:NOT\s+)?DISTINCT\s+FROM\b/gi, "IS DISTINCT_FROM");
   const relations: string[] = [];
   const relationPatterns = [
     /\bFROM\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
@@ -112,7 +115,7 @@ function validateGrowthSql(value: unknown): string {
     /\bDELETE\s+FROM\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
     /\bUPDATE\s+(?!SET\b)((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
   ];
-  for (const pattern of relationPatterns) for (const match of normalized.matchAll(pattern)) relations.push(match[1].toLowerCase());
+  for (const pattern of relationPatterns) for (const match of relationScan.matchAll(pattern)) relations.push(match[1].toLowerCase());
   if (!relations.length) return "";
 
   for (const relation of relations) {
