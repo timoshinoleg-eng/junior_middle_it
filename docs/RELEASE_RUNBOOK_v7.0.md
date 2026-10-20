@@ -503,6 +503,28 @@ curl.exe -s -w "`nHTTP %{http_code}`n" -X POST https://junior-middle-it.vercel.a
 
 # Шаг 4. End-to-end чек-лист в Telegram
 
+## 4.0 Автоматическая проверка одной командой
+
+В репозитории лежит готовый верификатор релиза — он проверяет все поверхности и печатает матрицу `OK / FAIL / SKIP`:
+
+```powershell
+cd <корень репозитория>
+python tools\verify_release_v7.py
+```
+
+Без секретов проверяются: контракт `/api/health`, доставка Mini App, гейт подписи `initData` и обе Edge-функции. Проверки миграций, флагов Vercel и фикса валидатора требуют `SUPABASE_ACCESS_TOKEN`, `VERCEL_TOKEN` и `GROWTH_BRIDGE_KEY` соответственно — без них они помечаются как `SKIP`, а не как ошибка:
+
+```powershell
+$env:SUPABASE_ACCESS_TOKEN = "<PAT Supabase>"   # проверка таблиц P9-P12
+$env:VERCEL_TOKEN         = "<токен Vercel>"     # проверка флагов production
+$env:GROWTH_BRIDGE_KEY    = "<ключ Render-моста>"# проверка правки валидатора
+python tools\verify_release_v7.py
+```
+
+Ожидаемый результат после всех трёх шагов — **ноль `FAIL` и ноль `SKIP`**. Машиночитаемый вывод: `python tools\verify_release_v7.py --json`.
+
+## 4.1 Ручной чек-лист в Telegram
+
 1. Открыть **@junior_jobs_channel_bot**, отправить `/copilot` — приходит карточка разбора с fit-score и кнопками.
 2. В карточке есть кнопка **«🖥 Открыть Mini App»** — она появляется только при `COPILOT_WEBAPP_ENABLED=true` и заданном `COPILOT_WEBAPP_URL`. BotFather и `setChatMenuButton` не нужны: кнопка inline с `web_app` (direct link), Telegram подписывает `initData` токеном бота автоматически.
 3. Mini App открывается, показывает вкладки Fit / Резюме / Поиск.
