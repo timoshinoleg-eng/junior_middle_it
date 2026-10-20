@@ -36,6 +36,7 @@ _REALISM = {
 }
 
 _BADGES = {
+    # Both sides are known: the title and the requirements can be compared.
     (GRADE_JUNIOR, GRADE_JUNIOR): "Уровень соответствует заголовку",
     (GRADE_JUNIOR, GRADE_MIDDLE): "Junior в заголовке, по требованиям — middle",
     (GRADE_JUNIOR, GRADE_SENIOR): "Junior в заголовке, по требованиям — senior+",
@@ -45,6 +46,16 @@ _BADGES = {
     (GRADE_SENIOR, GRADE_JUNIOR): "Уровень ниже заголовка",
     (GRADE_SENIOR, GRADE_MIDDLE): "Уровень ниже заголовка",
     (GRADE_SENIOR, GRADE_SENIOR): "Уровень соответствует заголовку",
+    # The requirements do not reveal a level, so only the title is known.
+    (GRADE_JUNIOR, GRADE_UNKNOWN): "Junior в заголовке, по требованиям уровень не уточнён",
+    (GRADE_MIDDLE, GRADE_UNKNOWN): "Middle в заголовке, по требованиям уровень не уточнён",
+    (GRADE_SENIOR, GRADE_UNKNOWN): "Senior+ в заголовке, по требованиям уровень не уточнён",
+    # The title has no level, but the requirements do.
+    (GRADE_UNKNOWN, GRADE_JUNIOR): "В заголовке уровень не указан, по требованиям — junior",
+    (GRADE_UNKNOWN, GRADE_MIDDLE): "В заголовке уровень не указан, по требованиям — middle",
+    (GRADE_UNKNOWN, GRADE_SENIOR): "В заголовке уровень не указан, по требованиям — senior+",
+    # Neither side reveals a level.
+    (GRADE_UNKNOWN, GRADE_UNKNOWN): "Уровень в заголовке не указан",
 }
 
 
@@ -94,6 +105,8 @@ def audit_grade(job: Dict) -> GradeAudit:
         signals.append(f"Требуется опыт: {years} г.")
     if real == GRADE_SENIOR and years is not None and years >= 5:
         signals.append("Порог senior+ по опыту")
+    if real == GRADE_UNKNOWN and declared != GRADE_UNKNOWN:
+        signals.append("По требованиям уровень не уточнён")
 
     is_fake = declared in (GRADE_JUNIOR, GRADE_MIDDLE) and real == GRADE_SENIOR
     if is_fake:

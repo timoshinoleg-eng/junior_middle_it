@@ -57,6 +57,35 @@ class GradeAuditTests(unittest.TestCase):
         audit = grade_audit.audit_grade(job)
         self.assertTrue(audit.signals)
 
+    def test_badge_does_not_claim_that_the_title_has_no_level(self):
+        job = {
+            "title": "Junior Backend Engineer (Python) - Remote",
+            "description": "Python, FastAPI, Docker, PostgreSQL.",
+        }
+        audit = grade_audit.audit_grade(job)
+        self.assertEqual(audit.declared_grade, fit.GRADE_JUNIOR)
+        self.assertEqual(audit.real_grade, fit.GRADE_UNKNOWN)
+        self.assertNotIn("не указан", audit.badge_text)
+        self.assertIn("Junior", audit.badge_text)
+
+    def test_badge_reports_the_requirements_when_the_title_has_no_level(self):
+        job = {"title": "Backend Engineer", "description": "Python, Postgres. Опыт 4+ лет."}
+        audit = grade_audit.audit_grade(job)
+        self.assertEqual(audit.declared_grade, fit.GRADE_UNKNOWN)
+        self.assertEqual(audit.real_grade, fit.GRADE_MIDDLE)
+        self.assertIn("middle", audit.badge_text)
+
+    def test_unclear_requirements_are_reported_as_a_signal(self):
+        job = {"title": "Junior Python Developer", "description": "Python, FastAPI."}
+        audit = grade_audit.audit_grade(job)
+        self.assertIn("По требованиям уровень не уточнён", audit.signals)
+
+    def test_every_grade_pair_has_its_own_badge(self):
+        grades = (fit.GRADE_JUNIOR, fit.GRADE_MIDDLE, fit.GRADE_SENIOR, fit.GRADE_UNKNOWN)
+        for declared in grades:
+            for real in grades:
+                self.assertIn((declared, real), grade_audit._BADGES)
+
 
 if __name__ == "__main__":
     unittest.main()
