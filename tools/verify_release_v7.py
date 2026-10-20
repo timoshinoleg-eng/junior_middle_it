@@ -229,6 +229,33 @@ def json_body(payload: Dict[str, object]) -> bytes:
 # --------------------------------------------------------------------------- #
 # Checks
 # --------------------------------------------------------------------------- #
+def check_copilot_tables(results: List[Dict[str, str]], payload: Optional[Dict[str, object]]) -> None:
+    """The table state reported by the production health endpoint."""
+    state = payload.get("copilot") if payload else None
+    tables = state.get("tables") if isinstance(state, dict) else None
+    if tables is True:
+        results.append(
+            {"name": "prod.copilot_tables", "status": PASS, "detail": "the migrations are applied"}
+        )
+        return
+    if tables is False:
+        results.append(
+            {
+                "name": "prod.copilot_tables",
+                "status": FAIL,
+                "detail": "the tables of P9-P12 are missing",
+            }
+        )
+        return
+    results.append(
+        {
+            "name": "prod.copilot_tables",
+            "status": SKIP,
+            "detail": "the table state is unknown",
+        }
+    )
+
+
 def check_health(results: List[Dict[str, str]]) -> Optional[Dict[str, object]]:
     status, body = http(PROD_BASE + "/api/health")
     if status != 200:
@@ -571,6 +598,7 @@ def run_checks() -> List[Dict[str, str]]:
     results: List[Dict[str, str]] = []
     payload = check_health(results)
     check_copilot_rollout(results, payload)
+    check_copilot_tables(results, payload)
     check_miniapp(results)
     check_signature_gate(results)
     check_edge_health(results)

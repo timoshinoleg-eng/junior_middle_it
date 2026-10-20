@@ -4,6 +4,7 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import serverless_health as health
 
@@ -12,11 +13,16 @@ GROWTH_URL = "https://project.supabase.co/functions/v1/growth-proxy"
 
 
 class _FakeResponse:
+    status = 200
+
     def __init__(self, payload):
         self._payload = json.dumps(payload).encode("utf-8")
 
     def read(self, _limit):
         return self._payload
+
+    def getcode(self):
+        return self.status
 
     def __enter__(self):
         return self
@@ -188,7 +194,7 @@ class CopilotRolloutTests(unittest.TestCase):
         self.assertNotIn("junior-middle-it.vercel.app", rendered)
         self.assertNotIn("super-secret-token", rendered)
         for value in state.values():
-            self.assertIsInstance(value, bool)
+            self.assertIn(value, (True, False, None))
 
     def test_readiness_carries_the_rollout_state(self):
         with patch.dict(os.environ, {"COPILOT_ENABLED": "true"}, clear=True):
@@ -196,6 +202,64 @@ class CopilotRolloutTests(unittest.TestCase):
         self.assertIn("copilot", state)
         self.assertTrue(state["copilot"]["enabled"])
         self.assertFalse(state["copilot"]["llm"])
+
+
+class CopilotTableProbeTests(unittest.TestCase):
+    BRIDGE = "https://project.supabase.co/functions/v1/interactive-growth-proxy"
+    ENV = {
+        "GROWTH_DATABASE_URL": BRIDGE,
+        "GROWTH_HTTP_AUTH_MODE": "telegram",
+        "TELEGRAM_BOT_TOKEN": "token",
+    }
+
+    def test_probe_is_unknown_without_the_bridge(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(health.copilot_tables_present())
+
+    def test_probe_is_unknown_without_the_bot_token(self):
+        env = {key: value for key, value in self.ENV.items() if key != "TELEGRAM_BOT_TOKEN"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(health.copilot_tables_present())
+
+    def test_probe_ignores_a_direct_database_url(self):
+        env = {**self.ENV, "GROWTH_DATABASE_URL": "postgresql://user:pass@db/postgres"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(health.copilot_tables_present())
+
+    def test_probe_reports_present_tables(self):
+        with patch.dict(os.environ, self.ENV, clear=True), patch(
+            "serverless_health.urlopen", return_value=_FakeResponse({"rows": [[0]]})
+        ):
+            self.assertTrue(health.copilot_tables_present())
+
+    def test_probe_reports_missing_tables(self):
+        error = HTTPError(
+            self.BRIDGE, 503, "unavailable", {}, io.BytesIO(b'{"error":"query failed"}')
+        )
+        with patch.dict(os.environ, self.ENV, clear=True), patch(
+            "serverless_health.urlopen", side_effect=error
+        ):
+            self.assertFalse(health.copilot_tables_present())
+
+    def test_probe_is_unknown_when_the_bridge_refuses_the_token(self):
+        error = HTTPError(self.BRIDGE, 401, "unauthorized", {}, io.BytesIO(b'{"error":"unauthorized"}'))
+        with patch.dict(os.environ, self.ENV, clear=True), patch(
+            "serverless_health.urlopen", side_effect=error
+        ):
+            self.assertIsNone(health.copilot_tables_present())
+
+    def test_probe_is_unknown_when_the_bridge_is_unreachable(self):
+        with patch.dict(os.environ, self.ENV, clear=True), patch(
+            "serverless_health.urlopen", side_effect=OSError("edge unreachable")
+        ):
+            self.assertIsNone(health.copilot_tables_present())
+
+    def test_rollout_reports_the_table_state(self):
+        with patch.dict(os.environ, self.ENV, clear=True), patch(
+            "serverless_health.urlopen", return_value=_FakeResponse({"rows": [[0]]})
+        ):
+            state = health.copilot_rollout()
+        self.assertTrue(state["tables"])
 
 
 if __name__ == "__main__":
