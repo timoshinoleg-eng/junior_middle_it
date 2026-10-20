@@ -197,5 +197,23 @@ class ValidatorVersionTests(unittest.TestCase):
         self.assertTrue(problems)
 
 
+class CopilotValidatorCheckTests(unittest.TestCase):
+    def _run(self, payload):
+        results = []
+        verify.check_copilot_validator(results, payload)
+        return results[0]
+
+    def test_accepted_validator_passes(self):
+        self.assertEqual(self._run({"copilot": {"validator_ok": True}})["status"], verify.PASS)
+
+    def test_rejected_validator_fails(self):
+        entry = self._run({"copilot": {"validator_ok": False}})
+        self.assertEqual(entry["status"], verify.FAIL)
+        self.assertIn("credit statement", entry["detail"])
+
+    def test_unknown_validator_is_skipped(self):
+        self.assertEqual(self._run({"copilot": {"validator_ok": None}})["status"], verify.SKIP)
+
+
 if __name__ == "__main__":
     unittest.main()
