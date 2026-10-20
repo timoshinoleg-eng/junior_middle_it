@@ -277,6 +277,43 @@ class CopilotTableProbeTests(unittest.TestCase):
             state = health.copilot_rollout()
         self.assertTrue(state["tables"])
 
+    def test_validator_probe_accepts_the_credit_statement(self):
+        with patch.dict(os.environ, self.ENV, clear=True), patch(
+            "serverless_health.urlopen", return_value=_FakeResponse({"rows": [[0]]})
+        ):
+            self.assertTrue(health.copilot_validator_accepted())
+
+    def test_validator_probe_reports_an_old_build(self):
+        error = HTTPError(
+            self.BRIDGE, 400, "bad request", {}, io.BytesIO(b'{"error":"query rejected"}')
+        )
+        with patch.dict(os.environ, self.ENV, clear=True), patch(
+            "serverless_health.urlopen", side_effect=error
+        ):
+            self.assertFalse(health.copilot_validator_accepted())
+
+    def test_validator_probe_is_unknown_without_the_bridge(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(health.copilot_validator_accepted())
+
+    def test_rollout_reports_the_validator_state(self):
+        with patch.dict(os.environ, self.ENV, clear=True), patch(
+            "serverless_health.urlopen", return_value=_FakeResponse({"rows": [[0]]})
+        ):
+            state = health.copilot_rollout()
+        self.assertTrue(state["validator_ok"])
+
+    def test_rollout_skips_the_validator_probe_without_tables(self):
+        error = HTTPError(
+            self.BRIDGE, 503, "unavailable", {}, io.BytesIO(b'{"error":"query failed"}')
+        )
+        with patch.dict(os.environ, self.ENV, clear=True), patch(
+            "serverless_health.urlopen", side_effect=error
+        ):
+            state = health.copilot_rollout()
+        self.assertFalse(state["tables"])
+        self.assertIsNone(state["validator_ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

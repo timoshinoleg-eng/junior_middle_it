@@ -256,6 +256,37 @@ def check_copilot_tables(results: List[Dict[str, str]], payload: Optional[Dict[s
     )
 
 
+def check_copilot_validator(results: List[Dict[str, str]], payload: Optional[Dict[str, object]]) -> None:
+    """Whether the deployed Edge validator accepts the credit statement."""
+    state = payload.get("copilot") if payload else None
+    accepted = state.get("validator_ok") if isinstance(state, dict) else None
+    if accepted is True:
+        results.append(
+            {
+                "name": "prod.copilot_validator",
+                "status": PASS,
+                "detail": "the credit statement is accepted",
+            }
+        )
+        return
+    if accepted is False:
+        results.append(
+            {
+                "name": "prod.copilot_validator",
+                "status": FAIL,
+                "detail": "the deployed Edge validator rejects the credit statement",
+            }
+        )
+        return
+    results.append(
+        {
+            "name": "prod.copilot_validator",
+            "status": SKIP,
+            "detail": "the validator state is unknown",
+        }
+    )
+
+
 def check_health(results: List[Dict[str, str]]) -> Optional[Dict[str, object]]:
     status, body = http(PROD_BASE + "/api/health")
     if status != 200:
@@ -599,6 +630,7 @@ def run_checks() -> List[Dict[str, str]]:
     payload = check_health(results)
     check_copilot_rollout(results, payload)
     check_copilot_tables(results, payload)
+    check_copilot_validator(results, payload)
     check_miniapp(results)
     check_signature_gate(results)
     check_edge_health(results)

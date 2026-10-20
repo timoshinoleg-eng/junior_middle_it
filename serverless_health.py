@@ -51,7 +51,9 @@ def copilot_rollout() -> Dict[str, object]:
         key: _flag_enabled(name) for key, name in COPILOT_ROLLOUT_FLAGS
     }
     state["webapp_url"] = _present("COPILOT_WEBAPP_URL")
-    state["tables"] = copilot_tables_present()
+    tables = copilot_tables_present()
+    state["tables"] = tables
+    state["validator_ok"] = copilot_validator_accepted() if tables is True else None
     state["ready"] = bool(state.get("enabled")) and bool(state.get("webapp"))
     return state
 
@@ -118,6 +120,49 @@ def copilot_tables_present() -> Optional[bool]:
         if int(exc.code) == 503 and "query failed" in payload:
             # The bridge answered, the database refused the statement: a table
             # of the migrations is missing.
+            return False
+        return None
+    except Exception:
+        return None
+
+
+# The read-only twin of the statement that grants the daily free credits. It
+# has the same shape, so the Edge validator treats it exactly like the real
+# one, but it selects from a row that does not exist and changes nothing.
+_COPILOT_VALIDATOR_PROBE = (
+    "SELECT balance FROM growth_copilot_credits "
+    "WHERE user_id = 0 AND free_granted_on IS DISTINCT FROM CURRENT_DATE"
+)
+
+
+def copilot_validator_accepted() -> Optional[bool]:
+    """Whether the deployed Edge validator accepts the credit statement.
+
+    The validator of the bridge reads the FROM of an ``IS DISTINCT FROM``
+    comparison as a table reference unless the build knows better. An old
+    build therefore rejects the whole statement, and the daily free credits
+    are never granted - the CV build of a real user fails.
+
+    ``None`` means "unknown": the probe could not reach the bridge.
+    """
+    endpoint = _interactive_bridge_url()
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    if not endpoint or not token:
+        return None
+    body = json.dumps({"query": _COPILOT_VALIDATOR_PROBE, "params": []}).encode("utf-8")
+    request = Request(
+        endpoint,
+        data=body,
+        headers={"Content-Type": "application/json", "x-telegram-bot-token": token},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=_PROBE_TIMEOUT) as response:
+            return int(getattr(response, "status", 200)) == 200
+    except HTTPError as exc:
+        payload = exc.read().decode("utf-8", "replace")
+        if int(exc.code) == 400 and "query rejected" in payload:
+            # The validator rejected the statement - the deployed build is old.
             return False
         return None
     except Exception:
