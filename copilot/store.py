@@ -264,6 +264,62 @@ class CopilotStore:
         return {"source_url": str(row[0] or ""), "text": str(row[1] or ""), "fetched_at": row[2]}
 
     # ------------------------------------------------------------------
+    # Generated document cache
+    # ------------------------------------------------------------------
+    def save_document(
+        self,
+        user_id: int,
+        job_id: str,
+        *,
+        telegram_file_id: str,
+        filename: str,
+        fit_score: int = 0,
+    ) -> bool:
+        """Remember the generated CV so a repeated tap sends the cached file."""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_documents
+                    (user_id, job_id, telegram_file_id, filename, fit_score, created_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (user_id, job_id) DO UPDATE SET
+                    telegram_file_id = EXCLUDED.telegram_file_id,
+                    filename = EXCLUDED.filename,
+                    fit_score = EXCLUDED.fit_score,
+                    created_at = NOW()
+                RETURNING job_id
+                """,
+                (
+                    int(user_id),
+                    str(job_id),
+                    str(telegram_file_id or ""),
+                    str(filename or ""),
+                    int(fit_score),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def get_document(self, user_id: int, job_id: str) -> Optional[Dict]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT telegram_file_id, filename, fit_score, created_at
+                FROM growth_copilot_documents
+                WHERE user_id = %s AND job_id = %s
+                """,
+                (int(user_id), str(job_id)),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "telegram_file_id": str(row[0] or ""),
+            "filename": str(row[1] or ""),
+            "fit_score": int(row[2] or 0),
+            "created_at": row[3],
+        }
+
+    # ------------------------------------------------------------------
     # Credits
     # ------------------------------------------------------------------
     def ensure_credit_row(self, user_id: int) -> None:
