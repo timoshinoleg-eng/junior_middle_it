@@ -107,6 +107,9 @@ function validatePrivateGrowthSql(value: unknown): string {
     ctes.add(match[1].toLowerCase());
   }
 
+  // IS [NOT] DISTINCT FROM compares values; its FROM is not a table reference.
+  // Only adjust the relation scan; security checks still inspect original SQL.
+  const relationScan = normalized.replace(/\bIS\s+(?:NOT\s+)?DISTINCT\s+FROM\b/gi, "IS DISTINCT_FROM");
   const relations: string[] = [];
   const relationPatterns = [
     /\bFROM\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
@@ -118,7 +121,7 @@ function validatePrivateGrowthSql(value: unknown): string {
     /\bCREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+[A-Za-z_][A-Za-z0-9_]*\s+ON\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)/gi,
   ];
   for (const pattern of relationPatterns) {
-    for (const match of normalized.matchAll(pattern)) relations.push(match[1].toLowerCase());
+    for (const match of relationScan.matchAll(pattern)) relations.push(match[1].toLowerCase());
   }
   if (!relations.length) return "";
 
