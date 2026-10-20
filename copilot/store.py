@@ -21,12 +21,16 @@ CREDIT_EVENTS_TABLE = "growth_copilot_credit_events"
 GRADE_AUDITS_TABLE = "growth_copilot_grade_audits"
 ENRICHMENTS_TABLE = "growth_copilot_enrichments"
 AI_REPORTS_TABLE = "growth_copilot_ai_reports"
+FORWARDED_JOBS_TABLE = "growth_copilot_forwarded_jobs"
+APPLICATIONS_TABLE = "growth_copilot_applications"
 
 EVALUATION_RETENTION_DAYS = 90
 DOCUMENT_RETENTION_DAYS = 90
 GRADE_AUDIT_RETENTION_DAYS = 45
 ENRICHMENT_RETENTION_DAYS = 14
 AI_REPORT_RETENTION_DAYS = 14
+FORWARDED_JOB_RETENTION_DAYS = 30
+APPLICATION_RETENTION_DAYS = 180
 
 
 class CopilotStoreUnavailable(RuntimeError):
@@ -383,6 +387,188 @@ class CopilotStore:
         }
 
     # ------------------------------------------------------------------
+    # Forwarded vacancies
+    # ------------------------------------------------------------------
+    def save_forwarded_job(
+        self,
+        job_hash: str,
+        *,
+        title: str = "",
+        company: str = "",
+        url: str = "",
+        text: str = "",
+    ) -> bool:
+        """Remember a vacancy the user forwarded into the private chat.
+
+        The text is a public vacancy posting, never a resume: the forward
+        handler refuses resume-like texts before they reach this method.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_forwarded_jobs
+                    (job_hash, title, company, url, text, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (job_hash) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    company = EXCLUDED.company,
+                    url = EXCLUDED.url,
+                    text = EXCLUDED.text,
+                    updated_at = NOW()
+                RETURNING job_hash
+                """,
+                (
+                    str(job_hash),
+                    str(title or ""),
+                    str(company or ""),
+                    str(url or ""),
+                    str(text or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def get_forwarded_job(self, job_hash: str) -> Optional[Dict]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT job_hash, title, company, url, text, created_at
+                FROM growth_copilot_forwarded_jobs
+                WHERE job_hash = %s
+                """,
+                (str(job_hash),),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "job_hash": str(row[0] or ""),
+            "title": str(row[1] or ""),
+            "company": str(row[2] or ""),
+            "url": str(row[3] or ""),
+            "text": str(row[4] or ""),
+            "created_at": row[5],
+        }
+
+    # ------------------------------------------------------------------
+    # Application tracker
+    # ------------------------------------------------------------------
+    def save_application(
+        self,
+        user_id: int,
+        job_id: str,
+        *,
+        company: str = "",
+        title: str = "",
+    ) -> bool:
+        """Mark that the user sent an application; a repeat tap restarts it."""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_applications
+                    (user_id, job_id, company, title, stage, sent_at,
+                     reminded_at, answered_at, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, 'sent', NOW(), NULL, NULL, NOW(), NOW())
+                ON CONFLICT (user_id, job_id) DO UPDATE SET
+                    company = EXCLUDED.company,
+                    title = EXCLUDED.title,
+                    stage = 'sent',
+                    sent_at = NOW(),
+                    reminded_at = NULL,
+                    answered_at = NULL,
+                    updated_at = NOW()
+                RETURNING job_id
+                """,
+                (
+                    int(user_id),
+                    str(job_id),
+                    str(company or ""),
+                    str(title or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def get_application(self, user_id: int, job_id: str) -> Optional[Dict]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT job_id, company, title, stage, sent_at, reminded_at, answered_at
+                FROM growth_copilot_applications
+                WHERE user_id = %s AND job_id = %s
+                """,
+                (int(user_id), str(job_id)),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "job_id": str(row[0] or ""),
+            "company": str(row[1] or ""),
+            "title": str(row[2] or ""),
+            "stage": str(row[3] or ""),
+            "sent_at": row[4],
+            "reminded_at": row[5],
+            "answered_at": row[6],
+        }
+
+    def list_applications_due(self, *, days: int = 7, limit: int = 100) -> List[Dict]:
+        """Applications that are old enough to ask about, and not asked yet."""
+        wait = max(1, min(int(days), 90))
+        rows_limit = max(1, min(int(limit), 500))
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT user_id, job_id, company, title, stage, sent_at
+                FROM growth_copilot_applications
+                WHERE stage = 'sent'
+                  AND reminded_at IS NULL
+                  AND sent_at <= NOW() - (%s * INTERVAL '1 day')
+                ORDER BY sent_at ASC
+                LIMIT %s
+                """,
+                (wait, rows_limit),
+            )
+            rows = cur.fetchall()
+        out: List[Dict] = []
+        for row in rows or []:
+            out.append(
+                {
+                    "user_id": int(row[0] or 0),
+                    "job_id": str(row[1] or ""),
+                    "company": str(row[2] or ""),
+                    "title": str(row[3] or ""),
+                    "stage": str(row[4] or ""),
+                    "sent_at": row[5],
+                }
+            )
+        return out
+
+    def mark_application_reminded(self, user_id: int, job_id: str) -> bool:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE growth_copilot_applications
+                SET reminded_at = NOW(), updated_at = NOW()
+                WHERE user_id = %s AND job_id = %s
+                RETURNING job_id
+                """,
+                (int(user_id), str(job_id)),
+            )
+            return bool(cur.fetchone())
+
+    def set_application_stage(self, user_id: int, job_id: str, stage: str) -> bool:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE growth_copilot_applications
+                SET stage = %s, answered_at = NOW(), updated_at = NOW()
+                WHERE user_id = %s AND job_id = %s
+                RETURNING stage
+                """,
+                (str(stage or ""), int(user_id), str(job_id)),
+            )
+            return bool(cur.fetchone())
+
+    # ------------------------------------------------------------------
     # Credits
     # ------------------------------------------------------------------
     def ensure_credit_row(self, user_id: int) -> None:
@@ -515,6 +701,16 @@ class CopilotStore:
                 AI_REPORTS_TABLE,
                 f"DELETE FROM {AI_REPORTS_TABLE} "
                 f"WHERE created_at < NOW() - INTERVAL '{AI_REPORT_RETENTION_DAYS} days'",
+            ),
+            (
+                FORWARDED_JOBS_TABLE,
+                f"DELETE FROM {FORWARDED_JOBS_TABLE} "
+                f"WHERE created_at < NOW() - INTERVAL '{FORWARDED_JOB_RETENTION_DAYS} days'",
+            ),
+            (
+                APPLICATIONS_TABLE,
+                f"DELETE FROM {APPLICATIONS_TABLE} "
+                f"WHERE created_at < NOW() - INTERVAL '{APPLICATION_RETENTION_DAYS} days'",
             ),
         )
         for table, statement in statements:

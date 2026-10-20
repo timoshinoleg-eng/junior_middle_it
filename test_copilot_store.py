@@ -191,8 +191,11 @@ class CopilotStoreTests(unittest.TestCase):
         for table in removed:
             self.assertTrue(table.startswith("growth_"))
         deletes = [q for q, _ in self.backend.queries if q.upper().startswith("DELETE")]
-        self.assertEqual(len(deletes), 5)
-        self.assertIn("growth_copilot_ai_reports", " ".join(deletes))
+        self.assertEqual(len(deletes), 7)
+        joined = " ".join(deletes)
+        self.assertIn("growth_copilot_ai_reports", joined)
+        self.assertIn("growth_copilot_forwarded_jobs", joined)
+        self.assertIn("growth_copilot_applications", joined)
 
 
 if __name__ == "__main__":

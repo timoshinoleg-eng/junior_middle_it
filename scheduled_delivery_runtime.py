@@ -107,6 +107,7 @@ async def run_daily_delivery(*, runtime_factory=build_runtime) -> Dict:
         "channel_sent": 0,
         "personal_targets": 0,
         "personal_jobs": 0,
+        "followups": 0,
         "skipped_receipts": 0,
         "unresolved": 0,
     }
@@ -150,6 +151,18 @@ async def run_daily_delivery(*, runtime_factory=build_runtime) -> Dict:
                         ledger.complete("daily_personal", period, uid, int(count or 0))
                     except Exception:
                         result["unresolved"] += 1
+
+            # The application follow-up reuses this scheduler: no new cron.
+            try:
+                import copilot_webhook_runtime as copilot_runtime
+
+                followups = await copilot_runtime.run_followup_reminders(
+                    job_bot, application, db, ledger
+                )
+                result["followups"] = int((followups or {}).get("sent") or 0)
+                result["skipped_receipts"] += int((followups or {}).get("skipped") or 0)
+            except Exception:
+                result["followups"] = 0
     finally:
         db.close()
     # At-most-once ambiguity is surfaced for operations but must not induce an
