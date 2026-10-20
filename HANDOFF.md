@@ -79,6 +79,7 @@
 | Интерактивный бот (webhook) | Vercel `/api/webhook` | работает |
 | Интерактивный бот (long polling) | Render | **выключен**: нет `TELEGRAM_BOT_TOKEN`, fail-closed |
 | Mini App API | Vercel `/api/copilot` | ждёт применения миграций и регистрации URL |
+| Релиз v7.0, ручные шаги | [`docs/RELEASE_RUNBOOK_v7.0.md`](docs/RELEASE_RUNBOOK_v7.0.md) | миграции P9–P12, деплой Edge-функций, флаги в production |
 
 ## Порядок запуска (для новой сессии)
 
