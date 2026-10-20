@@ -16,9 +16,43 @@ POSTING_REQUIRED_ENV = ("TELEGRAM_BOT_TOKEN", "CHANNEL_ID", "CRON_SECRET")
 _PUBLIC_JOBS_LIMIT = 300
 _PUBLIC_JOBS_TIMEOUT = 5.0
 
+# The Copilot rollout finishes with three manual steps - the migrations, the
+# Edge deploy and the production flags. None of them can be observed from the
+# outside without credentials, so the health payload reports the state as
+# booleans. No value, URL or secret ever leaves this module.
+COPILOT_ROLLOUT_FLAGS = (
+    ("enabled", "COPILOT_ENABLED"),
+    ("pdf", "COPILOT_PDF_ENABLED"),
+    ("forward", "COPILOT_FORWARD_ENABLED"),
+    ("outcome", "COPILOT_OUTCOME_ENABLED"),
+    ("upskill", "COPILOT_UPSKILL_ENABLED"),
+    ("webapp", "COPILOT_WEBAPP_ENABLED"),
+    ("llm", "COPILOT_LLM_ENABLED"),
+)
+_TRUTHY = {"1", "true", "yes", "on"}
+
 
 def _present(name: str) -> bool:
     return bool((os.getenv(name) or "").strip())
+
+
+def _flag_enabled(name: str) -> bool:
+    raw = str(os.getenv(name) or "").strip().lower()
+    return bool(raw) and raw in _TRUTHY
+
+
+def copilot_rollout() -> Dict[str, object]:
+    """Report which Copilot features are switched on in this deployment.
+
+    The result is a set of booleans, so the payload can be published without
+    exposing a secret or an internal URL.
+    """
+    state: Dict[str, object] = {
+        key: _flag_enabled(name) for key, name in COPILOT_ROLLOUT_FLAGS
+    }
+    state["webapp_url"] = _present("COPILOT_WEBAPP_URL")
+    state["ready"] = bool(state.get("enabled")) and bool(state.get("webapp"))
+    return state
 
 
 def missing_posting_env() -> List[str]:
@@ -144,6 +178,7 @@ def readiness(*, include_publication_counters: bool = False) -> Dict[str, object
         "durable_growth": durable_growth,
         "public_acquisition_ready": public_acquisition_ready,
         "missing_required": missing,
+        "copilot": copilot_rollout(),
     }
     if include_publication_counters:
         payload["publication"] = publication_counters()

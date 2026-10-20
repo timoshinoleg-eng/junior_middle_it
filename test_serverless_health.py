@@ -145,5 +145,58 @@ class ServerlessHealthTests(unittest.TestCase):
             )
 
 
+class CopilotRolloutTests(unittest.TestCase):
+    def test_rollout_is_off_without_the_flags(self):
+        with patch.dict(os.environ, {}, clear=True):
+            state = health.copilot_rollout()
+        self.assertFalse(state["enabled"])
+        self.assertFalse(state["webapp"])
+        self.assertFalse(state["webapp_url"])
+        self.assertFalse(state["ready"])
+
+    def test_rollout_reports_the_switched_on_features(self):
+        env = {
+            "COPILOT_ENABLED": "true",
+            "COPILOT_PDF_ENABLED": "true",
+            "COPILOT_FORWARD_ENABLED": "true",
+            "COPILOT_OUTCOME_ENABLED": "true",
+            "COPILOT_UPSKILL_ENABLED": "true",
+            "COPILOT_WEBAPP_ENABLED": "true",
+            "COPILOT_WEBAPP_URL": "https://junior-middle-it.vercel.app/copilot",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            state = health.copilot_rollout()
+        self.assertTrue(state["enabled"])
+        self.assertTrue(state["pdf"])
+        self.assertTrue(state["forward"])
+        self.assertTrue(state["outcome"])
+        self.assertTrue(state["upskill"])
+        self.assertTrue(state["webapp"])
+        self.assertTrue(state["webapp_url"])
+        self.assertTrue(state["ready"])
+
+    def test_rollout_never_exposes_a_value_or_a_secret(self):
+        env = {
+            "COPILOT_ENABLED": "true",
+            "COPILOT_WEBAPP_ENABLED": "true",
+            "COPILOT_WEBAPP_URL": "https://junior-middle-it.vercel.app/copilot",
+            "TELEGRAM_BOT_TOKEN": "super-secret-token",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            state = health.copilot_rollout()
+        rendered = repr(state)
+        self.assertNotIn("junior-middle-it.vercel.app", rendered)
+        self.assertNotIn("super-secret-token", rendered)
+        for value in state.values():
+            self.assertIsInstance(value, bool)
+
+    def test_readiness_carries_the_rollout_state(self):
+        with patch.dict(os.environ, {"COPILOT_ENABLED": "true"}, clear=True):
+            state = health.readiness()
+        self.assertIn("copilot", state)
+        self.assertTrue(state["copilot"]["enabled"])
+        self.assertFalse(state["copilot"]["llm"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,18 +4,43 @@
 
 ## Что уже сделано и проверено
 
+Снимок состояния на 2026-10-20. Значения счётчиков меняются сами, остальные строки — факты о коде.
+
 | Проверка | Результат |
 |---|---|
-| `main` | `930eeb3` = `053608ee` + `6a6978b` (валидатор `growth-proxy`) + PR #60 (валидатор `interactive-growth-proxy`) |
-| PR #53–#58 | все смержены в `main`, CI зелёный на 3.12/3.13 |
+| `main` | все шесть этапов плана (PR #53–#58) + правка валидатора `growth-proxy` (`6a6978b`) + PR #60 (`interactive-growth-proxy`) + PR #61 (runbook) + PR #62 (верификатор) + PR #63 (бейдж грейда и дымовой прогон) |
+| PR #53–#63 | все смержены в `main`, CI зелёный на 3.12/3.13 |
 | Production Smoke на `main` | `success` |
-| `GET /api/health` | 200, `durable_growth: true`, `missing_required: []`, `published_7d: 50` |
+| `GET /api/health` | 200, `durable_growth: true`, `missing_required: []`, `published_7d: 46` (счётчик растёт) |
 | `GET /copilot` | 200, HTML Mini App (2308 байт) |
 | `GET /miniapp/app.js` | 200 (8536 байт) |
 | `POST /api/copilot` с подделанным `initData` | 401 «Сессия недействительна. Открой приложение заново.» |
 | `GET growth-proxy/health` | 200 `{"ok":true,"render_bridge":true}` |
+| Локальные тесты | 572 теста / 56 модулей — OK |
+| Дымовой прогон ядра | 101 живая вакансия, 0 проблем, детерминированность соблюдена |
 
 Осталось три шага: **миграции P9–P12** → **деплой Edge-функций с правкой валидатора** → **флаги Copilot в production + передеплой**.
+
+## Как убедиться, что развёртывание завершено — без единого секрета
+
+Три публичных сигнала, по одному на каждый ручной шаг (кроме миграций — их видно только изнутри базы):
+
+| Шаг | Сигнал | Ожидаемое значение |
+|---|---|---|
+| 2. Edge-функции | `GET .../functions/v1/growth-proxy/health` → поле `validator` | `2` |
+| 2. Edge-функции | `GET .../functions/v1/interactive-growth-proxy/health` | 200, `validator: 2` |
+| 3. Флаги | `GET /api/health` → секция `copilot` | `enabled`, `pdf`, `forward`, `outcome`, `upskill`, `webapp` — все `true` |
+
+Версия валидатора `2` означает, что задеплоена сборка, понимающая `IS [NOT] DISTINCT FROM` как сравнение значений, а не как ссылку на таблицу. Секция `copilot` в health содержит только булевы — ни значения, ни URL, ни секретов.
+
+Быстрая проверка одной командой:
+
+```powershell
+curl.exe -s https://junior-middle-it.vercel.app/api/health | Select-String -Pattern 'copilot'
+curl.exe -s https://uucjptyqfsdzqsftgiro.supabase.co/functions/v1/growth-proxy/health
+curl.exe -s https://uucjptyqfsdzqsftgiro.supabase.co/functions/v1/interactive-growth-proxy/health
+```
+
 
 ## Порядок выполнения
 
@@ -521,7 +546,7 @@ $env:GROWTH_BRIDGE_KEY    = "<ключ Render-моста>"# проверка п�
 python tools\verify_release_v7.py
 ```
 
-Ожидаемый результат после всех трёх шагов — **ноль `FAIL` и ноль `SKIP`**. Машиночитаемый вывод: `python tools\verify_release_v7.py --json`.
+Ожидаемый результат после всех трёх шагов — **ноль `FAIL` и ноль `SKIP`**. До этого момента верификатор честно показывает незакрытые шаги: `prod.copilot_rollout` — флаги ещё выключены, `edge.*.validator` — Edge-функции ещё не передеплоены. Машиночитаемый вывод: `python tools\verify_release_v7.py --json`.
 
 Детерминированное ядро Copilot можно проверить и вообще без секретов — на живых вакансиях из публичной проекции Edge:
 

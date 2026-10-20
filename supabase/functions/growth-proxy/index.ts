@@ -8,6 +8,10 @@ const PROTOCOL_V2 = 2;
 const RENDER_BRIDGE_KEY_SHA256 = "cbd26e6af077ca9b8ccb7baae4555ab5a90e2b4a8c824a3df9c5c174e720b213";
 const MAX_PRIVATE_SQL_BYTES = 40_000;
 const MAX_PRIVATE_SQL_PARAMS = 80;
+// Bumped whenever the private SQL validator changes. Version 2 understands
+// "IS [NOT] DISTINCT FROM" as a scalar comparison instead of a table
+// reference, so an operator can see from the outside which build is deployed.
+const VALIDATOR_VERSION = 2;
 const sql = postgres(DB_URL, { prepare: false, max: 1, idle_timeout: 20, connect_timeout: 10 });
 const telegramAuthCache = new Map<string, number>();
 
@@ -400,6 +404,7 @@ Deno.serve(async (req: Request) => {
       service: "growth-proxy",
       protocol: PROTOCOL_V2,
       render_bridge: Boolean(RENDER_BRIDGE_KEY_SHA256),
+      validator: VALIDATOR_VERSION,
     }), { status: DB_URL ? 200 : 503, headers: jsonHeaders });
   }
   if (req.method === "GET" && url.pathname.endsWith("/public-jobs")) return publicJobs(url);

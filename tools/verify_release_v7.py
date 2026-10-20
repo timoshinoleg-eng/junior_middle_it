@@ -3,15 +3,17 @@
 One command that checks every surface of the release:
 
 * the production health contract and the Mini App delivery;
+* the published state of the Copilot rollout - the feature flags of the
+  production environment, so the last manual step is observable from the
+  outside;
+* the deployed validator version of both Edge growth bridges, so the Edge
+  deploy is observable without credentials;
 * the Mini App API signature gate - a forged ``initData`` must stay a 401;
-* both Edge growth bridges, including the ``IS DISTINCT FROM`` validator fix;
-* the P9-P12 Copilot tables and their privileges (needs a Supabase access token);
-* the Copilot feature flags of the Vercel production environment and whether the
-  last production deployment is newer than them (needs a Vercel token).
+* the P9-P12 Copilot tables and their privileges (needs a Supabase access token).
 
 Credentials are optional. A check that needs one is reported as skipped instead
 of failed, so the script always ends with a readable matrix and a stable exit
-code: 0 when nothing failed, 1 otherwise.
+code: 0 when the rollout is finished, 1 while a step is still open.
 
 The script only reads. It never writes to Telegram, never posts to the channel
 and never changes an environment.
@@ -72,6 +74,21 @@ EXPECTED_FLAGS = {
 VALIDATOR_PROBE = (
     "SELECT balance FROM growth_copilot_credits "
     "WHERE user_id = 1 AND free_granted_on IS DISTINCT FROM CURRENT_DATE"
+)
+
+# Version of the private SQL validator. Version 2 understands
+# "IS [NOT] DISTINCT FROM" as a scalar comparison instead of a table
+# reference, so the deployed Edge build is observable without credentials.
+EXPECTED_VALIDATOR_VERSION = 2
+
+# Features that have to be switched on when the rollout is finished.
+REQUIRED_ROLLOUT_FLAGS = (
+    "enabled",
+    "pdf",
+    "forward",
+    "outcome",
+    "upskill",
+    "webapp",
 )
 
 PASS = "pass"
@@ -155,6 +172,34 @@ def deployment_problems(deployment_created: Optional[int], env_created: Dict[str
     return problems
 
 
+def rollout_problems(state: object) -> List[str]:
+    """Problems of the published Copilot rollout state."""
+    if not isinstance(state, dict):
+        return ["the health payload has no copilot section"]
+    problems: List[str] = []
+    for name in REQUIRED_ROLLOUT_FLAGS:
+        if state.get(name) is not True:
+            problems.append("%s is not switched on" % name)
+    if state.get("webapp_url") is not True:
+        problems.append("COPILOT_WEBAPP_URL is not set")
+    if state.get("llm") is True:
+        problems.append("the LLM layer is switched on without a provider key")
+    return problems
+
+
+def validator_version_problems(payload: object) -> List[str]:
+    """Problems of the validator version reported by an Edge function."""
+    if not isinstance(payload, dict):
+        return ["the health response is not JSON"]
+    version = payload.get("validator")
+    if version != EXPECTED_VALIDATOR_VERSION:
+        return [
+            "validator is %r, expected %r - the Edge function was not redeployed"
+            % (version, EXPECTED_VALIDATOR_VERSION)
+        ]
+    return []
+
+
 # --------------------------------------------------------------------------- #
 # Network helpers
 # --------------------------------------------------------------------------- #
@@ -184,16 +229,16 @@ def json_body(payload: Dict[str, object]) -> bytes:
 # --------------------------------------------------------------------------- #
 # Checks
 # --------------------------------------------------------------------------- #
-def check_health(results: List[Dict[str, str]]) -> None:
+def check_health(results: List[Dict[str, str]]) -> Optional[Dict[str, object]]:
     status, body = http(PROD_BASE + "/api/health")
     if status != 200:
         results.append({"name": "prod.health", "status": FAIL, "detail": "HTTP %s" % status})
-        return
+        return None
     try:
         payload = json.loads(body)
     except ValueError:
         results.append({"name": "prod.health", "status": FAIL, "detail": "response is not JSON"})
-        return
+        return None
     problems = health_problems(payload)
     results.append(
         {
@@ -202,6 +247,57 @@ def check_health(results: List[Dict[str, str]]) -> None:
             "detail": "; ".join(problems) if problems else "ready",
         }
     )
+    return payload
+
+
+def check_copilot_rollout(results: List[Dict[str, str]], payload: Optional[Dict[str, object]]) -> None:
+    if payload is None:
+        results.append(
+            {
+                "name": "prod.copilot_rollout",
+                "status": FAIL,
+                "detail": "the health payload is unreachable",
+            }
+        )
+        return
+    problems = rollout_problems(payload.get("copilot"))
+    results.append(
+        {
+            "name": "prod.copilot_rollout",
+            "status": FAIL if problems else PASS,
+            "detail": "; ".join(problems) if problems else "all features are switched on",
+        }
+    )
+
+
+def check_validator_versions(results: List[Dict[str, str]]) -> None:
+    for name, path in (
+        ("edge.growth_bridge.validator", "/growth-proxy/health"),
+        ("edge.interactive_bridge.validator", "/interactive-growth-proxy/health"),
+    ):
+        status, body = http(EDGE_BASE + path)
+        if status != 200:
+            results.append(
+                {
+                    "name": name,
+                    "status": FAIL,
+                    "detail": "HTTP %s - the Edge function was not redeployed" % status,
+                }
+            )
+            continue
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            results.append({"name": name, "status": FAIL, "detail": "response is not JSON"})
+            continue
+        problems = validator_version_problems(payload)
+        results.append(
+            {
+                "name": name,
+                "status": FAIL if problems else PASS,
+                "detail": "; ".join(problems) if problems else "validator %s" % payload.get("validator"),
+            }
+        )
 
 
 def check_miniapp(results: List[Dict[str, str]]) -> None:
@@ -473,10 +569,12 @@ def check_vercel_flags(results: List[Dict[str, str]]) -> None:
 
 def run_checks() -> List[Dict[str, str]]:
     results: List[Dict[str, str]] = []
-    check_health(results)
+    payload = check_health(results)
+    check_copilot_rollout(results, payload)
     check_miniapp(results)
     check_signature_gate(results)
     check_edge_health(results)
+    check_validator_versions(results)
     check_interactive_bridge(results)
     check_validator_fix(results)
     check_tables(results)
