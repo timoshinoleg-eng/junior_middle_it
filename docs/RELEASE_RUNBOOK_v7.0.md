@@ -384,6 +384,20 @@ P13 защищает от двойного списания и от возвра
 
 Порядок: остановить и завершить все платные обработчики Telegram и Mini App, применить P13 и P14, проверить backfill, развернуть код, проверить оба транспорта и возобновить трафик. Без подтверждённого реестра новый код закрывает платные операции; legacy-fallback удалён. После отказа probe или 42P01 проверка повторяется не чаще раза в 60 секунд и восстанавливает работу без рестарта. Прочие ошибки реального запроса отклоняют только этот запрос; следующий сразу обращается к БД. Порядок и риски принятия брошенной оплаты описаны в процедуре cutover.
 
+**Заморозка (шаг 1 процедуры) — два флага и редеплой:**
+
+```powershell
+vercel env add COPILOT_ENABLED    production --value false --no-sensitive --force --yes
+vercel env add COPILOT_PDF_ENABLED production --value false --no-sensitive --force --yes
+vercel redeploy --target production
+```
+
+Останова должны быть **доказаны** тремя проверками: `POST /api/copilot/pdf` отвечает 503 `maintenance` (а без подписи — 401), в логах Vercel есть `Copilot paid callback refused: maintenance`, и `growth_copilot_credit_events` не растёт в течение минуты (drain завершён). Только после этого применяются P13 и P14.
+
+**Включение обратно (шаг 7 процедуры) — тоже два флага**, затем редеплой и контролируемый smoke обоих транспортов: платное действие через Mini App API и через Telegram-бота, одна запись `spend` в журнале и строка `delivered` в реестре. Если smoke не прошёл — вернуть флаги в `false`, редеплой, откат деплоя Vercel на предыдущий.
+
+**Проверка схемы:** `tools/verify_release_v7.py` требует и таблицу P13 `growth_copilot_credit_ops`, и колонку P14 `growth_copilot_ai_reports.claim` (тип `text`, `NOT NULL`, default `''`). Без P14 проверка даёт FAIL.
+
 ---
 
 # Шаг 2. Edge-функции: `growth-proxy` и `interactive-growth-proxy`
