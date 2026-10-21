@@ -577,8 +577,11 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
         return
 
     try:
-        manager.ensure_daily_allowance(user_id)
-        if manager.balance(user_id) < 1:
+        operation = llm_operation(store, user_id, job_hash)
+        operation_state = operation.state()
+        if not operation.paid:
+            manager.ensure_daily_allowance(user_id)
+        if not operation.paid and manager.balance(user_id) < 1:
             await query.answer(
                 "Бесплатные AI-разборы на сегодня закончились. "
                 "Пригласи друга — он получит бонус, а ты — +5 кредитов.",
@@ -612,11 +615,21 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
 
     # The claim is owned by this request from here on. Every exit below
     # releases the slot, so a failure of the model, of the cache or of
-    # the delivery never blocks the next request. Releasing the claim of
-    # a delivered answer is a no-op: the release only touches a row that
-    # still holds this claim and no answer, so the report of this attempt
-    # and the report of a newer attempt both stay.
+    # the delivery never blocks the next request. Release deletes an empty
+    # placeholder or clears this token while keeping a cached answer.
+    # A newer attempt's token and report are never changed.
     try:
+        operation.bind_claim(claim)
+        if operation_state == "reserved":
+            try:
+                operation.reserve()
+            except (InsufficientCredits, CreditStoreUnavailable) as exc:
+                logger.warning("Copilot AI reservation adoption refused: %s", type(exc).__name__)
+                await query.message.reply_text(
+                    "AI-разбор уже выполняется или был прерван. Попробуй позже.\n\n"
+                    + format_analysis(job, analysis), disable_web_page_preview=True,
+                )
+                return
         # The slot of the global budget is taken before the call. A call of the
         # model costs the operator even when the user is not charged for it
         # again, and repeated requests for the same vacancy must not pass the
@@ -634,6 +647,10 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
             _release_ai_claim(store, user_id, job_hash, claim)
             await query.answer(
                 "Дневной лимит AI-разборов исчерпан. Попробуй позже.", show_alert=True
+            )
+            await query.message.reply_text(
+                "AI-разбор временно недоступен. Ниже — обычный разбор без нейросети.\n\n"
+                + format_analysis(job, analysis), disable_web_page_preview=True,
             )
             return
 
@@ -658,11 +675,9 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
             return
 
         text = result.as_text()
-        operation = None
         if manager is not None:
             # The analysis is paid for. It is only shown when the credit is
             # confirmed, otherwise the free deterministic report is shown instead.
-            operation = llm_operation(store, user_id, job_hash).bind_claim(claim)
             try:
                 operation.reserve()
             except (InsufficientCredits, CreditStoreUnavailable) as exc:

@@ -107,6 +107,9 @@ class FakeGrowthStore:
     """
 
     def __init__(self):
+        from copilot import store as store_module
+        store_module._CREDIT_OPS_TABLE_MISSING = True
+        store_module._CREDIT_OPS_RETRY_AT = 0.0
         self.credits = {}
         self.initial_balance = 0
         self.granted_today = set()
@@ -168,7 +171,9 @@ class FakeGrowthStore:
         sql = re.sub(r"\s+", " ", str(query)).strip()
         values = list(params or ())
         self._rows = []
-        if sql.startswith("SELECT 1 FROM growth_copilot_credit_ops"):
+        if sql == "SELECT 1 FROM public.growth_copilot_credit_ops LIMIT 1":
+            self._guard("registry")
+        elif sql.startswith("SELECT 1 FROM growth_copilot_credit_ops"):
             uid, ref, kind, attempt = values
             row = self.ops.get((int(uid), str(ref), str(kind)))
             self._rows = [(1,)] if row and row["attempt"] == attempt and row["state"] == "reserved" else []
@@ -179,7 +184,7 @@ class FakeGrowthStore:
         elif sql.startswith("SELECT 1 FROM growth_copilot_ai_reports"):
             uid, ref, claim = values
             row = self.ai_reports.get((int(uid), str(ref)))
-            self._rows = [(1,)] if row and row["model"] == claim else []
+            self._rows = [(1,)] if row and row["claim"] == claim else []
         elif "op_reserved AS" in sql:
             self._guard("debit")
             self._rows = self._reserve_operation(values)
@@ -213,6 +218,8 @@ class FakeGrowthStore:
             self._rows = self._counts(values)
         elif "UPDATE growth_copilot_documents" in sql:
             self._rows = self._save_document(values)
+        elif "WITH empty_slot AS" in sql:
+            self._rows = self._release_ai_claim(values)
         elif "UPDATE growth_copilot_ai_reports" in sql:
             self._rows = self._save_ai_report(values)
         elif "INSERT INTO growth_copilot_documents" in sql and "EXCLUDED.telegram_file_id" in sql:
@@ -228,7 +235,7 @@ class FakeGrowthStore:
             self._rows = self._release_ai_claim(values)
         elif "FROM growth_copilot_ai_reports" in sql:
             self._rows = self._get_ai_report(values)
-        elif "INSERT INTO growth_copilot_ai_reports" in sql and "answer <> ''" in sql:
+        elif "INSERT INTO growth_copilot_ai_reports" in sql and "DO UPDATE" in sql:
             self._guard("ai_claim")
             self._rows = self._claim_ai_report(values)
         elif "INSERT INTO growth_copilot_ai_reports" in sql:
@@ -308,15 +315,22 @@ class FakeGrowthStore:
         user_id = int(values[0])
         ref = str(values[2])
         kind = str(values[3])
-        amount = int(values[4])
+        amount = int(values[20])
         key = self._operation_key(user_id, ref, kind)
         row = self.ops.get(key)
+        if row is not None and row["state"] == "reserved":
+            claim = values[8]
+            if (claim and self.clock - row["clock"] > int(values[7]) * 60
+                    and self._owns_build(user_id, ref, kind, claim)):
+                row["clock"] = self.clock
+                return [(row["attempt"],)]
+            return []
         if row is not None and row["state"] != "released":
             return []
         if self._balance(user_id) < amount:
             return []
         attempt = (row["attempt"] + 1) if row else 1
-        self.ops[key] = {"state": "reserved", "amount": amount, "attempt": attempt}
+        self.ops[key] = {"state": "reserved", "amount": amount, "attempt": attempt, "clock": self.clock}
         self.credits[user_id] = self._balance(user_id) - amount
         self.events.append((user_id, -amount, kind, ref))
         return [(attempt,)]
@@ -345,7 +359,7 @@ class FakeGrowthStore:
         return [(len(self.events),)]
 
     def _owns_build(self, uid, ref, kind, claim):
-        rows, column = (self.documents, "filename") if kind == "spend" else (self.ai_reports, "model")
+        rows, column = (self.documents, "filename") if kind == "spend" else (self.ai_reports, "claim")
         row = rows.get((int(uid), str(ref)))
         return bool(row and row[column] == claim)
 
@@ -520,10 +534,11 @@ class FakeGrowthStore:
         key = (user_id, job_id)
         row = self.ai_reports.get(key)
         stale = row is not None and self.clock - row["clock"] >= stale_minutes * 60.0
-        if row is None or row["answer"] or stale:
+        if row is None or not row["claim"] or stale:
             # A free slot, a stored report or a dead claim may be taken over.
             self.ai_reports[key] = {
-                "model": token,
+                "model": "",
+                "claim": token,
                 "answer": "",
                 "used_resume": False,
                 "clock": self.clock,
@@ -535,8 +550,11 @@ class FakeGrowthStore:
         key = (int(values[0]), str(values[1]))
         token = str(values[2])
         row = self.ai_reports.get(key)
-        if row and not row["answer"] and row["model"] == token:
-            del self.ai_reports[key]
+        if row and row["claim"] == token:
+            if row["answer"]:
+                row["claim"] = ""
+            else:
+                del self.ai_reports[key]
             return [(key[1],)]
         return []
 
@@ -552,11 +570,12 @@ class FakeGrowthStore:
         key = (int(values[3]), str(values[4]))
         claim = str(values[5] or "")
         row = self.ai_reports.get(key)
-        if row is None or row["model"] != claim:
+        if row is None or row["claim"] != claim:
             # Only the owner of the claim may write the answer.
             return []
         self.ai_reports[key] = {
             "model": model,
+            "claim": claim,
             "answer": answer,
             "used_resume": used_resume,
             "clock": self.clock,
@@ -762,19 +781,16 @@ class AttemptBindingTests(unittest.TestCase):
         self.assertEqual(a.mark_unknown(), "unknown")
         self.assertNotIn(credit_ops.REASON_RELEASE, event_reasons(backend))
 
-    def test_legacy_reservation_logs_unknown_attempt_and_keeps_legacy_refund(self):
+    def test_missing_registry_refuses_reservation_without_journal_fallback(self):
         from copilot import store as store_module
         store, backend = make_store(balance=3)
         with patch.object(store_module, "_CREDIT_OPS_TABLE_MISSING", True), patch.object(
             store_module, "_CREDIT_OPS_RETRY_AT", float("inf")
-        ), self.assertLogs(store_module.logger, level="WARNING") as logs:
-            operation = credit_ops.cv_operation(store, 42, JOB["hash"])
-            operation.reserve()
-            self.assertIsNone(operation.attempt)
-            self.assertTrue(operation.can_deliver())
-            self.assertEqual(operation.release(), "released")
+        ):
+            with self.assertRaises(credit_ops.CreditStoreUnavailable):
+                credit_ops.cv_operation(store, 42, JOB["hash"]).reserve()
         self.assertEqual(backend._balance(42), 3)
-        self.assertIn("attempt binding unavailable", " ".join(logs.output))
+        self.assertEqual(backend.events, [])
 
     def test_non_owner_cannot_refund_before_or_after_timeout(self):
         for timeout_first in (False, True):
@@ -863,7 +879,7 @@ class AttemptBindingTests(unittest.TestCase):
             with patch.object(store_module.time, "monotonic", return_value=101.0):
                 with self.assertLogs(store_module.logger, level="WARNING") as logs:
                     self.assertTrue(store._registry_available())
-                self.assertIn("restored", " ".join(logs.output))
+                self.assertIn("confirmed", " ".join(logs.output))
                 self.assertFalse(store_module._CREDIT_OPS_TABLE_MISSING)
                 self.assertTrue(store._registry_available())
                 self.assertEqual(connect.call_count, 1)

@@ -191,7 +191,7 @@ class LLMAccountingTests(unittest.TestCase):
                 self._tap()
         self.assertIs(caught.exception, failure)
         self.assertTrue(replacement[0])
-        self.assertEqual(self.backend.ai_reports[(USER_ID, JOB["hash"])]["model"], replacement[0])
+        self.assertEqual(self.backend.ai_reports[(USER_ID, JOB["hash"])]["claim"], replacement[0])
         self.assertEqual(self.backend._balance(USER_ID), 2)
         self.assertNotIn(credit_ops.REASON_LLM_RELEASE, self._reasons())
 
@@ -203,6 +203,57 @@ class LLMAccountingTests(unittest.TestCase):
         self.assertNotIn(_result().as_text(), self._text(message, query))
         self.assertEqual(self.backend.ai_reports, {})
         self.assertNotIn(credit_ops.REASON_LLM_RELEASE, self._reasons())
+
+    def test_paid_report_at_zero_balance_uses_provider_budget_without_spending(self):
+        for state in ("delivered", "unknown"):
+            with self.subTest(state=state):
+                self.backend.seed_credits(USER_ID, 0)
+                self.backend.ai_reports.clear()
+                self.backend.ops[(USER_ID, JOB["hash"], "llm_call")] = {
+                    "state": state, "attempt": 1, "amount": 1, "clock": self.backend.clock}
+                before = self._reasons().count(copilot_credits.REASON_LLM_ATTEMPT)
+                message, query, db = self._tap()
+                self.assertIn(_result().as_text(), self._text(message, query))
+                self.assertEqual(self.backend._balance(USER_ID), 0)
+                self.assertEqual(self._reasons().count(copilot_credits.REASON_LLM_ATTEMPT), before + 1)
+                self.assertNotIn(credit_ops.REASON_LLM_SPEND, self._reasons())
+
+    def test_paid_report_at_zero_balance_with_exhausted_budget_shows_fallback(self):
+        self.backend.seed_credits(USER_ID, 0)
+        self.backend.ops[(USER_ID, JOB["hash"], "llm_call")] = {
+            "state": "delivered", "attempt": 1, "amount": 1, "clock": 0}
+        with patch.dict(os.environ, {"COPILOT_LLM_DAILY_BUDGET": "0"}):
+            message, query, db = self._tap()
+        self.assertEqual(self.calls, [])
+        self.assertIn("обычный разбор без нейросети", self._text(message, query))
+        self.assertEqual(self.backend._balance(USER_ID), 0)
+        self.assertEqual(self.backend.events, [])
+
+    def test_unknown_registry_state_does_not_call_provider(self):
+        with patch.object(copilot_runtime.CopilotStore, "credit_operation_state", return_value="invalid"):
+            message, query, db = self._tap()
+        self.assertEqual(self.calls, [])
+        self.assertIn("Не удалось проверить кредиты", self._text(message, query))
+        self.assertEqual(self.backend.events, [])
+
+    def test_unpaid_report_at_zero_balance_keeps_free_limit_message(self):
+        self.backend.seed_credits(USER_ID, 0)
+        message, query, db = self._tap()
+        self.assertIn("Бесплатные AI-разборы на сегодня закончились", self._text(message, query))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.backend.events, [])
+
+    def test_abandoned_paid_report_at_zero_balance_is_adopted(self):
+        self.backend.seed_credits(USER_ID, 0)
+        self.backend.ops[(USER_ID, JOB["hash"], "llm_call")] = {
+            "state": "reserved", "attempt": 3, "amount": 1, "clock": 0}
+        self.backend.advance(minutes=20)
+        message, query, db = self._tap()
+        self.assertIn(_result().as_text(), self._text(message, query))
+        self.assertEqual(self.backend.ops[(USER_ID, JOB["hash"], "llm_call")]["state"], "delivered")
+        self.assertEqual(self.backend._balance(USER_ID), 0)
+        self.assertEqual(self._reasons().count(copilot_credits.REASON_LLM_ATTEMPT), 1)
+        self.assertNotIn(credit_ops.REASON_LLM_SPEND, self._reasons())
 
     def test_the_call_of_the_model_is_counted_and_charged_once(self):
         message, _query, _db = self._tap()

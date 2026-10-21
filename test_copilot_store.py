@@ -48,6 +48,8 @@ class FakeConnection:
 
 class FakeGrowthStore:
     def __init__(self, responses=None):
+        copilot_store._CREDIT_OPS_TABLE_MISSING = True
+        copilot_store._CREDIT_OPS_RETRY_AT = 0.0
         self.queries = []
         self.responses = dict(responses or {})
 

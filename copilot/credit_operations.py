@@ -40,7 +40,7 @@ state records that the operation was already paid for.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -174,68 +174,39 @@ class CostedOperation:
             self._state = self._read_state()
         return self._state
 
-    def _event_counts(self) -> Dict[str, int]:
-        try:
-            return self._store.credit_event_counts(
-                self._user_id,
-                (
-                    self._spend_reason,
-                    self._release_reason,
-                    self._delivered_reason,
-                    self._unknown_reason,
-                ),
-                self._ref,
-            )
-        except Exception as exc:
-            raise CreditStoreUnavailable(
-                "credit journal is unavailable: %s" % type(exc).__name__
-            ) from exc
-
     def _read_state(self) -> str:
-        """The state of the operation.
-
-        The state is the row of the operation registry of the store, because
-        that row is the gate of the reservation: the state that is read here
-        is the state that the database used to refuse a second charge. A
-        production without the registry falls back to the journal.
-        """
+        """Only the registry determines whether an operation is paid."""
         try:
             registered = self._store.credit_operation_state(
                 self._user_id, self._ref, self._spend_reason
             )
         except Exception as exc:
-            raise CreditStoreUnavailable(
-                "credit operation is unavailable: %s" % type(exc).__name__
-            ) from exc
-        if registered:
-            return _OP_STATES.get(str(registered), STATE_NEW)
-        counts = self._event_counts()
-        spends = int(counts.get(self._spend_reason, 0))
-        releases = int(counts.get(self._release_reason, 0))
-        if counts.get(self._delivered_reason):
-            return STATE_DELIVERED
-        if counts.get(self._unknown_reason):
-            return STATE_UNKNOWN
-        if spends > releases:
-            return STATE_RESERVED
-        if spends:
-            return STATE_RELEASED
-        return STATE_NEW
+            raise CreditStoreUnavailable("credit operation is unavailable: %s" % type(exc).__name__) from exc
+        if registered is None:
+            return STATE_NEW
+        if registered not in _OP_STATES:
+            raise CreditStoreUnavailable("Unknown credit operation state")
+        return _OP_STATES[registered]
 
     def reserve(self) -> str:
         """Reserve the credit of this operation.
 
         The reservation happens at most once per attempt. Only the object
         that acquired it may settle it; another object observing an open
-        reservation is refused. A paid terminal result may be replayed without
+        reservation may adopt it only with a current claim after it expires.
+        A paid terminal result may be replayed without
         settlement rights. A request after a refund acquires a new attempt.
 
         Raises :class:`InsufficientCredits` when the balance is too low and
         :class:`CreditStoreUnavailable` when the store cannot confirm it.
         """
-        if self._claim and not self._store.owns_claim(
-            self._user_id, self._ref, self._claim, self._spend_reason
-        ):
+        try:
+            owns_claim = not self._claim or self._store.owns_claim(
+                self._user_id, self._ref, self._claim, self._spend_reason
+            )
+        except Exception as exc:
+            raise CreditStoreUnavailable("Build claim could not be confirmed") from exc
+        if not owns_claim:
             raise CreditStoreUnavailable("The build claim was taken over")
         state = self.state()
         if state in (STATE_DELIVERED, STATE_UNKNOWN):
@@ -244,7 +215,6 @@ class CostedOperation:
         if state == STATE_RESERVED:
             if self._reserved_here:
                 return state
-            raise CreditStoreUnavailable("Reservation belongs to another operation")
         try:
             reserved = self._store.reserve_credit(
                 self._user_id,
@@ -252,18 +222,23 @@ class CostedOperation:
                 self._spend_reason,
                 self._ref,
                 release_reason=self._release_reason,
+                claim=self._claim,
             )
         except Exception as exc:
             raise CreditStoreUnavailable(
                 "credit reservation failed: %s" % type(exc).__name__
             ) from exc
         if reserved:
-            self.attempt = None if reserved is True else int(reserved)
+            if isinstance(reserved, bool) or not isinstance(reserved, int) or reserved < 1:
+                raise CreditStoreUnavailable("Reservation returned no attempt")
+            self.attempt = reserved
+            if state == STATE_RESERVED:
+                logger.info("Adopted abandoned credit reservation")
             self._reserved_here = True
             self._state = STATE_RESERVED
             return self._state
         # The store refused. Either the balance was too low or the operation
-        # is already paid for; the journal tells the two apart.
+        # is already paid for; the registry tells the two apart.
         self._state = self._read_state()
         if self._state in (STATE_RESERVED, STATE_DELIVERED, STATE_UNKNOWN):
             raise CreditStoreUnavailable("Reservation belongs to another operation")

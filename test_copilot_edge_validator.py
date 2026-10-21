@@ -6,8 +6,7 @@ is extracted from the deployed source and called with Node. A copy of the
 rules would pass even when the deployed validator refuses a statement, which
 is exactly the defect this test has to catch.
 
-Node is optional: without it the test skips itself and says so, so the normal
-CI run stays green. The check is reproducible with any Node 22.6 or newer:
+Node is optional locally. CI requires it and fails instead of skipping. The check is reproducible with any Node 22.6 or newer:
 
     node --version
     python -m unittest test_copilot_edge_validator -v
@@ -128,6 +127,7 @@ def _run_validator(binary, path: str, name: str, constant: str, queries) -> list
 def _statements():
     """Every statement of the Copilot store that the bridge has to accept."""
     store, backend = credit_cases.make_store(balance=3)
+    store._registry_available()
     operation = credit_ops.cv_operation(store, 42, credit_cases.JOB["hash"])
     operation.reserve()
     operation.release()
@@ -143,7 +143,11 @@ def _statements():
         fit_score=50,
         claim="claim:test",
     )
-    store.claim_ai_report(42, credit_cases.JOB["hash"])
+    ai_claim = store.claim_ai_report(42, credit_cases.JOB["hash"])
+    store.owns_claim(42, credit_cases.JOB["hash"], ai_claim, "llm_call")
+    store.owns_claim(42, credit_cases.JOB["hash"], "claim:test", "spend")
+    store.owns_credit_attempt(42, credit_cases.JOB["hash"], "spend", 1)
+    store.reserve_credit(42, 1, "llm_call", credit_cases.JOB["hash"], claim=ai_claim)
     store.save_ai_report(
         42, credit_cases.JOB["hash"], claim="claim:test", model="m", answer="a"
     )
@@ -175,12 +179,16 @@ class EdgeValidatorTests(unittest.TestCase):
 
     def setUp(self):
         self.binary, self.reason = _node_binary()
+        if not self.binary and os.environ.get("CI"):
+            self.fail(self.reason or "CI must provide Node 22")
         if not self.binary:
             self.skipTest(self.reason or "node is not installed")
 
     def test_the_private_growth_proxy_accepts_every_statement(self):
         statements = _statements()
         self.assertTrue(statements)
+        self.assertTrue(any("FROM public.growth_copilot_credit_ops LIMIT 1" in query for query, _ in statements))
+        self.assertTrue(any("op_adopted AS" in query for query, _ in statements))
         queries = [query for query, _params in statements]
         results = _run_validator(
             self.binary, GROWTH_PROXY, "validatePrivateGrowthSql", "MAX_PRIVATE_SQL_BYTES", queries
@@ -195,6 +203,8 @@ class EdgeValidatorTests(unittest.TestCase):
     def test_the_interactive_growth_proxy_accepts_every_statement(self):
         statements = _statements()
         self.assertTrue(statements)
+        self.assertTrue(any("FROM public.growth_copilot_credit_ops LIMIT 1" in query for query, _ in statements))
+        self.assertTrue(any("op_adopted AS" in query for query, _ in statements))
         queries = [query for query, _params in statements]
         results = _run_validator(
             self.binary, INTERACTIVE_PROXY, "validateGrowthSql", "MAX_SQL_BYTES", queries
@@ -205,6 +215,18 @@ class EdgeValidatorTests(unittest.TestCase):
             if not result
         ]
         self.assertEqual(refused, [], "the interactive bridge would refuse: %s" % refused[:1])
+
+    def test_registry_probe_has_a_relation_on_both_bridges(self):
+        for path, name, constant in (
+            (GROWTH_PROXY, "validatePrivateGrowthSql", "MAX_PRIVATE_SQL_BYTES"),
+            (INTERACTIVE_PROXY, "validateGrowthSql", "MAX_SQL_BYTES"),
+        ):
+            results = _run_validator(self.binary, path, name, constant, [
+                "SELECT to_regclass('public.growth_copilot_credit_ops')",
+                "SELECT 1 FROM public.growth_copilot_credit_ops LIMIT 1",
+            ])
+            self.assertEqual(results[0], "")
+            self.assertTrue(results[1])
 
     def test_the_validator_really_refuses_a_forbidden_statement(self):
         """The negative control of the two tests above.

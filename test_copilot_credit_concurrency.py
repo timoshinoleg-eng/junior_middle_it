@@ -117,12 +117,14 @@ CREATE TABLE IF NOT EXISTS public.growth_copilot_ai_reports (
     user_id BIGINT NOT NULL,
     job_id TEXT NOT NULL,
     model TEXT NOT NULL DEFAULT '',
+    claim TEXT NOT NULL DEFAULT '',
     answer TEXT NOT NULL DEFAULT '',
     used_resume BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (user_id, job_id)
 );
+ALTER TABLE public.growth_copilot_ai_reports ADD COLUMN IF NOT EXISTS claim TEXT NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS public.growth_copilot_rate_limits (
     user_id BIGINT PRIMARY KEY,
     window_start TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -724,6 +726,8 @@ class CreditConcurrencyTests(unittest.TestCase):
 
     def setUp(self):
         dsn = os.environ.get(DSN_ENV)
+        if not dsn and os.environ.get("CI"):
+            self.fail("CI must provide COPILOT_TEST_PG_DSN")
         if not dsn:
             self.skipTest("%s is not set: no PostgreSQL for the concurrency check" % DSN_ENV)
         from psycopg.conninfo import conninfo_to_dict
@@ -731,6 +735,115 @@ class CreditConcurrencyTests(unittest.TestCase):
         if not dbname or any(word in dbname for word in ("prod", "production", "main", "junior")):
             self.fail("COPILOT_TEST_PG_DSN must name a dedicated test database")
         self.dsn = dsn
+
+    def _abandoned(self, kind, *, stale=True):
+        import psycopg
+        _reset(self.dsn)
+        store = _store(self.dsn)
+        self.addCleanup(store._store.close)
+        claim_fn = (lambda: store.claim_document(USER_ID, REF, "cv.pdf")) if kind == "spend" else (lambda: store.claim_ai_report(USER_ID, REF))
+        first = claim_fn()
+        a = CostedOperation(store, USER_ID, REF, spend_reason=kind).bind_claim(first)
+        a.reserve()
+        (_make_claim_stale if kind == "spend" else _make_ai_claim_stale)(self.dsn)
+        if stale:
+            with psycopg.connect(self.dsn, autocommit=True) as conn:
+                conn.execute("UPDATE growth_copilot_credit_ops SET updated_at = NOW() - INTERVAL '1 hour'")
+        second = claim_fn()
+        self.assertTrue(second)
+        self.assertNotEqual(first, second)
+        b = CostedOperation(store, USER_ID, REF, spend_reason=kind).bind_claim(second)
+        return store, a, b, second
+
+    def test_abandoned_reservation_is_adopted_without_second_spend(self):
+        for kind in ("spend", "llm_call"):
+            with self.subTest(kind=kind):
+                store, a, b, claim = self._abandoned(kind)
+                self.assertEqual(b.reserve(), "reserved")
+                self.assertEqual(b.attempt, a.attempt)
+                self.assertTrue(b.can_deliver())
+                self.assertEqual(b.confirm(), "delivered")
+                self.assertEqual(_operations(self.dsn), [(REF, kind, "delivered", 1)])
+                self.assertEqual(_balance(self.dsn), BALANCE - 1)
+                self.assertEqual(sum(reason == kind for reason, _, _ in _journal(self.dsn)), 1)
+
+    def test_adopted_ambiguous_delivery_keeps_credit_spent(self):
+        for kind in ("spend", "llm_call"):
+            with self.subTest(kind=kind):
+                store, a, b, claim = self._abandoned(kind)
+                b.reserve()
+                self.assertEqual(b.mark_unknown(), "unknown")
+                self.assertEqual(_operations(self.dsn), [(REF, kind, "unknown", 1)])
+                self.assertEqual(_balance(self.dsn), BALANCE - 1)
+                self.assertEqual(sum(delta for _, delta, _ in _journal(self.dsn)), -1)
+
+    def test_fresh_reservation_cannot_be_adopted(self):
+        for kind in ("spend", "llm_call"):
+            with self.subTest(kind=kind):
+                store, a, b, claim = self._abandoned(kind, stale=False)
+                with self.assertRaises(CreditStoreUnavailable):
+                    b.reserve()
+                self.assertEqual(_balance(self.dsn), BALANCE - 1)
+                self.assertEqual(len(_journal(self.dsn)), 1)
+
+    def test_adoption_blocks_old_owners_settlement(self):
+        for kind in ("spend", "llm_call"):
+            with self.subTest(kind=kind):
+                store, a, b, claim = self._abandoned(kind)
+                b.reserve()
+                journal = _journal(self.dsn)
+                for settle in (a.confirm, a.release, a.mark_unknown):
+                    with self.assertRaises(CreditStoreUnavailable):
+                        settle()
+                self.assertFalse(a.can_deliver())
+                self.assertEqual(_journal(self.dsn), journal)
+                self.assertEqual(_operations(self.dsn), [(REF, kind, "reserved", 1)])
+                self.assertEqual(_balance(self.dsn), BALANCE - 1)
+
+    def test_parallel_adoption_is_exclusive(self):
+        for kind in ("spend", "llm_call"):
+            with self.subTest(kind=kind):
+                store, a, b, claim = self._abandoned(kind)
+                self.assertFalse(store.reserve_credit(USER_ID, 1, kind, REF, claim="claim:wrong"))
+                def adopt(other):
+                    return other.reserve_credit(USER_ID, 1, kind, REF, claim=claim)
+                results = _parallel(self.dsn, [adopt, adopt])
+                self.assertEqual(sum(value is not False for value in results), 1)
+                self.assertEqual(_balance(self.dsn), BALANCE - 1)
+                self.assertEqual(len(_journal(self.dsn)), 1)
+                self.assertFalse(store.reserve_credit(USER_ID, 1, kind, REF, claim="claim:wrong"))
+
+    def test_p14_migration_is_idempotent_and_cleans_legacy_model_tokens(self):
+        import psycopg
+        from pathlib import Path
+        _reset(self.dsn)
+        migration = (Path(__file__).parent / "supabase/migrations/20261021070000_p14_copilot_ai_report_claim.sql").read_text(encoding="utf-8")
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            conn.execute("INSERT INTO growth_copilot_ai_reports (user_id, job_id, model) VALUES (%s, %s, %s)",
+                         (USER_ID, REF, "claim:legacy"))
+            conn.execute(migration)
+            conn.execute(migration)
+            row = conn.execute("SELECT model, claim FROM growth_copilot_ai_reports WHERE user_id = %s AND job_id = %s",
+                               (USER_ID, REF)).fetchone()
+        self.assertEqual(row, ("", ""))
+
+    def test_ai_claim_survives_save_and_resume_slot_reopens(self):
+        _reset(self.dsn)
+        store = _store(self.dsn)
+        self.addCleanup(store._store.close)
+        for used_resume in (False, True):
+            with self.subTest(used_resume=used_resume):
+                claim = store.claim_ai_report(USER_ID, REF)
+                self.assertTrue(claim)
+                self.assertTrue(store.save_ai_report(USER_ID, REF, claim=claim,
+                    model="test-model", answer="private" if used_resume else "answer", used_resume=used_resume))
+                self.assertTrue(store.owns_claim(USER_ID, REF, claim, "llm_call"))
+                self.assertEqual(store.get_ai_report(USER_ID, REF)["model"], "test-model")
+                if used_resume:
+                    self.assertEqual(store.get_ai_report(USER_ID, REF)["answer"], "")
+                self.assertTrue(store.release_ai_report_claim(USER_ID, REF, claim))
+                self.assertFalse(store.owns_claim(USER_ID, REF, claim, "llm_call"))
+        self.assertTrue(store.claim_ai_report(USER_ID, REF))
 
     def test_reject_b_then_timeout_a_keeps_credit_spent(self):
         _reset(self.dsn)
