@@ -126,6 +126,55 @@ class LLMAccountingTests(unittest.TestCase):
         )
 
     # -- the call of the provider ----------------------------------
+    def test_ai_proven_delivery_rejection_releases_credit(self):
+        from telegram.error import BadRequest
+        failure = BadRequest("message rejected")
+        with patch.object(FakeMessage, "reply_text", side_effect=failure):
+            with self.assertRaises(BadRequest) as caught:
+                self._tap()
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(self.backend.ops[(USER_ID, JOB["hash"], "llm_call")]["state"], "released")
+        self.assertEqual(self.backend._balance(USER_ID), 3)
+        self.assertEqual(self._reasons().count(credit_ops.REASON_LLM_SPEND), 1)
+        self.assertEqual(self._reasons().count(credit_ops.REASON_LLM_RELEASE), 1)
+        self.assertNotIn(credit_ops.REASON_LLM_UNKNOWN, self._reasons())
+        self.assertEqual(self.backend.ai_reports, {})
+
+    def test_ai_ambiguous_delivery_keeps_credit_unknown(self):
+        failure = TimeoutError("delivery timeout")
+        with patch.object(FakeMessage, "reply_text", side_effect=failure):
+            with self.assertRaises(TimeoutError) as caught:
+                self._tap()
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(self.backend.ops[(USER_ID, JOB["hash"], "llm_call")]["state"], "unknown")
+        self.assertEqual(self.backend._balance(USER_ID), 2)
+        self.assertEqual(self._reasons().count(credit_ops.REASON_LLM_UNKNOWN), 1)
+        self.assertNotIn(credit_ops.REASON_LLM_RELEASE, self._reasons())
+        self.assertEqual(self.backend.ai_reports, {})
+
+    def test_ai_delivered_answer_confirms_one_spend(self):
+        message, query, db = self._tap()
+        self.assertIn(_result().as_text(), self._text(message, query))
+        self.assertEqual(self.backend.ops[(USER_ID, JOB["hash"], "llm_call")]["state"], "delivered")
+        self.assertEqual(self.backend._balance(USER_ID), 2)
+        self.assertEqual(self._reasons().count(credit_ops.REASON_LLM_SPEND), 1)
+        self.assertEqual(self._reasons().count(credit_ops.REASON_LLM_DELIVERED), 1)
+        self.assertNotIn(credit_ops.REASON_LLM_RELEASE, self._reasons())
+
+    def test_retry_after_ai_refund_does_not_start_another_paid_attempt(self):
+        from telegram.error import BadRequest
+        with patch.object(FakeMessage, "reply_text", side_effect=BadRequest("message rejected")):
+            with self.assertRaises(BadRequest):
+                self._tap()
+        before = list(self.backend.events)
+        message, query, db = self._tap()
+        self.assertIn("обычный разбор без нейросети", self._text(message, query))
+        self.assertNotIn(_result().as_text(), self._text(message, query))
+        self.assertEqual(self.backend.ops[(USER_ID, JOB["hash"], "llm_call")]["state"], "released")
+        self.assertEqual(self.backend._balance(USER_ID), 3)
+        self.assertEqual(self.backend.events, before)
+        self.assertEqual(len(self.calls), 1)
+
     def test_takeover_after_reservation_sends_no_ai_answer_or_settlement(self):
         original = credit_ops.CostedOperation.reserve
 

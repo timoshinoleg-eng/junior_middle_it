@@ -13,9 +13,8 @@
 -- the state of an operation lives in one row of this table now, and the
 -- database itself refuses a second reservation of the same attempt.
 --
--- The table is additive: the code of a production without it keeps the old
--- statements, so the migration can be applied before the deploy and the
--- deploy can be rolled back without losing anything.
+-- The table is additive. Keep paid traffic frozen during migration and cutover.
+-- Audit legacy references before P13; unmapped references require owner approval.
 --
 -- Privacy invariant: the table holds the reference of a vacancy, the state of
 -- the operation and the amount of the credit. It never holds a resume, a
@@ -59,6 +58,7 @@ WITH spends AS (
         COUNT(*) AS spends
     FROM public.growth_copilot_credit_events
     WHERE reason IN ('spend', 'llm_call')
+      AND ref ~ '^[0-9a-f]{40}$'
     GROUP BY user_id, ref, reason
 ),
 releases AS (
@@ -72,6 +72,7 @@ releases AS (
         COUNT(*) AS releases
     FROM public.growth_copilot_credit_events
     WHERE reason IN ('spend_release', 'llm_call_release')
+      AND ref ~ '^[0-9a-f]{40}$'
     GROUP BY user_id, ref, reason
 ),
 states AS (
@@ -121,4 +122,5 @@ SELECT
     NOW()
 FROM states
 WHERE state <> 'released'
+  AND ref ~ '^[0-9a-f]{40}$'
 ON CONFLICT (user_id, ref, kind) DO NOTHING;

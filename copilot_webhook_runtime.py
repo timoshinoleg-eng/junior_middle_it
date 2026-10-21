@@ -583,6 +583,14 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
     try:
         operation = llm_operation(store, user_id, job_hash)
         operation_state = operation.state()
+        if operation_state == "released":
+            # A refunded AI request must not silently start another paid attempt.
+            await query.answer("Показываю обычный разбор")
+            await query.message.reply_text(
+                "AI-разбор был прерван. Ниже — обычный разбор без нейросети.\n\n"
+                + format_analysis(job, analysis), disable_web_page_preview=True,
+            )
+            return
         if not operation.paid:
             manager.ensure_daily_allowance(user_id)
         if not operation.paid and manager.balance(user_id) < 1:
@@ -710,9 +718,8 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
         except Exception as exc:
             logger.warning("Copilot AI delivery failed: %s", type(exc).__name__)
             if operation is not None:
-                # The answer is lost, so the credit stays spent: the analysis may
-                # have reached the user anyway.
-                settle_delivery_safely(operation, DELIVERY_UNKNOWN)
+                # Only a proven Telegram rejection permits a refund.
+                settle_delivery_safely(operation, _telegram_delivery_outcome(exc))
             raise
         if operation is not None:
             settle_delivery_safely(operation, DELIVERY_DELIVERED)

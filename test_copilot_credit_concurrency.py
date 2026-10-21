@@ -736,6 +736,30 @@ class CreditConcurrencyTests(unittest.TestCase):
         validate_test_dsn(dsn)
         cls.dsn = dsn
 
+    def test_p13_backfill_ignores_unmapped_refs_and_audit_finds_them(self):
+        import psycopg
+        from pathlib import Path
+        from tools.verify_release_v7 import HISTORICAL_CREDIT_REFS_QUERY, EMPTY_CREDIT_REFS_QUERY
+        _reset(self.dsn)
+        migration = (Path(__file__).parent / "supabase/migrations/20261021060000_p13_copilot_credit_operations.sql").read_text(encoding="utf-8")
+        backfill = "WITH spends AS (" + migration.split("WITH spends AS (", 1)[1]
+        valid_ref = "a" * 40
+        refs = ("cv", "pdf", "", "legacy-ref", "A" * 40, valid_ref)
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            for ref in refs:
+                conn.execute("INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref) VALUES (%s, -1, 'spend', %s)", (USER_ID, ref))
+            legacy = conn.execute(HISTORICAL_CREDIT_REFS_QUERY).fetchall()
+            empty = conn.execute(EMPTY_CREDIT_REFS_QUERY).fetchall()
+            self.assertEqual({row[0] for row in legacy}, {"cv", "pdf", "legacy-ref", "A" * 40})
+            self.assertEqual([(row[0], row[2]) for row in empty], [("", 1)])
+            conn.execute(backfill)
+            conn.execute(backfill)
+            rows = conn.execute("SELECT ref, kind, state, attempt FROM growth_copilot_credit_ops").fetchall()
+            self.assertEqual(rows, [(valid_ref, "spend", "reserved", 1)])
+            conn.execute("DELETE FROM growth_copilot_credit_events WHERE ref <> %s", (valid_ref,))
+            self.assertEqual(conn.execute(HISTORICAL_CREDIT_REFS_QUERY).fetchall(), [])
+            self.assertEqual(conn.execute(EMPTY_CREDIT_REFS_QUERY).fetchall(), [])
+
     def _abandoned(self, kind, *, stale=True):
         import psycopg
         _reset(self.dsn)

@@ -56,6 +56,48 @@ EXPECTED_TABLES = (
     "growth_copilot_rate_limits",
 )
 
+HISTORICAL_CREDIT_REFS_QUERY = """SELECT ref, reason, count(*) AS events,
+       min(created_at) AS first_seen, max(created_at) AS last_seen
+FROM public.growth_copilot_credit_events
+WHERE ref IS DISTINCT FROM ''
+  AND ref !~ '^[0-9a-f]{40}$'
+GROUP BY ref, reason
+ORDER BY events DESC;"""
+
+EMPTY_CREDIT_REFS_QUERY = """SELECT ref, reason, count(*) AS events,
+       min(created_at) AS first_seen, max(created_at) AS last_seen
+FROM public.growth_copilot_credit_events
+WHERE ref = '' OR ref IS NULL
+GROUP BY ref, reason
+ORDER BY events DESC;"""
+
+
+def check_historical_credit_refs(results, url, headers):
+    """Stop cutover before P13 when journal references cannot map to job hashes."""
+    for name, query in (("supabase.copilot_legacy_refs", HISTORICAL_CREDIT_REFS_QUERY),
+                        ("supabase.copilot_empty_refs", EMPTY_CREDIT_REFS_QUERY)):
+        status, body = http(url, method="POST", headers=headers, body=json_body({"query": query}))
+        try:
+            rows = json.loads(body) if status == 200 else None
+            if not isinstance(rows, list):
+                raise ValueError("invalid audit response")
+            findings = []
+            for row in rows:
+                ref = row["ref"]
+                events = int(row["events"])
+                if events < 1:
+                    raise ValueError("invalid event count")
+                # Do not print arbitrary historical refs: they may contain private data.
+                label = repr(ref) if ref in ("cv", "pdf", "", None) else "<unmapped reference>"
+                findings.append("%s: %d events" % (label, events))
+            detail = ("Pre-P13 release blocked; owner-approved mapping required: " + "; ".join(findings)) if findings else "Pre-P13 reference audit passed"
+            result = FAIL if findings else PASS
+        except (ValueError, TypeError, KeyError, OverflowError):
+            detail = "Pre-P13 reference audit not confirmed (HTTP %s); release blocked" % status
+            result = FAIL
+        results.append({"name": name, "status": result, "detail": detail})
+
+
 EXPECTED_P14_CLAIM_COLUMN = {
     "table_name": "growth_copilot_ai_reports", "column_name": "claim",
     "data_type": "text", "is_nullable": "NO", "column_default": "''::text",
@@ -526,9 +568,13 @@ def check_tables(results: List[Dict[str, str]]) -> None:
         results.append(
             {"name": "supabase.copilot_tables", "status": SKIP, "detail": "SUPABASE_ACCESS_TOKEN is not set"}
         )
+        for name in ("supabase.copilot_legacy_refs", "supabase.copilot_empty_refs"):
+            results.append({"name": name, "status": FAIL,
+                            "detail": "Pre-P13 reference audit requires SUPABASE_ACCESS_TOKEN; release blocked"})
         return
     url = "https://api.supabase.com/v1/projects/%s/database/query" % SUPABASE_PROJECT_REF
     headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+    check_historical_credit_refs(results, url, headers)
     check_p14_column(results, url, headers)
     table_query = (
         "SELECT c.relname AS table_name, c.relrowsecurity AS rls_enabled "

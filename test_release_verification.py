@@ -280,3 +280,78 @@ class P14IntegrationTests(unittest.TestCase):
         statuses = {row["name"]: row["status"] for row in results}
         self.assertEqual(statuses["supabase.copilot_tables"], verify.PASS)
         self.assertEqual(statuses["supabase.copilot_p14_claim"], verify.FAIL)
+
+
+class HistoricalCreditReferenceTests(unittest.TestCase):
+    def test_legacy_cv_and_pdf_references_block_release(self):
+        findings = [{"ref": "cv", "reason": "spend", "events": 3}, {"ref": "pdf", "reason": "spend", "events": 2}]
+        results = []
+        with patch.object(verify, "http", side_effect=[(200, json.dumps(findings)), (200, "[]")]):
+            verify.check_historical_credit_refs(results, "https://example.test", {})
+        self.assertEqual(results[0]["status"], verify.FAIL)
+        self.assertIn("'cv': 3 events", results[0]["detail"])
+        self.assertIn("'pdf': 2 events", results[0]["detail"])
+        self.assertEqual(results[1]["status"], verify.PASS)
+
+    def test_clean_or_hash_only_journal_passes_reference_audit(self):
+        # Both SELECTs return no findings for an empty or hash-only journal.
+        results = []
+        with patch.object(verify, "http", return_value=(200, "[]")):
+            verify.check_historical_credit_refs(results, "https://example.test", {})
+        self.assertEqual([row["status"] for row in results], [verify.PASS, verify.PASS])
+
+    def test_empty_reference_blocks_release_in_separate_result(self):
+        results = []
+        with patch.object(verify, "http", side_effect=[(200, "[]"), (200, json.dumps([{"ref": "", "reason": "spend", "events": 4}]))]):
+            verify.check_historical_credit_refs(results, "https://example.test", {})
+        self.assertEqual(results[0]["status"], verify.PASS)
+        self.assertEqual(results[1]["name"], "supabase.copilot_empty_refs")
+        self.assertEqual(results[1]["status"], verify.FAIL)
+        self.assertIn("4 events", results[1]["detail"])
+
+    def test_unconfirmed_audit_blocks_release_without_exposing_private_refs(self):
+        for response in ((503, "query failed"), (200, "not JSON")):
+            results = []
+            with patch.object(verify, "http", return_value=response):
+                verify.check_historical_credit_refs(results, "https://example.test", {})
+            self.assertEqual([row["status"] for row in results], [verify.FAIL, verify.FAIL])
+        results = []
+        with patch.object(verify, "http", side_effect=[(200, json.dumps([{"ref": "private-reference", "events": 1}])), (200, "[]")]):
+            verify.check_historical_credit_refs(results, "https://example.test", {})
+        self.assertEqual(results[0]["status"], verify.FAIL)
+        self.assertNotIn("private-reference", results[0]["detail"])
+
+    def test_missing_credentials_cannot_skip_pre_p13_barrier(self):
+        results = []
+        with patch.dict("os.environ", {"SUPABASE_ACCESS_TOKEN": ""}), patch.object(verify, "http") as request:
+            verify.check_tables(results)
+        request.assert_not_called()
+        statuses = {row["name"]: row["status"] for row in results}
+        self.assertEqual(statuses["supabase.copilot_legacy_refs"], verify.FAIL)
+        self.assertEqual(statuses["supabase.copilot_empty_refs"], verify.FAIL)
+
+
+class HistoricalReferenceIntegrationTests(unittest.TestCase):
+    def test_reference_audit_is_a_required_release_check(self):
+        for ref in ("cv", "pdf", "", None):
+            with self.subTest(ref=ref):
+                def respond(url, **kwargs):
+                    query = json.loads(kwargs["body"])["query"]
+                    if "ref IS DISTINCT FROM ''" in query:
+                        rows = [{"ref": ref, "events": 1}] if ref in ("cv", "pdf") else []
+                    elif "WHERE ref = '' OR ref IS NULL" in query:
+                        rows = [{"ref": "", "events": 1}] if ref == "" else []
+                    elif "information_schema.columns" in query:
+                        rows = [dict(verify.EXPECTED_P14_CLAIM_COLUMN)]
+                    elif "pg_class" in query:
+                        rows = [{"table_name": name, "rls_enabled": True} for name in verify.EXPECTED_TABLES]
+                    else:
+                        rows = []
+                    return 200, json.dumps(rows)
+                results = []
+                with patch.dict("os.environ", {"SUPABASE_ACCESS_TOKEN": "test-only"}), patch.object(verify, "http", side_effect=respond):
+                    verify.check_tables(results)
+                self.assertEqual(results[0]["name"], "supabase.copilot_legacy_refs")
+                self.assertEqual(results[1]["name"], "supabase.copilot_empty_refs")
+                with patch.object(verify, "run_checks", return_value=results), patch("builtins.print"):
+                    self.assertEqual(verify.main([]), 0 if ref is None else 1)
