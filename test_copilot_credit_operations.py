@@ -834,6 +834,8 @@ class AttemptBindingTests(unittest.TestCase):
                     if channel == "bot":
                         _message, _db, context = run_telegram_build(store, backend)
                         self.assertEqual(context.bot.sent, [])
+                        self.assertIn("Сборка уже выполняется или была прервана. Попробуй позже.",
+                                      [text for text, _ in _message.replies])
                     else:
                         with patch.object(copilot_webapp, "send_document_to_chat") as send:
                             status, _payload = call_api(store, FakeDb(backend, JOB), pdf_request())
@@ -982,6 +984,29 @@ class MiniAppCreditTests(unittest.TestCase):
 
     def _call(self, payload=None):
         return call_api(self.store, self.db, payload or pdf_request())
+
+    def test_confirm_refusal_keeps_delivered_document_and_success_response(self):
+        with patch.object(credit_ops.CostedOperation, "confirm",
+                          side_effect=credit_ops.CreditStoreUnavailable("refused")), \
+             patch.object(copilot_webapp, "send_document_to_chat", return_value={"file_id": "FILE-1"}):
+            status, payload = self._call()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(sent_document(self.store, self.backend)["telegram_file_id"], "FILE-1")
+        self.assertTrue(any(name == "copilot_webapp_cv_sent" for name, _ in self.db.events))
+        self.assertEqual(self.backend._balance(42), 2)
+
+    def test_release_refusal_preserves_delivery_error_and_releases_claim(self):
+        failure = copilot_webapp.WebappError(502, "telegram_error", "Отказ доставки.",
+                                           delivery=copilot_webapp.DELIVERY_REJECTED)
+        with patch.object(credit_ops.CostedOperation, "release",
+                          side_effect=credit_ops.CreditStoreUnavailable("refused")), \
+             patch.object(copilot_webapp, "send_document_to_chat", side_effect=failure):
+            status, payload = self._call()
+        self.assertEqual(status, 502)
+        self.assertEqual(payload["error"], "telegram_error")
+        self.assertEqual(self.backend.documents, {})
+        self.assertEqual(self.backend._balance(42), 2)
 
     def test_a_successful_build_and_delivery_costs_one_credit(self):
         with patch.object(
@@ -1173,6 +1198,41 @@ class TelegramCreditTests(unittest.TestCase):
         patcher = patch.dict(os.environ, {"COPILOT_FREE_PER_DAY": "0"}, clear=False)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_confirm_refusal_keeps_document_cache_and_completion(self):
+        store, backend = make_store(balance=3)
+        with patch.object(credit_ops.CostedOperation, "confirm",
+                          side_effect=credit_ops.CreditStoreUnavailable("refused")):
+            message, db, context = run_telegram_build(store, backend)
+        self.assertEqual(len(context.bot.sent), 1)
+        self.assertEqual(sent_document(store, backend)["telegram_file_id"], "FILE-1")
+        self.assertIn("Готово", message.replies[-1][0])
+        self.assertTrue(any(name == "copilot_cv_built" for name, _ in db.events))
+        self.assertEqual(backend._balance(42), 2)
+
+    def test_settlement_refusal_after_failed_delivery_releases_own_claim(self):
+        from telegram import error as telegram_error
+        for method, failure in (("release", telegram_error.BadRequest("rejected")),
+                                ("mark_unknown", telegram_error.TimedOut("timeout"))):
+            with self.subTest(method=method):
+                store, backend = make_store(balance=3)
+                with patch.object(credit_ops.CostedOperation, method,
+                                  side_effect=credit_ops.CreditStoreUnavailable("refused")):
+                    message, db, context = run_telegram_build(store, backend, failure=failure)
+                self.assertIn("Не удалось отправить файл. Попробуй позже.",
+                              [text for text, _ in message.replies])
+                self.assertEqual(backend.documents, {})
+                self.assertEqual(backend._balance(42), 2)
+
+    def test_ownership_refusal_releases_own_claim_and_answers(self):
+        store, backend = make_store(balance=3)
+        with patch.object(credit_ops.CostedOperation, "can_deliver", return_value=False):
+            message, db, context = run_telegram_build(store, backend)
+        self.assertEqual(context.bot.sent, [])
+        self.assertIn("Сборка уже выполняется или была прервана. Попробуй позже.",
+                      [text for text, _ in message.replies])
+        self.assertEqual(backend.documents, {})
+        self.assertEqual(event_reasons(backend), [credit_ops.REASON_SPEND])
 
     def test_a_successful_build_and_delivery_costs_one_credit(self):
         store, backend = make_store(balance=3)

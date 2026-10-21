@@ -42,7 +42,7 @@ from copilot.credit_operations import (
     InsufficientCredits,
     cv_operation,
     llm_operation,
-    settle_delivery,
+    settle_delivery_safely,
 )
 from copilot.credits import CreditManager
 from copilot.store import CopilotStore, CopilotStoreUnavailable
@@ -675,9 +675,15 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
                     disable_web_page_preview=True,
                 )
                 return
-        if operation is not None and not operation.can_deliver():
-            return
-        if operation is None and not store.owns_claim(user_id, job_hash, claim, "llm_call"):
+        if (operation is not None and not operation.can_deliver()) or (
+            operation is None and not store.owns_claim(user_id, job_hash, claim, "llm_call")
+        ):
+            _release_ai_claim(store, user_id, job_hash, claim)
+            await query.message.reply_text(
+                "AI-разбор уже выполняется или был прерван. Попробуй позже.\n\n"
+                + format_analysis(job, analysis),
+                disable_web_page_preview=True,
+            )
             return
 
         try:
@@ -687,10 +693,10 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
             if operation is not None:
                 # The answer is lost, so the credit stays spent: the analysis may
                 # have reached the user anyway.
-                settle_delivery(operation, DELIVERY_UNKNOWN)
+                settle_delivery_safely(operation, DELIVERY_UNKNOWN)
             raise
         if operation is not None:
-            settle_delivery(operation, DELIVERY_DELIVERED)
+            settle_delivery_safely(operation, DELIVERY_DELIVERED)
         if store is not None:
             try:
                 saved = store.save_ai_report(
@@ -1158,6 +1164,8 @@ async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> Non
             return
 
         if not operation.can_deliver():
+            _release_pdf_claim(store, user_id, job_hash, claimed)
+            await message.reply_text("Сборка уже выполняется или была прервана. Попробуй позже.")
             return
 
         try:
@@ -1173,12 +1181,12 @@ async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> Non
             # Telegram may have stored the file even though the answer was lost,
             # so a proven refusal pays the credit back and an open outcome does
             # not.
-            settle_delivery(operation, _telegram_delivery_outcome(exc))
+            settle_delivery_safely(operation, _telegram_delivery_outcome(exc))
             _release_pdf_claim(store, user_id, job_hash, claimed)
             await message.reply_text("Не удалось отправить файл. Попробуй позже.")
             return
 
-        settle_delivery(operation, DELIVERY_DELIVERED)
+        settle_delivery_safely(operation, DELIVERY_DELIVERED)
 
         if file_id:
             try:

@@ -137,11 +137,72 @@ class LLMAccountingTests(unittest.TestCase):
 
         with patch.object(credit_ops.CostedOperation, "reserve", reserve_then_takeover):
             message, _query, db = self._tap()
-        self.assertEqual(message.replies, [])
+        self.assertEqual(len(message.replies), 1)
+        self.assertEqual(message.replies[0][0],
+            "AI-разбор уже выполняется или был прерван. Попробуй позже.\n\n"
+            + copilot_runtime.format_analysis(JOB, copilot_runtime.analyse_job(
+                JOB, copilot_runtime._profile_from_settings(db.get_user_settings(USER_ID))
+            )))
+        self.assertNotIn(_result().as_text(), message.replies[0][0])
+        self.assertTrue(self.backend.ai_reports)
         self.assertNotIn(credit_ops.REASON_LLM_RELEASE, self._reasons())
         self.assertNotIn(credit_ops.REASON_LLM_DELIVERED, self._reasons())
         self.assertNotIn(credit_ops.REASON_LLM_UNKNOWN, self._reasons())
         self.assertFalse(any(name == "copilot_ai_viewed" for name, _props in db.events))
+
+    def test_confirm_refusal_keeps_answer_cache_and_view_event(self):
+        with patch.object(credit_ops.CostedOperation, "confirm",
+                          side_effect=credit_ops.CreditStoreUnavailable("refused")), \
+             self.assertLogs(credit_ops.logger, level="WARNING") as logs:
+            message, query, db = self._tap()
+        self.assertIn(_result().as_text(), self._text(message, query))
+        self.assertTrue(any(row.get("answer") == _result().as_text()
+                            for row in self.backend.ai_reports.values()))
+        self.assertTrue(any(name == "copilot_ai_viewed" for name, _ in db.events))
+        self.assertEqual(self.backend._balance(USER_ID), 2)
+        self.assertIn("CreditStoreUnavailable", " ".join(logs.output))
+
+    def test_unknown_refusal_preserves_delivery_exception_and_releases_claim(self):
+        failure = RuntimeError("delivery failed")
+        with patch.object(FakeMessage, "reply_text", side_effect=failure), \
+             patch.object(credit_ops.CostedOperation, "mark_unknown",
+                          side_effect=credit_ops.CreditStoreUnavailable("refused")):
+            with self.assertRaises(RuntimeError) as caught:
+                self._tap()
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(self.backend.ai_reports, {})
+        self.assertEqual(self.backend._balance(USER_ID), 2)
+
+    def test_failed_delivery_after_takeover_keeps_new_owners_claim(self):
+        from copilot.store import CopilotStore
+        failure = RuntimeError("delivery failed")
+        replacement = []
+
+        async def fail_after_takeover(message, text, **kwargs):
+            self.backend.advance(minutes=20)
+            db = FakeDb(JOB)
+            db._growth_store = self.backend
+            store = CopilotStore.from_database(db)
+            replacement.append(store.claim_ai_report(USER_ID, JOB["hash"]))
+            raise failure
+
+        with patch.object(FakeMessage, "reply_text", new=fail_after_takeover):
+            with self.assertRaises(RuntimeError) as caught:
+                self._tap()
+        self.assertIs(caught.exception, failure)
+        self.assertTrue(replacement[0])
+        self.assertEqual(self.backend.ai_reports[(USER_ID, JOB["hash"])]["model"], replacement[0])
+        self.assertEqual(self.backend._balance(USER_ID), 2)
+        self.assertNotIn(credit_ops.REASON_LLM_RELEASE, self._reasons())
+
+    def test_ownership_refusal_releases_own_claim_and_shows_fallback(self):
+        with patch.object(credit_ops.CostedOperation, "can_deliver", return_value=False):
+            message, query, db = self._tap()
+        self.assertIn("AI-разбор уже выполняется или был прерван. Попробуй позже.",
+                      self._text(message, query))
+        self.assertNotIn(_result().as_text(), self._text(message, query))
+        self.assertEqual(self.backend.ai_reports, {})
+        self.assertNotIn(credit_ops.REASON_LLM_RELEASE, self._reasons())
 
     def test_the_call_of_the_model_is_counted_and_charged_once(self):
         message, _query, _db = self._tap()

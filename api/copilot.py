@@ -38,7 +38,7 @@ from copilot.credit_operations import (
     CreditStoreUnavailable,
     InsufficientCredits,
     cv_operation,
-    settle_delivery,
+    settle_delivery_safely,
 )
 from copilot.credits import CreditManager
 from copilot.store import CopilotStore
@@ -419,10 +419,13 @@ class handler(BaseHTTPRequestHandler):
         except copilot_webapp.WebappError as exc:
             # A rejected document is paid back, a lost answer keeps the credit
             # spent: Telegram may have stored the file anyway.
-            settle_delivery(operation, exc.delivery or DELIVERY_UNKNOWN)
+            settle_delivery_safely(operation, exc.delivery or DELIVERY_UNKNOWN)
+            raise
+        except Exception:
+            settle_delivery_safely(operation, DELIVERY_UNKNOWN)
             raise
 
-        settle_delivery(operation, DELIVERY_DELIVERED)
+        settle_delivery_safely(operation, DELIVERY_DELIVERED)
         try:
             saved = store.save_document(
                 user_id,

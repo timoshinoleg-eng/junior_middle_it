@@ -361,6 +361,15 @@ def settle_delivery(operation: CostedOperation, outcome: str) -> str:
     return operation.mark_unknown()
 
 
+def settle_delivery_safely(operation: CostedOperation, outcome: str) -> Optional[str]:
+    """Keep settlement failures from interrupting delivery and cache handling."""
+    try:
+        return settle_delivery(operation, outcome)
+    except Exception as exc:
+        logger.warning("Credit delivery settlement failed: %s", type(exc).__name__)
+        return None
+
+
 def cv_operation(store, user_id: int, job_hash: str) -> CostedOperation:
     """The CV export of one vacancy, shared by the bot and the Mini App."""
     return CostedOperation(
