@@ -7,7 +7,7 @@ operation at the same time. This module runs the production statements of
 
 The server is not started by the test: it reads the DSN from the environment
 variable ``COPILOT_TEST_PG_DSN`` and skips itself when there is none, so the
-normal CI run stays green and the check stays reproducible. To run it locally:
+local run can omit PostgreSQL. CI supplies an isolated PostgreSQL service. To run it locally:
 
     python tools/pg_concurrency_check.py
 
@@ -34,6 +34,7 @@ import threading
 import unittest
 
 from copilot.credit_operations import (
+    CostedOperation, CreditStoreUnavailable,
     REASON_LLM_SPEND,
     REASON_RELEASE,
     REASON_SPEND,
@@ -363,7 +364,7 @@ def scenario_parallel_different_operations(dsn: str) -> dict:
     )
     return {
         "results": results,
-        "granted": sum(1 for item in results if item is True),
+        "granted": sum(1 for item in results if isinstance(item, int) and item > 0),
         "balance": _balance(dsn),
     }
 
@@ -379,7 +380,7 @@ def scenario_parallel_reserve_and_release(dsn: str) -> dict:
 
     def release(store):
         return store.release_credit(
-            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND
+            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND, attempt=1
         )
 
     results = _parallel(dsn, [reserve, release])
@@ -499,7 +500,7 @@ def scenario_balance_matches_journal(dsn: str) -> dict:
     try:
         store.reserve_credit(USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE)
         store.release_credit(
-            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND
+            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND, attempt=1
         )
         store.reserve_credit(USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE)
     finally:
@@ -529,7 +530,7 @@ def scenario_reservation_without_claim(dsn: str) -> dict:
     journal = _journal(dsn)
     return {
         "results": results,
-        "granted": sum(1 for item in results if item is True),
+        "granted": sum(1 for item in results if isinstance(item, int) and item > 0),
         "spends": sum(1 for r, _d, _r2 in journal if r == REASON_SPEND),
         "balance": _balance(dsn),
     }
@@ -547,7 +548,7 @@ def scenario_many_parallel_reservations(dsn: str, calls: int = 8) -> dict:
     results = _parallel(dsn, [reserve] * calls)
     journal = _journal(dsn)
     return {
-        "granted": sum(1 for item in results if item is True),
+        "granted": sum(1 for item in results if isinstance(item, int) and item > 0),
         "spends": sum(1 for r, _d, _r2 in journal if r == REASON_SPEND),
         "balance": _balance(dsn),
     }
@@ -568,7 +569,7 @@ def scenario_parallel_releases(dsn: str, calls: int = 4) -> dict:
 
     def release(store):
         return store.release_credit(
-            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND
+            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND, attempt=1
         )
 
     results = _parallel(dsn, [release] * calls)
@@ -725,7 +726,98 @@ class CreditConcurrencyTests(unittest.TestCase):
         dsn = os.environ.get(DSN_ENV)
         if not dsn:
             self.skipTest("%s is not set: no PostgreSQL for the concurrency check" % DSN_ENV)
+        from psycopg.conninfo import conninfo_to_dict
+        dbname = conninfo_to_dict(dsn).get("dbname", "").lower()
+        if not dbname or any(word in dbname for word in ("prod", "production", "main", "junior")):
+            self.fail("COPILOT_TEST_PG_DSN must name a dedicated test database")
         self.dsn = dsn
+
+    def test_reject_b_then_timeout_a_keeps_credit_spent(self):
+        _reset(self.dsn)
+        store = _store(self.dsn)
+        self.addCleanup(store._store.close)
+        a = CostedOperation(store, USER_ID, REF)
+        b = CostedOperation(store, USER_ID, REF)
+        a.reserve()
+        self.assertEqual(a.attempt, 1)
+        with self.assertRaises(CreditStoreUnavailable):
+            b.reserve()
+        with self.assertRaises(CreditStoreUnavailable):
+            b.release()
+        self.assertEqual(_balance(self.dsn), BALANCE - 1)
+        self.assertEqual(a.mark_unknown(), "unknown")
+        self.assertEqual(_operations(self.dsn), [(REF, REASON_SPEND, "unknown", 1)])
+        self.assertEqual(_balance(self.dsn), BALANCE - 1)
+
+    def test_timeout_a_then_late_release_b_keeps_credit_spent(self):
+        _reset(self.dsn)
+        store = _store(self.dsn)
+        self.addCleanup(store._store.close)
+        a = CostedOperation(store, USER_ID, REF)
+        b = CostedOperation(store, USER_ID, REF)
+        a.reserve()
+        with self.assertRaises(CreditStoreUnavailable):
+            b.reserve()
+        self.assertEqual(a.mark_unknown(), "unknown")
+        with self.assertRaises(CreditStoreUnavailable):
+            b.release()
+        self.assertFalse(store.release_credit(
+            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND, attempt=2
+        ))
+        self.assertEqual(_operations(self.dsn), [(REF, REASON_SPEND, "unknown", 1)])
+        self.assertEqual(_balance(self.dsn), BALANCE - 1)
+
+    def test_stale_attempt_cannot_settle_new_reservation(self):
+        _reset(self.dsn)
+        store = _store(self.dsn)
+        self.addCleanup(store._store.close)
+        first = store.reserve_credit(USER_ID, 1, REASON_SPEND, REF)
+        self.assertTrue(store.release_credit(
+            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND, attempt=first
+        ))
+        second = store.reserve_credit(USER_ID, 1, REASON_SPEND, REF)
+        self.assertEqual(second, first + 1)
+        journal = _journal(self.dsn)
+        self.assertFalse(store.release_credit(
+            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND, attempt=first
+        ))
+        self.assertFalse(store.confirm_credit_operation(
+            USER_ID, REF, REASON_SPEND, "cv_delivered", attempt=first
+        ))
+        self.assertFalse(store.mark_credit_operation_unknown(
+            USER_ID, REF, REASON_SPEND, "cv_delivery_unknown", attempt=first
+        ))
+        self.assertEqual(_journal(self.dsn), journal)
+        self.assertEqual(_operations(self.dsn), [(REF, REASON_SPEND, "reserved", second)])
+        self.assertEqual(_balance(self.dsn), BALANCE - 1)
+
+    def test_takeover_blocks_delivery_and_all_settlement(self):
+        for kind in ("spend", "llm_call"):
+            with self.subTest(kind=kind):
+                _reset(self.dsn)
+                store = _store(self.dsn)
+                try:
+                    claim_fn = (lambda uid, ref: store.claim_document(uid, ref, "cv.pdf")) if kind == "spend" else store.claim_ai_report
+                    first = claim_fn(USER_ID, REF)
+                    a = CostedOperation(store, USER_ID, REF, spend_reason=kind).bind_claim(first)
+                    a.reserve()
+                    self.assertTrue(a.can_deliver())
+                    stale_fn = _make_claim_stale if kind == "spend" else _make_ai_claim_stale
+                    stale_fn(self.dsn)
+                    second = claim_fn(USER_ID, REF)
+                    self.assertNotEqual(first, second)
+                    self.assertFalse(a.can_deliver())
+                    for settle in (a.release, a.confirm, a.mark_unknown):
+                        with self.assertRaises(CreditStoreUnavailable):
+                            settle()
+                    self.assertFalse(store.release_credit(
+                        USER_ID, 1, REASON_RELEASE, REF, reserved_reason=kind,
+                        attempt=a.attempt, claim=first
+                    ))
+                    self.assertEqual(_balance(self.dsn), BALANCE - 1)
+                    self.assertEqual(_operations(self.dsn), [(REF, kind, "reserved", 1)])
+                finally:
+                    store._store.close()
 
     def test_a_repeated_reservation_is_refused(self):
         result = scenario_sequential(self.dsn)

@@ -168,7 +168,19 @@ class FakeGrowthStore:
         sql = re.sub(r"\s+", " ", str(query)).strip()
         values = list(params or ())
         self._rows = []
-        if "op_reserved AS" in sql:
+        if sql.startswith("SELECT 1 FROM growth_copilot_credit_ops"):
+            uid, ref, kind, attempt = values
+            row = self.ops.get((int(uid), str(ref), str(kind)))
+            self._rows = [(1,)] if row and row["attempt"] == attempt and row["state"] == "reserved" else []
+        elif sql.startswith("SELECT 1 FROM growth_copilot_documents"):
+            uid, ref, claim = values
+            row = self.documents.get((int(uid), str(ref)))
+            self._rows = [(1,)] if row and row["filename"] == claim else []
+        elif sql.startswith("SELECT 1 FROM growth_copilot_ai_reports"):
+            uid, ref, claim = values
+            row = self.ai_reports.get((int(uid), str(ref)))
+            self._rows = [(1,)] if row and row["model"] == claim else []
+        elif "op_reserved AS" in sql:
             self._guard("debit")
             self._rows = self._reserve_operation(values)
         elif "op_released AS" in sql:
@@ -307,7 +319,7 @@ class FakeGrowthStore:
         self.ops[key] = {"state": "reserved", "amount": amount, "attempt": attempt}
         self.credits[user_id] = self._balance(user_id) - amount
         self.events.append((user_id, -amount, kind, ref))
-        return [(len(self.events),)]
+        return [(attempt,)]
 
     def _release_operation(self, values):
         """The release of the registry.
@@ -318,26 +330,37 @@ class FakeGrowthStore:
         user_id = int(values[0])
         ref = str(values[2])
         kind = str(values[3])
-        amount = int(values[4])
-        reason = str(values[8])
+        attempt, claim = values[4:6]
+        amount = int(values[14])
+        reason = str(values[18])
         key = self._operation_key(user_id, ref, kind)
         row = self.ops.get(key)
-        if not row or row["state"] != "reserved":
+        if not row or row["state"] != "reserved" or row["attempt"] != attempt:
+            return []
+        if claim and not self._owns_build(user_id, ref, kind, claim):
             return []
         row["state"] = "released"
         self.credits[user_id] = self._balance(user_id) + amount
         self.events.append((user_id, amount, reason, ref))
         return [(len(self.events),)]
 
+    def _owns_build(self, uid, ref, kind, claim):
+        rows, column = (self.documents, "filename") if kind == "spend" else (self.ai_reports, "model")
+        row = rows.get((int(uid), str(ref)))
+        return bool(row and row[column] == claim)
+
     def _settle_operation(self, values, state):
         """The end of an operation: delivered or of an unknown outcome."""
         user_id = int(values[0])
         ref = str(values[1])
         kind = str(values[2])
-        reason = str(values[4])
+        attempt, claim = values[3:5]
+        reason = str(values[14])
         key = self._operation_key(user_id, ref, kind)
         row = self.ops.get(key)
-        if not row:
+        if not row or row["attempt"] != attempt:
+            return []
+        if claim and not self._owns_build(user_id, ref, kind, claim):
             return []
         if state == "delivered":
             if row["state"] not in ("reserved", "unknown"):
@@ -699,6 +722,151 @@ def event_reasons(backend, user_id=None):
     ]
 
 
+class AttemptBindingTests(unittest.TestCase):
+    """Settlement requires the token acquired by this object."""
+
+    def setUp(self):
+        patcher = patch.dict(os.environ, {"COPILOT_FREE_PER_DAY": "0"}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_attempt_is_forwarded_to_every_settlement_method(self):
+        from unittest.mock import Mock
+        for method, store_method in (
+            ("release", "release_credit"),
+            ("confirm", "confirm_credit_operation"),
+            ("mark_unknown", "mark_credit_operation_unknown"),
+        ):
+            with self.subTest(method=method):
+                store = Mock()
+                store.credit_operation_state.return_value = None
+                store.credit_event_counts.return_value = {}
+                store.reserve_credit.return_value = 7
+                getattr(store, store_method).return_value = True
+                operation = credit_ops.cv_operation(store, 42, JOB["hash"])
+                operation.reserve()
+                getattr(operation, method)()
+                call = getattr(store, store_method).call_args
+                self.assertEqual(call.kwargs.get("attempt"), 7)
+                self.assertIsNone(call.kwargs.get("claim"))
+                self.assertEqual(operation.attempt, 7)
+
+    def test_unreserved_object_cannot_release_someone_elses_credit(self):
+        store, backend = make_store(balance=3)
+        a = credit_ops.cv_operation(store, 42, JOB["hash"])
+        b = credit_ops.cv_operation(store, 42, JOB["hash"])
+        a.reserve()
+        with self.assertRaises(credit_ops.CreditStoreUnavailable):
+            b.release()
+        self.assertEqual(backend._balance(42), 2)
+        self.assertEqual(a.mark_unknown(), "unknown")
+        self.assertNotIn(credit_ops.REASON_RELEASE, event_reasons(backend))
+
+    def test_legacy_reservation_logs_unknown_attempt_and_keeps_legacy_refund(self):
+        from copilot import store as store_module
+        store, backend = make_store(balance=3)
+        with patch.object(store_module, "_CREDIT_OPS_TABLE_MISSING", True), patch.object(
+            store_module, "_CREDIT_OPS_RETRY_AT", float("inf")
+        ), self.assertLogs(store_module.logger, level="WARNING") as logs:
+            operation = credit_ops.cv_operation(store, 42, JOB["hash"])
+            operation.reserve()
+            self.assertIsNone(operation.attempt)
+            self.assertTrue(operation.can_deliver())
+            self.assertEqual(operation.release(), "released")
+        self.assertEqual(backend._balance(42), 3)
+        self.assertIn("attempt binding unavailable", " ".join(logs.output))
+
+    def test_non_owner_cannot_refund_before_or_after_timeout(self):
+        for timeout_first in (False, True):
+            with self.subTest(timeout_first=timeout_first):
+                store, backend = make_store(balance=3)
+                a = credit_ops.cv_operation(store, 42, JOB["hash"])
+                b = credit_ops.cv_operation(store, 42, JOB["hash"])
+                a.reserve()
+                with self.assertRaises(credit_ops.CreditStoreUnavailable):
+                    b.reserve()
+                if timeout_first:
+                    a.mark_unknown()
+                for settle in (b.release, b.confirm, b.mark_unknown):
+                    with self.assertRaises(credit_ops.CreditStoreUnavailable):
+                        settle()
+                if not timeout_first:
+                    a.mark_unknown()
+                self.assertEqual(backend._balance(42), 2)
+                self.assertEqual(a.state(), "unknown")
+                self.assertNotIn(credit_ops.REASON_RELEASE, event_reasons(backend))
+
+    def test_stale_attempt_cannot_change_registry_or_balance(self):
+        store, backend = make_store(balance=3)
+        a = credit_ops.cv_operation(store, 42, JOB["hash"])
+        a.reserve()
+        a.release()
+        b = credit_ops.cv_operation(store, 42, JOB["hash"])
+        b.reserve()
+        self.assertEqual(b.attempt, 2)
+        before = list(backend.events)
+        self.assertFalse(store.release_credit(
+            42, 1, "spend_release", JOB["hash"], reserved_reason="spend", attempt=a.attempt
+        ))
+        self.assertFalse(store.confirm_credit_operation(
+            42, JOB["hash"], "spend", "cv_delivered", attempt=a.attempt
+        ))
+        self.assertFalse(store.mark_credit_operation_unknown(
+            42, JOB["hash"], "spend", "cv_delivery_unknown", attempt=a.attempt
+        ))
+        self.assertEqual(backend.events, before)
+        self.assertEqual(backend._balance(42), 2)
+        self.assertEqual(store.credit_operation_state(42, JOB["hash"], "spend"), "reserved")
+
+    def test_pdf_takeover_after_reservation_sends_nothing(self):
+        for channel in ("bot", "mini_app"):
+            with self.subTest(channel=channel):
+                store, backend = make_store(balance=3)
+                original = credit_ops.CostedOperation.reserve
+
+                def reserve_then_takeover(operation):
+                    state = original(operation)
+                    backend.advance(minutes=20)
+                    store.claim_document(42, JOB["hash"], "cv.pdf")
+                    return state
+
+                with patch.object(credit_ops.CostedOperation, "reserve", reserve_then_takeover):
+                    if channel == "bot":
+                        _message, _db, context = run_telegram_build(store, backend)
+                        self.assertEqual(context.bot.sent, [])
+                    else:
+                        with patch.object(copilot_webapp, "send_document_to_chat") as send:
+                            status, _payload = call_api(store, FakeDb(backend, JOB), pdf_request())
+                        self.assertEqual(status, 503)
+                        send.assert_not_called()
+                self.assertEqual(backend._balance(42), 2)
+                self.assertEqual(event_reasons(backend), [credit_ops.REASON_SPEND])
+
+    def test_missing_registry_is_rechecked_and_restored(self):
+        from unittest.mock import Mock
+        from copilot import store as store_module
+        store, _backend = make_store(balance=3)
+        cursor = Mock()
+        cursor.fetchone.return_value = ("growth_copilot_credit_ops",)
+        context = Mock()
+        context.__enter__ = Mock(return_value=cursor)
+        context.__exit__ = Mock(return_value=False)
+        with patch.object(store_module, "_CREDIT_OPS_TABLE_MISSING", True), patch.object(
+            store_module, "_CREDIT_OPS_RETRY_AT", 100.0
+        ), patch.object(store_module.time, "monotonic", return_value=99.0), patch.object(
+            store, "_cursor", return_value=context
+        ) as connect:
+            self.assertFalse(store._registry_available())
+            connect.assert_not_called()
+            with patch.object(store_module.time, "monotonic", return_value=101.0):
+                with self.assertLogs(store_module.logger, level="WARNING") as logs:
+                    self.assertTrue(store._registry_available())
+                self.assertIn("restored", " ".join(logs.output))
+                self.assertFalse(store_module._CREDIT_OPS_TABLE_MISSING)
+                self.assertTrue(store._registry_available())
+                self.assertEqual(connect.call_count, 1)
+
+
 class CreditOperationTests(unittest.TestCase):
     """The state machine of one costed operation."""
 
@@ -732,7 +900,9 @@ class CreditOperationTests(unittest.TestCase):
         first = credit_ops.cv_operation(store, 42, JOB["hash"])
         second = credit_ops.cv_operation(store, 42, JOB["hash"])
         self.assertEqual(first.reserve(), credit_ops.STATE_RESERVED)
-        self.assertEqual(second.reserve(), credit_ops.STATE_RESERVED)
+        with self.assertRaises(credit_ops.CreditStoreUnavailable):
+            second.reserve()
+        self.assertEqual(second.state(), credit_ops.STATE_RESERVED)
         self.assertEqual(backend._balance(42), 2)
         self.assertEqual(event_reasons(backend).count(credit_ops.REASON_SPEND), 1)
 

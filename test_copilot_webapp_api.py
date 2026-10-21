@@ -100,6 +100,13 @@ class FakeStore:
         self.claimed.add(key)
         return "claim:%s" % key[1]
 
+    def owns_claim(self, user_id, ref, claim, kind):
+        return (int(user_id), str(ref)) in self.claimed and claim == "claim:%s" % ref
+
+    def owns_credit_attempt(self, user_id, ref, kind, attempt):
+        # This fake deliberately represents the legacy journal backend.
+        return attempt is None and self._count(user_id, kind, ref) > 0
+
     def release_document_claim(self, user_id, job_id, claim=None):
         key = (int(user_id), str(job_id))
         if key in self.claimed:
@@ -149,7 +156,7 @@ class FakeStore:
         self.events.append((int(user_id), -int(amount), reason, ref))
         return True
 
-    def release_credit(self, user_id, amount, reason, ref, *, reserved_reason):
+    def release_credit(self, user_id, amount, reason, ref, *, reserved_reason, attempt=None, claim=None):
         if self._count(user_id, reserved_reason, ref) <= self._count(user_id, reason, ref):
             return False
         self.balance_value += int(amount)
@@ -170,11 +177,11 @@ class FakeStore:
         # operation is read from the journal.
         return None
 
-    def confirm_credit_operation(self, user_id, ref, kind, reason):
+    def confirm_credit_operation(self, user_id, ref, kind, reason, *, attempt=None, claim=None):
         self.events.append((int(user_id), 0, reason, ref))
         return True
 
-    def mark_credit_operation_unknown(self, user_id, ref, kind, reason):
+    def mark_credit_operation_unknown(self, user_id, ref, kind, reason, *, attempt=None, claim=None):
         self.events.append((int(user_id), 0, reason, ref))
         return True
 

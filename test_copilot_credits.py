@@ -74,7 +74,7 @@ class FakeStore:
         self.events.append((uid, -int(amount), reason, ref))
         return True
 
-    def release_credit(self, user_id, amount, reason, ref, *, reserved_reason):
+    def release_credit(self, user_id, amount, reason, ref, *, reserved_reason, attempt=None, claim=None):
         uid = int(user_id)
         if self._count(uid, reserved_reason, ref) <= self._count(uid, reason, ref):
             return False

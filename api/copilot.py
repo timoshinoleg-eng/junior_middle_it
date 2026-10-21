@@ -294,7 +294,7 @@ class handler(BaseHTTPRequestHandler):
             )
 
         manager = CreditManager(store)
-        operation = cv_operation(store, user_id, job_hash)
+        operation = cv_operation(store, user_id, job_hash).bind_claim(claimed)
         try:
             return self._build_and_send(
                 db,
@@ -408,6 +408,10 @@ class handler(BaseHTTPRequestHandler):
                 503, "store_unavailable", "Не удалось списать кредит. Попробуй позже."
             ) from exc
 
+        if not operation.can_deliver():
+            raise copilot_webapp.WebappError(
+                503, "store_unavailable", "Не удалось проверить кредиты. Попробуй позже."
+            )
         try:
             sent = copilot_webapp.send_document_to_chat(
                 token, user_id, CV_FILENAME, pdf_bytes, caption=caption

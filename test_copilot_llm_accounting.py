@@ -126,6 +126,23 @@ class LLMAccountingTests(unittest.TestCase):
         )
 
     # -- the call of the provider ----------------------------------
+    def test_takeover_after_reservation_sends_no_ai_answer_or_settlement(self):
+        original = credit_ops.CostedOperation.reserve
+
+        def reserve_then_takeover(operation):
+            state = original(operation)
+            self.backend.advance(minutes=20)
+            operation._store.claim_ai_report(operation._user_id, JOB["hash"])
+            return state
+
+        with patch.object(credit_ops.CostedOperation, "reserve", reserve_then_takeover):
+            message, _query, db = self._tap()
+        self.assertEqual(message.replies, [])
+        self.assertNotIn(credit_ops.REASON_LLM_RELEASE, self._reasons())
+        self.assertNotIn(credit_ops.REASON_LLM_DELIVERED, self._reasons())
+        self.assertNotIn(credit_ops.REASON_LLM_UNKNOWN, self._reasons())
+        self.assertFalse(any(name == "copilot_ai_viewed" for name, _props in db.events))
+
     def test_the_call_of_the_model_is_counted_and_charged_once(self):
         message, _query, _db = self._tap()
         self.assertEqual(len(self.calls), 1)

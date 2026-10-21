@@ -120,6 +120,40 @@ class CostedOperation:
         self._delivered_reason = str(delivered_reason or REASON_DELIVERED)
         self._unknown_reason = str(unknown_reason or REASON_UNKNOWN)
         self._state: Optional[str] = None
+        self.attempt: Optional[int] = None
+        self._reserved_here = False
+        self._paid_replay = False
+        self._claim: Optional[str] = None
+
+    def bind_claim(self, claim: str):
+        """Bind this operation to the build slot before reserving."""
+        self._claim = str(claim)
+        return self
+
+    def can_deliver(self) -> bool:
+        """Refuse stale builds before crossing the delivery boundary."""
+        if not self._reserved_here and not self._paid_replay:
+            return False
+        try:
+            return (
+                (not self._claim or self._store.owns_claim(
+                    self._user_id, self._ref, self._claim, self._spend_reason
+                ))
+                and (self._paid_replay or self._store.owns_credit_attempt(
+                    self._user_id, self._ref, self._spend_reason, self.attempt
+                ))
+            )
+        except Exception as exc:
+            logger.warning("Credit ownership check failed: %s", type(exc).__name__)
+            return False
+
+    def _require_owner(self):
+        if not self._reserved_here:
+            raise CreditStoreUnavailable("This object does not own a reservation")
+        if self._claim and not self._store.owns_claim(
+            self._user_id, self._ref, self._claim, self._spend_reason
+        ):
+            raise CreditStoreUnavailable("The build claim was taken over")
 
     @property
     def ref(self) -> str:
@@ -191,17 +225,26 @@ class CostedOperation:
     def reserve(self) -> str:
         """Reserve the credit of this operation.
 
-        The reservation happens at most once per attempt: a repeated request
-        keeps the state the operation already has and never charges the user
-        twice. A request after a refund is a new attempt and is charged
-        again.
+        The reservation happens at most once per attempt. Only the object
+        that acquired it may settle it; another object observing an open
+        reservation is refused. A paid terminal result may be replayed without
+        settlement rights. A request after a refund acquires a new attempt.
 
         Raises :class:`InsufficientCredits` when the balance is too low and
         :class:`CreditStoreUnavailable` when the store cannot confirm it.
         """
+        if self._claim and not self._store.owns_claim(
+            self._user_id, self._ref, self._claim, self._spend_reason
+        ):
+            raise CreditStoreUnavailable("The build claim was taken over")
         state = self.state()
-        if state in (STATE_RESERVED, STATE_DELIVERED, STATE_UNKNOWN):
+        if state in (STATE_DELIVERED, STATE_UNKNOWN):
+            self._paid_replay = not self._reserved_here
             return state
+        if state == STATE_RESERVED:
+            if self._reserved_here:
+                return state
+            raise CreditStoreUnavailable("Reservation belongs to another operation")
         try:
             reserved = self._store.reserve_credit(
                 self._user_id,
@@ -215,14 +258,16 @@ class CostedOperation:
                 "credit reservation failed: %s" % type(exc).__name__
             ) from exc
         if reserved:
+            self.attempt = None if reserved is True else int(reserved)
+            self._reserved_here = True
             self._state = STATE_RESERVED
             return self._state
         # The store refused. Either the balance was too low or the operation
         # is already paid for; the journal tells the two apart.
         self._state = self._read_state()
         if self._state in (STATE_RESERVED, STATE_DELIVERED, STATE_UNKNOWN):
-            return self._state
-        raise InsufficientCredits("no credits for %s" % self._ref)
+            raise CreditStoreUnavailable("Reservation belongs to another operation")
+        raise InsufficientCredits("No credits available")
 
     def release(self) -> str:
         """Give the reservation back.
@@ -231,6 +276,7 @@ class CostedOperation:
         operation keeps its state, so a repeated release cannot credit the
         user twice.
         """
+        self._require_owner()
         state = self.state()
         if state != STATE_RESERVED:
             return state
@@ -241,6 +287,7 @@ class CostedOperation:
                 self._release_reason,
                 self._ref,
                 reserved_reason=self._spend_reason,
+                attempt=self.attempt, claim=self._claim,
             )
         except Exception as exc:
             logger.warning("Credit release failed: %s", type(exc).__name__)
@@ -248,17 +295,19 @@ class CostedOperation:
         if released:
             self._state = STATE_RELEASED
         else:
-            self._state = self._read_state()
+            raise CreditStoreUnavailable("Settlement refused for this attempt")
         return self._state
 
     def confirm(self) -> str:
         """Mark the operation as delivered."""
+        self._require_owner()
         state = self.state()
         if state in (STATE_DELIVERED, STATE_RELEASED):
             return state
         try:
             confirmed = self._store.confirm_credit_operation(
-                self._user_id, self._ref, self._spend_reason, self._delivered_reason
+                self._user_id, self._ref, self._spend_reason, self._delivered_reason,
+                attempt=self.attempt, claim=self._claim
             )
         except Exception as exc:
             logger.warning("Credit confirmation failed: %s", type(exc).__name__)
@@ -266,7 +315,7 @@ class CostedOperation:
         if confirmed:
             self._state = STATE_DELIVERED
         else:
-            self._state = self._read_state()
+            raise CreditStoreUnavailable("Settlement refused for this attempt")
         return self._state
 
     def mark_unknown(self) -> str:
@@ -276,12 +325,14 @@ class CostedOperation:
         though the answer was lost. The state makes sure that a later request
         does not charge the user again.
         """
+        self._require_owner()
         state = self.state()
         if state != STATE_RESERVED:
             return state
         try:
             marked = self._store.mark_credit_operation_unknown(
-                self._user_id, self._ref, self._spend_reason, self._unknown_reason
+                self._user_id, self._ref, self._spend_reason, self._unknown_reason,
+                attempt=self.attempt, claim=self._claim
             )
         except Exception as exc:
             logger.warning("Credit state update failed: %s" % type(exc).__name__)
@@ -289,7 +340,7 @@ class CostedOperation:
         if marked:
             self._state = STATE_UNKNOWN
         else:
-            self._state = self._read_state()
+            raise CreditStoreUnavailable("Settlement refused for this attempt")
         return self._state
 
 
@@ -300,6 +351,9 @@ def settle_delivery(operation: CostedOperation, outcome: str) -> str:
     paid back and an open outcome keeps the credit spent, because a lost
     answer does not prove that the document never arrived.
     """
+    if operation._paid_replay:
+        # An already paid replay owns no reservation and must never settle it.
+        return operation.state()
     if outcome == DELIVERY_DELIVERED:
         return operation.confirm()
     if outcome == DELIVERY_REJECTED:

@@ -662,7 +662,7 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
         if manager is not None:
             # The analysis is paid for. It is only shown when the credit is
             # confirmed, otherwise the free deterministic report is shown instead.
-            operation = llm_operation(store, user_id, job_hash)
+            operation = llm_operation(store, user_id, job_hash).bind_claim(claim)
             try:
                 operation.reserve()
             except (InsufficientCredits, CreditStoreUnavailable) as exc:
@@ -675,6 +675,22 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
                     disable_web_page_preview=True,
                 )
                 return
+        if operation is not None and not operation.can_deliver():
+            return
+        if operation is None and not store.owns_claim(user_id, job_hash, claim, "llm_call"):
+            return
+
+        try:
+            await query.message.reply_text(text, disable_web_page_preview=True)
+        except Exception as exc:
+            logger.warning("Copilot AI delivery failed: %s", type(exc).__name__)
+            if operation is not None:
+                # The answer is lost, so the credit stays spent: the analysis may
+                # have reached the user anyway.
+                settle_delivery(operation, DELIVERY_UNKNOWN)
+            raise
+        if operation is not None:
+            settle_delivery(operation, DELIVERY_DELIVERED)
         if store is not None:
             try:
                 saved = store.save_ai_report(
@@ -709,17 +725,6 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
             except Exception as exc:
                 logger.info("Copilot AI cache write failed: %s", type(exc).__name__)
 
-        try:
-            await query.message.reply_text(text, disable_web_page_preview=True)
-        except Exception as exc:
-            logger.warning("Copilot AI delivery failed: %s", type(exc).__name__)
-            if operation is not None:
-                # The answer is lost, so the credit stays spent: the analysis may
-                # have reached the user anyway.
-                settle_delivery(operation, DELIVERY_UNKNOWN)
-            raise
-        if operation is not None:
-            settle_delivery(operation, DELIVERY_DELIVERED)
         job_bot.db.log_event(
             user_id, "copilot_ai_viewed", {"hash": job_hash, "model": result.model}
         )
@@ -1126,7 +1131,7 @@ async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> Non
         # The credit is only taken once the document exists, and only for the
         # attempt that delivers it. A repeated request of the same vacancy keeps
         # the state the operation already has.
-        operation = cv_operation(store, user_id, job_hash)
+        operation = cv_operation(store, user_id, job_hash).bind_claim(claimed)
         try:
             CreditManager(store).ensure_daily_allowance(user_id)
             operation.reserve()
@@ -1150,6 +1155,9 @@ async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> Non
             logger.warning("Copilot credit reservation failed: %s", type(exc).__name__)
             _release_pdf_claim(store, user_id, job_hash, claimed)
             await message.reply_text("Не удалось проверить кредиты. Попробуй позже.")
+            return
+
+        if not operation.can_deliver():
             return
 
         try:
