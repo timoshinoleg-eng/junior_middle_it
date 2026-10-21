@@ -78,6 +78,8 @@ class FakeStore:
         self.balance_value = balance
         self.spent = []
         self.saved = []
+        self.events = []
+        self.claimed = set()
 
     # rate limit
     def bump_rate_limit(self, user_id, *, limit=10, window_minutes=10):
@@ -87,9 +89,23 @@ class FakeStore:
     def get_document(self, user_id, job_id):
         return self.document
 
-    def save_document(self, user_id, job_id, **kwargs):
+    def save_document(self, user_id, job_id, *, claim=None, **kwargs):
         self.saved.append((user_id, job_id, kwargs))
         return True
+
+    def claim_document(self, user_id, job_id, filename, *, stale_after_minutes=15):
+        key = (int(user_id), str(job_id))
+        if key in self.claimed:
+            return None
+        self.claimed.add(key)
+        return "claim:%s" % key[1]
+
+    def release_document_claim(self, user_id, job_id, claim=None):
+        key = (int(user_id), str(job_id))
+        if key in self.claimed:
+            self.claimed.discard(key)
+            return True
+        return False
 
     def get_forwarded_job(self, job_hash):
         return None
@@ -104,6 +120,9 @@ class FakeStore:
     def grant_daily_allowance(self, user_id, amount):
         return None
 
+    def grant_daily_allowance_with_event(self, user_id, amount, reason, ref=""):
+        return False
+
     def spend_credits(self, user_id, amount):
         if self.balance_value < amount:
             return None
@@ -111,7 +130,56 @@ class FakeStore:
         self.spent.append(amount)
         return self.balance_value
 
+    def _count(self, user_id, reason, ref):
+        return sum(
+            1
+            for uid, _delta, item_reason, item_ref in self.events
+            if int(uid) == int(user_id)
+            and str(item_reason) == str(reason)
+            and str(item_ref) == str(ref)
+        )
+
+    def reserve_credit(self, user_id, amount, reason, ref, *, release_reason="spend_release"):
+        if self._count(user_id, reason, ref) > self._count(user_id, release_reason, ref):
+            return False
+        if self.balance_value < int(amount):
+            return False
+        self.balance_value -= int(amount)
+        self.spent.append(int(amount))
+        self.events.append((int(user_id), -int(amount), reason, ref))
+        return True
+
+    def release_credit(self, user_id, amount, reason, ref, *, reserved_reason):
+        if self._count(user_id, reserved_reason, ref) <= self._count(user_id, reason, ref):
+            return False
+        self.balance_value += int(amount)
+        self.events.append((int(user_id), int(amount), reason, ref))
+        return True
+
+    def credit_event_counts(self, user_id, reasons, ref):
+        counts = {}
+        for uid, _delta, reason, item_ref in self.events:
+            if int(uid) != int(user_id) or str(item_ref) != str(ref):
+                continue
+            if reason in reasons:
+                counts[reason] = counts.get(reason, 0) + 1
+        return counts
+
+    def credit_operation_state(self, user_id, ref, kind):
+        # This store has no operation registry, so the state of a costed
+        # operation is read from the journal.
+        return None
+
+    def confirm_credit_operation(self, user_id, ref, kind, reason):
+        self.events.append((int(user_id), 0, reason, ref))
+        return True
+
+    def mark_credit_operation_unknown(self, user_id, ref, kind, reason):
+        self.events.append((int(user_id), 0, reason, ref))
+        return True
+
     def log_credit_event(self, user_id, delta, reason, ref=""):
+        self.events.append((int(user_id), int(delta), reason, ref))
         return True
 
     def count_credit_events(self, reason, today_only=False):

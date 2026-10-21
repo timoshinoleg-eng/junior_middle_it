@@ -2,7 +2,7 @@
 
 The tool is an operational helper for the manual rollout of v7.0, so its
 expectations must not drift away from the repository: the table list has to
-match the migrations of P9-P12, and the flag list has to stay documented in
+match the migrations of P9-P13, and the flag list has to stay documented in
 ``.env.example.txt``.
 """
 import re

@@ -1,0 +1,273 @@
+﻿"""The accounting of the model calls: the five cases of one LLM analysis.
+
+The review asked for a model that tells the five cases of a paid analysis
+apart:
+
+* the call of the provider - it costs the operator, even when it fails;
+* the charge of the user - it happens once, only for a shown answer;
+* the answer from the cache - it costs nothing and calls nobody;
+* the repeat after the cache expired - it calls the model again and charges
+  the user nothing, because the vacancy was paid for already;
+* the failed attempt - it costs the operator a call and charges the user
+  nothing.
+
+On top of that the slot of the global budget is taken before the call, so
+parallel taps cannot pass the budget, and the analysis slot of the vacancy is
+claimed, so two parallel taps of the same vacancy cannot call the model
+twice and cannot charge the user twice.
+"""
+import os
+import threading
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import copilot_webhook_runtime as copilot_runtime
+from copilot import credit_operations as credit_ops
+from copilot import credits as copilot_credits
+
+from test_copilot_credit_operations import FakeGrowthStore, JOB
+from test_copilot_runtime import FakeBot, FakeDb, FakeMessage, FakeQuery, FakeUpdate
+
+
+# The user of the runtime tests.
+USER_ID = 4242
+
+
+def _result(ok=True, error=""):
+    from copilot import llm as copilot_llm
+
+    if not ok:
+        return copilot_llm.LLMResult(ok=False, error=error)
+    return copilot_llm.LLMResult(
+        ok=True,
+        summary="Нормальная junior-вакансия",
+        sections={
+            "strengths": ["Совпадает Python"],
+            "gaps": [],
+            "risks": [],
+            "next_steps": [],
+            "questions": [],
+        },
+        model="test-model",
+    )
+
+
+class LLMAccountingTests(unittest.TestCase):
+    """One LLM analysis and its five cases."""
+
+    def setUp(self):
+        patcher = patch.dict(
+            os.environ,
+            {
+                "COPILOT_ENABLED": "true",
+                "COPILOT_LLM_ENABLED": "true",
+                "COPILOT_LLM_API_KEY": "test-key",
+                "COPILOT_FREE_PER_DAY": "0",
+                "COPILOT_LLM_DAILY_BUDGET": "200",
+            },
+            clear=False,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.backend = FakeGrowthStore()
+        self.backend.initial_balance = 3
+        self.calls = []
+
+    def _analyze(self, ok=True, error=""):
+        def fake_analyze(job, skills, deterministic, resume_text, **kwargs):
+            self.calls.append(job)
+            return _result(ok=ok, error=error)
+
+        return fake_analyze
+
+    def _tap(self, *, ok=True, error="", backend=None, patched=True):
+        """One tap on the AI button.
+
+        The provider is patched by the caller, so two threads can tap at the
+        same moment without patching the module twice.
+        """
+        import asyncio
+
+        backend = backend or self.backend
+        db = FakeDb(JOB)
+        db._growth_store = backend
+        message = FakeMessage()
+        query = FakeQuery(message)
+        query.data = "copilot_ai:" + JOB["hash"]
+        update = FakeUpdate(message=message, query=query)
+        if patched:
+            with patch.object(
+                copilot_runtime.copilot_llm,
+                "analyze",
+                new=self._analyze(ok=ok, error=error),
+            ):
+                asyncio.run(
+                    copilot_runtime._copilot_handle_callback(
+                        FakeBot(db), update, SimpleNamespace()
+                    )
+                )
+        else:
+            asyncio.run(
+                copilot_runtime._copilot_handle_callback(
+                    FakeBot(db), update, SimpleNamespace()
+                )
+            )
+        return message, query, db
+
+    def _reasons(self, backend=None):
+        backend = backend or self.backend
+        return [reason for _uid, _delta, reason, _ref in backend.events]
+
+    def _text(self, message, query):
+        """Everything the user got: the answer of the button and the text."""
+        return " ".join(
+            [text for text, _kwargs in message.replies] + list(query.answers)
+        )
+
+    # -- the call of the provider ----------------------------------
+    def test_the_call_of_the_model_is_counted_and_charged_once(self):
+        message, _query, _db = self._tap()
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("AI-разбор", self._text(message, _query))
+        # The operator paid for one call and the user for one credit.
+        self.assertEqual(self._reasons().count(copilot_credits.REASON_LLM_ATTEMPT), 1)
+        self.assertEqual(self._reasons().count(credit_ops.REASON_LLM_SPEND), 1)
+        self.assertEqual(self._reasons().count(credit_ops.REASON_LLM_DELIVERED), 1)
+        self.assertEqual(self.backend._balance(USER_ID), 2)
+
+    def test_a_failed_call_costs_the_operator_but_not_the_user(self):
+        message, _query, db = self._tap(ok=False, error="http_500")
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("не получился", self._text(message, _query))
+        # The call was made, so the budget paid for it.
+        self.assertEqual(self._reasons().count(copilot_credits.REASON_LLM_ATTEMPT), 1)
+        # The user gets nothing, so the user pays nothing.
+        self.assertEqual(self._reasons().count(credit_ops.REASON_LLM_SPEND), 0)
+        self.assertEqual(self.backend._balance(USER_ID), 3)
+        self.assertTrue(any(name == "copilot_ai_failed" for name, _props in db.events))
+
+    def test_a_failed_call_leaves_no_report_behind(self):
+        self._tap(ok=False, error="http_500")
+        self.assertEqual(self.backend.ai_reports, {})
+        # The user may try again right away.
+        message, _query, _db = self._tap()
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("AI-разбор", self._text(message, _query))
+
+    # -- the answer from the cache ----------------------------------
+    def test_the_second_tap_answers_from_the_cache_and_costs_nothing(self):
+        self._tap()
+        message, _query, db = self._tap()
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("AI-разбор", self._text(message, _query))
+        self.assertTrue(any(name == "copilot_ai_cached" for name, _props in db.events))
+        self.assertEqual(self._reasons().count(copilot_credits.REASON_LLM_ATTEMPT), 1)
+        self.assertEqual(self._reasons().count(credit_ops.REASON_LLM_SPEND), 1)
+        self.assertEqual(self.backend._balance(USER_ID), 2)
+
+    # -- the repeat after the cache expired -------------------------
+    def test_the_repeat_after_the_cache_expired_calls_the_model_again(self):
+        self._tap()
+        # The cached answer expires.
+        self.backend.advance(minutes=13 * 60)
+        message, _query, _db = self._tap()
+        # The operator paid for the second call.
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self._reasons().count(copilot_credits.REASON_LLM_ATTEMPT), 2)
+        # The vacancy was paid for already, so the user pays nothing more.
+        self.assertEqual(self._reasons().count(credit_ops.REASON_LLM_SPEND), 1)
+        self.assertEqual(self.backend._balance(USER_ID), 2)
+        self.assertIn("AI-разбор", self._text(message, _query))
+
+    # -- the budget -------------------------------------------------
+    def test_the_budget_stops_the_call_when_it_is_exhausted(self):
+        with patch.dict(os.environ, {"COPILOT_LLM_DAILY_BUDGET": "1"}, clear=False):
+            self._tap()
+            # The only slot of the day is used.
+            self.backend.advance(minutes=13 * 60)
+            message, _query, _db = self._tap()
+        # The second call does not reach the model at all.
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("лимит AI-разборов исчерпан", self._text(message, _query))
+        self.assertEqual(self._reasons().count(copilot_credits.REASON_LLM_ATTEMPT), 1)
+        self.assertEqual(self.backend._balance(USER_ID), 2)
+
+    def test_a_budget_of_zero_calls_nobody(self):
+        with patch.dict(os.environ, {"COPILOT_LLM_DAILY_BUDGET": "0"}, clear=False):
+            message, _query, _db = self._tap()
+        self.assertEqual(self.calls, [])
+        self.assertIn("лимит AI-разборов исчерпан", self._text(message, _query))
+        self.assertEqual(self.backend._balance(USER_ID), 3)
+
+    def test_the_budget_counter_is_a_counter_of_its_own(self):
+        """The counter of the budget is not the counter of the requests.
+
+        The rate limit of the Mini App counts the requests of a user, the
+        budget counts the calls of the model of everybody. They live in
+        different rows, so one cannot reset the other.
+        """
+        manager = copilot_credits.CreditManager(_store(self.backend))
+        self.assertTrue(manager.reserve_llm_call(USER_ID, "job-a"))
+        self.assertTrue(manager.reserve_llm_call(USER_ID + 1, "job-b"))
+        self.assertEqual(self.backend.rate_limits.get(0), 2)
+
+    # -- parallel taps ----------------------------------------------
+    def test_two_parallel_taps_call_the_model_once(self):
+        """The analysis slot of the vacancy is the mutex of the flow.
+
+        Without the claim two parallel taps would call the model twice, burn
+        two slots of the budget and could charge the user twice, because the
+        reservation of the credit cannot see the parallel transaction yet.
+        """
+        results = []
+
+        def worker():
+            try:
+                self._tap(patched=False)
+                results.append("ok")
+            except Exception as exc:  # pragma: no cover - reported below
+                results.append("error: %s" % exc)
+
+        with patch.object(
+            copilot_runtime.copilot_llm, "analyze", new=self._analyze()
+        ):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(results, ["ok", "ok"])
+        # One call of the model, one slot of the budget, one charge.
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self._reasons().count(copilot_credits.REASON_LLM_ATTEMPT), 1)
+        self.assertEqual(self._reasons().count(credit_ops.REASON_LLM_SPEND), 1)
+        self.assertEqual(self.backend._balance(USER_ID), 2)
+
+    def test_the_second_tap_is_told_that_the_analysis_runs(self):
+        """The tap that loses the race gets an answer, not a second analysis."""
+        claim = self.backend._claim_ai_report((USER_ID, JOB["hash"], "claim:other", False, 15))
+        self.assertIsNotNone(claim)
+        message, _query, _db = self._tap()
+        self.assertEqual(self.calls, [])
+        self.assertIn("уже выполняется", self._text(message, _query))
+        self.assertEqual(self.backend._balance(USER_ID), 3)
+        # The claim of the other attempt is still there.
+        self.assertIn((USER_ID, JOB["hash"]), self.backend.ai_reports)
+
+    def test_a_stale_analysis_slot_is_taken_over(self):
+        self.backend._claim_ai_report((USER_ID, JOB["hash"], "claim:old", False, 15))
+        self.backend.advance(minutes=20)
+        message, _query, _db = self._tap()
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("AI-разбор", self._text(message, _query))
+
+
+def _store(backend):
+    from copilot.store import CopilotStore
+
+    return CopilotStore(backend)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -32,6 +32,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Compile Python sources
         run: python -m compileall -q .
 
@@ -83,6 +88,10 @@ jobs:
              test_copilot_enrich \
              test_copilot_store \
              test_copilot_credits \
+             test_copilot_credit_operations \
+             test_copilot_credit_concurrency \
+             test_copilot_llm_accounting \
+             test_copilot_edge_validator \
              test_copilot_runtime \
              test_copilot_pdf \
              test_copilot_security \

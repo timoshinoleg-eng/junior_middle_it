@@ -169,11 +169,20 @@ class CopilotStoreTests(unittest.TestCase):
     def test_ai_report_is_cached(self):
         store = self._store()
         self.assertTrue(
-            store.save_ai_report(1, "hash", model="m", answer="answer", used_resume=False)
+            store.save_ai_report(
+                1, "hash", claim="claim:1", model="m", answer="answer", used_resume=False
+            )
         )
         query, params = self.backend.queries[-1]
         self.assertIn("growth_copilot_ai_reports", query)
         self.assertIn("answer", params)
+
+    def test_ai_report_needs_the_claim_of_its_owner(self):
+        store = self._store()
+        self.assertTrue(store.claim_ai_report(1, "hash"))
+        query, params = self.backend.queries[-1]
+        self.assertIn("growth_copilot_ai_reports", query)
+        self.assertIn("claim:", params[2])
 
     def test_ai_report_is_read_back(self):
         store = self._store(
@@ -191,11 +200,15 @@ class CopilotStoreTests(unittest.TestCase):
         for table in removed:
             self.assertTrue(table.startswith("growth_"))
         deletes = [q for q, _ in self.backend.queries if q.upper().startswith("DELETE")]
-        self.assertEqual(len(deletes), 7)
+        self.assertEqual(len(deletes), 8)
         joined = " ".join(deletes)
         self.assertIn("growth_copilot_ai_reports", joined)
         self.assertIn("growth_copilot_forwarded_jobs", joined)
         self.assertIn("growth_copilot_applications", joined)
+        # An open reservation is never dropped: the state of the row is what
+        # keeps a paid operation from being paid for twice.
+        self.assertIn("growth_copilot_credit_ops", joined)
+        self.assertIn("state <> 'reserved'", joined)
 
 
 if __name__ == "__main__":

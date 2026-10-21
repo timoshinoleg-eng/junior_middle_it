@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 from copilot import fit as copilot_fit
 from copilot import grade_audit as copilot_grade
 from copilot import hr_link as copilot_hr
+from copilot.credit_operations import DELIVERY_REJECTED, DELIVERY_UNKNOWN
 
 MAX_BODY_BYTES = 4_000_000
 MAX_RESUME_BYTES = 2_500_000
@@ -28,15 +29,28 @@ RATE_LIMIT_REQUESTS = 10
 RATE_LIMIT_WINDOW_MINUTES = 10
 BOT_API_TIMEOUT = 30
 
+__all__ = [
+    "DELIVERY_REJECTED",
+    "DELIVERY_UNKNOWN",
+    "WebappError",
+]
+
 
 class WebappError(Exception):
-    """An error with the HTTP status and the message the Mini App shows."""
+    """An error with the HTTP status and the message the Mini App shows.
 
-    def __init__(self, status: int, code: str, message: str):
+    ``delivery`` tells whether a failed Telegram call is known to have
+    rejected the document or only left the outcome open. A rejected document
+    can be paid back, an open outcome cannot: Telegram may have stored it even
+    though the answer was lost.
+    """
+
+    def __init__(self, status: int, code: str, message: str, *, delivery: Optional[str] = None):
         super().__init__(message)
         self.status = int(status)
         self.code = str(code)
         self.message = str(message)
+        self.delivery = delivery
 
     def payload(self) -> Dict:
         return {
@@ -128,11 +142,27 @@ def _bot_api_call(token: str, method: str, payload: Dict) -> Dict:
         with urllib.request.urlopen(request, timeout=BOT_API_TIMEOUT) as response:
             data = json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        raise WebappError(502, "telegram_error", "Telegram не принял файл. Попробуй позже.") from exc
+        rejected = 400 <= int(exc.code) < 500
+        raise WebappError(
+            502,
+            "telegram_error",
+            "Telegram не принял файл. Попробуй позже.",
+            delivery=DELIVERY_REJECTED if rejected else DELIVERY_UNKNOWN,
+        ) from exc
     except Exception as exc:
-        raise WebappError(502, "telegram_error", "Telegram недоступен. Попробуй позже.") from exc
+        raise WebappError(
+            502,
+            "telegram_error",
+            "Telegram недоступен. Попробуй позже.",
+            delivery=DELIVERY_UNKNOWN,
+        ) from exc
     if not isinstance(data, dict) or not data.get("ok"):
-        raise WebappError(502, "telegram_error", "Telegram не принял файл. Попробуй позже.")
+        raise WebappError(
+            502,
+            "telegram_error",
+            "Telegram не принял файл. Попробуй позже.",
+            delivery=DELIVERY_REJECTED,
+        )
     result = data.get("result")
     return result if isinstance(result, dict) else {}
 
@@ -166,11 +196,29 @@ def send_document_to_chat(
         with urllib.request.urlopen(request, timeout=BOT_API_TIMEOUT) as response:
             data = json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        raise WebappError(502, "telegram_error", "Telegram не принял файл. Попробуй позже.") from exc
+        # Telegram answered. A 4xx means the document was rejected, a 5xx and
+        # every lost answer leave the outcome open.
+        rejected = 400 <= int(exc.code) < 500
+        raise WebappError(
+            502,
+            "telegram_error",
+            "Telegram не принял файл. Попробуй позже.",
+            delivery=DELIVERY_REJECTED if rejected else DELIVERY_UNKNOWN,
+        ) from exc
     except Exception as exc:
-        raise WebappError(502, "telegram_error", "Telegram недоступен. Попробуй позже.") from exc
+        raise WebappError(
+            502,
+            "telegram_error",
+            "Telegram недоступен. Попробуй позже.",
+            delivery=DELIVERY_UNKNOWN,
+        ) from exc
     if not isinstance(data, dict) or not data.get("ok"):
-        raise WebappError(502, "telegram_error", "Telegram не принял файл. Попробуй позже.")
+        raise WebappError(
+            502,
+            "telegram_error",
+            "Telegram не принял файл. Попробуй позже.",
+            delivery=DELIVERY_REJECTED,
+        )
     result = data.get("result") or {}
     document = result.get("document") or {}
     return {
