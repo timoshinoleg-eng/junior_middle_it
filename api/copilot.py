@@ -32,6 +32,7 @@ from copilot import forward as copilot_forward
 from copilot import pdf as copilot_pdf
 from copilot import webapp as copilot_webapp
 from copilot import webapp_auth
+from copilot import paid_operations_enabled
 from copilot.credit_operations import (
     DELIVERY_DELIVERED,
     DELIVERY_UNKNOWN,
@@ -173,6 +174,11 @@ class handler(BaseHTTPRequestHandler):
             payload = self._read_json()
             user = self._authenticate(payload)
             user_id = int(user["id"])
+            if path.endswith("/pdf") and not paid_operations_enabled(pdf=True):
+                raise copilot_webapp.WebappError(
+                    503, "maintenance",
+                    "Разбор резюме временно недоступен: технические работы. Попробуй позже.",
+                )
             db, job_bot, store = self._runtime()
             self._rate_limit(store, user_id)
             if path.endswith("/pdf"):

@@ -647,7 +647,7 @@ def call_api(store, db, payload, *, path="/api/copilot/pdf", env=None):
     handler.path = path
     handler.captured_status = None
     handler.captured_payload = None
-    environment = {"TELEGRAM_BOT_TOKEN": BOT_TOKEN}
+    environment = {"TELEGRAM_BOT_TOKEN": BOT_TOKEN, "COPILOT_ENABLED": "true", "COPILOT_PDF_ENABLED": "true"}
     environment.update(env or {})
     with patch.dict(os.environ, environment, clear=False), patch.object(
         api_copilot.handler, "_runtime", new=lambda self: (db, None, store)
@@ -722,9 +722,10 @@ def run_telegram_build(store, backend, *, failure=None, user_id=42):
     )
     context = SimpleNamespace(bot=FakeTelegramBot(failure=failure))
     pending = {"job_hash": JOB["hash"], "job": dict(JOB)}
-    asyncio.run(
-        copilot_runtime._build_cv_from_message(job_bot, update, context, pending)
-    )
+    with patch.dict(os.environ, {"COPILOT_ENABLED": "true", "COPILOT_PDF_ENABLED": "true"}):
+        asyncio.run(
+            copilot_runtime._build_cv_from_message(job_bot, update, context, pending)
+        )
     return message, db, context
 
 

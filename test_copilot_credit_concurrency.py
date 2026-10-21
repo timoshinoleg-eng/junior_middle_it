@@ -7,7 +7,7 @@ operation at the same time. This module runs the production statements of
 
 The server is not started by the test: it reads the DSN from the environment
 variable ``COPILOT_TEST_PG_DSN`` and skips itself when there is none, so the
-local run can omit PostgreSQL. CI supplies an isolated PostgreSQL service. To run it locally:
+local run can omit PostgreSQL. Only database copilot_test on localhost, 127.0.0.1 or ::1 is allowed. CI supplies an isolated PostgreSQL service. To run it locally:
 
     python tools/pg_concurrency_check.py
 
@@ -30,6 +30,7 @@ What the module proves:
 * a build whose slot was released cannot write its file or its answer.
 """
 import os
+from tools.copilot_pg_safety import validate_test_dsn
 import threading
 import unittest
 
@@ -135,6 +136,7 @@ CREATE TABLE IF NOT EXISTS public.growth_copilot_rate_limits (
 
 
 def _reset(dsn: str) -> None:
+    validate_test_dsn(dsn)
     import psycopg
 
     with psycopg.connect(dsn, autocommit=True) as conn:
@@ -724,17 +726,15 @@ def run_scenarios(dsn: str) -> dict:
 class CreditConcurrencyTests(unittest.TestCase):
     """The credit reservation on a real PostgreSQL server."""
 
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         dsn = os.environ.get(DSN_ENV)
         if not dsn and os.environ.get("CI"):
-            self.fail("CI must provide COPILOT_TEST_PG_DSN")
+            raise RuntimeError("CI must provide COPILOT_TEST_PG_DSN")
         if not dsn:
-            self.skipTest("%s is not set: no PostgreSQL for the concurrency check" % DSN_ENV)
-        from psycopg.conninfo import conninfo_to_dict
-        dbname = conninfo_to_dict(dsn).get("dbname", "").lower()
-        if not dbname or any(word in dbname for word in ("prod", "production", "main", "junior")):
-            self.fail("COPILOT_TEST_PG_DSN must name a dedicated test database")
-        self.dsn = dsn
+            raise unittest.SkipTest("COPILOT_TEST_PG_DSN is not set: no PostgreSQL for the concurrency check")
+        validate_test_dsn(dsn)
+        cls.dsn = dsn
 
     def _abandoned(self, kind, *, stale=True):
         import psycopg

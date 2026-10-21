@@ -211,7 +211,7 @@ def call(payload, *, path="/api/copilot", db=None, store=None, env=None):
     handler.path = path
     handler.captured_status = None
     handler.captured_payload = None
-    environment = {"TELEGRAM_BOT_TOKEN": BOT_TOKEN}
+    environment = {"TELEGRAM_BOT_TOKEN": BOT_TOKEN, "COPILOT_ENABLED": "true", "COPILOT_PDF_ENABLED": "true"}
     environment.update(env or {})
     with patch.dict(os.environ, environment, clear=False), patch.object(
         api_copilot.handler, "_runtime", new=lambda self: (db, None, store)

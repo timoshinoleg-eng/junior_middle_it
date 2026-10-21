@@ -9,7 +9,7 @@ One command that checks every surface of the release:
 * the deployed validator version of both Edge growth bridges, so the Edge
   deploy is observable without credentials;
 * the Mini App API signature gate - a forged ``initData`` must stay a 401;
-* the P9-P12 Copilot tables and their privileges (needs a Supabase access token).
+* the P9-P14 Copilot schema, P14 claim column and table privileges (needs a Supabase access token).
 
 Credentials are optional. A check that needs one is reported as skipped instead
 of failed, so the script always ends with a readable matrix and a stable exit
@@ -40,7 +40,7 @@ EDGE_BASE = "https://%s.supabase.co/functions/v1" % SUPABASE_PROJECT_REF
 VERCEL_PROJECT = "junior-middle-it"
 VERCEL_SCOPE = "olegs-projects-bfc4e11a"
 
-# Tables of the migrations P9-P13, in the order of the migrations.
+# Tables and required columns of migrations P9-P14.
 EXPECTED_TABLES = (
     "growth_copilot_ai_reports",
     "growth_copilot_applications",
@@ -55,6 +55,37 @@ EXPECTED_TABLES = (
     "growth_copilot_profiles",
     "growth_copilot_rate_limits",
 )
+
+EXPECTED_P14_CLAIM_COLUMN = {
+    "table_name": "growth_copilot_ai_reports", "column_name": "claim",
+    "data_type": "text", "is_nullable": "NO", "column_default": "''::text",
+}
+
+
+def column_problems(rows):
+    """Require the P14 ownership column, including its type and constraints."""
+    expected = EXPECTED_P14_CLAIM_COLUMN
+    row = next((row for row in rows if row.get("table_name") == expected["table_name"]
+                and row.get("column_name") == expected["column_name"]), None)
+    if row is None:
+        return ["P14 growth_copilot_ai_reports.claim is missing"]
+    return ["P14 claim %s must be %r" % (key, expected[key])
+            for key in ("data_type", "is_nullable", "column_default") if row.get(key) != expected[key]]
+
+
+def check_p14_column(results, url, headers):
+    query = ("SELECT table_name, column_name, data_type, is_nullable, column_default "
+             "FROM information_schema.columns WHERE table_schema = 'public' "
+             "AND table_name = 'growth_copilot_ai_reports' AND column_name = 'claim'")
+    status, body = http(url, method="POST", headers=headers, body=json_body({"query": query}))
+    try:
+        rows = json.loads(body) if status == 200 else None
+        problems = column_problems(rows) if isinstance(rows, list) else ["P14 column query failed or returned invalid data"]
+    except (ValueError, TypeError, AttributeError):
+        problems = ["P14 column query returned invalid data"]
+    results.append({"name": "supabase.copilot_p14_claim", "status": FAIL if problems else PASS,
+                    "detail": "; ".join(problems) if problems else "P14 claim TEXT NOT NULL DEFAULT ''"})
+
 
 # Feature flags of the production environment. The LLM layer stays off until a
 # provider key exists, and the resume never reaches a model by default.
@@ -498,6 +529,7 @@ def check_tables(results: List[Dict[str, str]]) -> None:
         return
     url = "https://api.supabase.com/v1/projects/%s/database/query" % SUPABASE_PROJECT_REF
     headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+    check_p14_column(results, url, headers)
     table_query = (
         "SELECT c.relname AS table_name, c.relrowsecurity AS rls_enabled "
         "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "

@@ -108,6 +108,8 @@ jobs:
              test_copilot_credit_operations \
              test_copilot_credit_concurrency \
              test_copilot_registry_recovery \
+             test_copilot_maintenance \
+             test_copilot_pg_safety \
              test_copilot_llm_accounting \
              test_copilot_edge_validator \
              test_copilot_runtime \

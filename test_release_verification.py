@@ -2,10 +2,11 @@
 
 The tool is an operational helper for the manual rollout of v7.0, so its
 expectations must not drift away from the repository: the table list has to
-match the migrations of P9-P13, and the flag list has to stay documented in
+match the migrations of P9-P14, and the flag list has to stay documented in
 ``.env.example.txt``.
 """
 import re
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -242,3 +243,40 @@ class ValidatorVersionCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class P14ColumnTests(unittest.TestCase):
+    def test_missing_or_incorrect_claim_column_fails_release(self):
+        for key, value in ((None, None), ("data_type", "integer"), ("is_nullable", "YES"), ("column_default", None), ("column_default", "'claim'::text")):
+            with self.subTest(key=key, value=value):
+                row = dict(verify.EXPECTED_P14_CLAIM_COLUMN)
+                if key:
+                    row[key] = value
+                rows = [row] if key else []
+                results = []
+                with patch.object(verify, "http", return_value=(200, json.dumps(rows))):
+                    verify.check_p14_column(results, "https://example.test", {})
+                self.assertEqual(results[0]["status"], verify.FAIL)
+
+    def test_correct_claim_column_passes_release(self):
+        results = []
+        with patch.object(verify, "http", return_value=(200, json.dumps([dict(verify.EXPECTED_P14_CLAIM_COLUMN)]))):
+            verify.check_p14_column(results, "https://example.test", {})
+        self.assertEqual(results[0]["status"], verify.PASS)
+
+
+class P14IntegrationTests(unittest.TestCase):
+    def test_table_check_fails_when_p14_column_is_missing(self):
+        def respond(url, **kwargs):
+            query = json.loads(kwargs["body"])["query"]
+            if "pg_class" in query:
+                rows = [{"table_name": name, "rls_enabled": True} for name in verify.EXPECTED_TABLES]
+            else:
+                rows = []
+            return 200, json.dumps(rows)
+        results = []
+        with patch.dict("os.environ", {"SUPABASE_ACCESS_TOKEN": "test-only"}), patch.object(verify, "http", side_effect=respond):
+            verify.check_tables(results)
+        statuses = {row["name"]: row["status"] for row in results}
+        self.assertEqual(statuses["supabase.copilot_tables"], verify.PASS)
+        self.assertEqual(statuses["supabase.copilot_p14_claim"], verify.FAIL)

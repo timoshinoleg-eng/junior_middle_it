@@ -23,7 +23,7 @@ from saved_searches import suggested_search_from_resume
 from telegram import WebAppInfo
 from telegram.ext import CommandHandler
 
-from copilot import flag_enabled
+from copilot import flag_enabled, paid_operations_enabled
 from copilot import enrich as copilot_enrich
 from copilot import fit as copilot_fit
 from copilot import forward as copilot_forward
@@ -76,7 +76,7 @@ def enrichment_enabled() -> bool:
 
 def pdf_enabled() -> bool:
     """PDF export is a paid action, so it has its own switch."""
-    return flag_enabled("COPILOT_PDF_ENABLED")
+    return paid_operations_enabled(pdf=True)
 
 
 def ai_enabled() -> bool:
@@ -518,6 +518,10 @@ def _release_ai_claim(store, user_id: int, job_hash: str, claim: str) -> None:
 
 async def _handle_ai(job_bot, update, job_hash: str) -> None:
     """Run the optional LLM analysis behind the explicit button."""
+    if not paid_operations_enabled():
+        logger.info("Copilot AI refused: maintenance")
+        await update.callback_query.answer("Технические работы, попробуй позже.", show_alert=True)
+        return
     query = update.callback_query
     user_id = update.effective_user.id if update.effective_user else None
     if not user_id:
@@ -1034,6 +1038,10 @@ def _release_pdf_claim(store, user_id: int, job_hash: str, claim: str) -> None:
 
 async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> None:
     """Build the tailored CV from the resume the user just sent."""
+    if not paid_operations_enabled(pdf=True):
+        logger.info("Copilot PDF refused: maintenance")
+        await update.message.reply_text("Технические работы, попробуй позже.")
+        return
     user_id = update.effective_user.id if update.effective_user else None
     message = update.message
     document = getattr(message, "document", None) if message else None
@@ -1335,6 +1343,10 @@ async def _copilot_handle_callback(self, update, context):
         return await _original_handle_callback(self, update, context)
 
     action, _, rest = data.partition(":")
+    if action in ("copilot_ai", "copilot_pdf") and not paid_operations_enabled(pdf=action == "copilot_pdf"):
+        logger.info("Copilot paid callback refused: maintenance")
+        await query.answer("Технические работы, попробуй позже.", show_alert=True)
+        return
     if action == "copilot_outcome":
         stage, _, job_hash = rest.partition(":")
         await _handle_outcome(self, update, stage, job_hash)
