@@ -22,7 +22,12 @@ What the module proves:
 * a parallel reservation and a refund keep the journal consistent;
 * the slot of the global budget is atomic: parallel calls cannot pass it;
 * a claim that was taken over cannot be released or written by its old owner;
-* the balance of a referral and its journal entry are written together.
+* the balance of a referral and its journal entry are written together;
+* two parallel reservations of one operation charge the user once, even
+  without a claim in front of them, and the same holds for the releases;
+* a reservation without balance changes nothing, so an operation is never
+  paid for without a debit;
+* a build whose slot was released cannot write its file or its answer.
 """
 import os
 import threading
@@ -87,6 +92,17 @@ CREATE TABLE IF NOT EXISTS public.growth_copilot_credit_events (
     ref TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE TABLE IF NOT EXISTS public.growth_copilot_credit_ops (
+    user_id BIGINT NOT NULL,
+    ref TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'reserved',
+    amount INTEGER NOT NULL DEFAULT 1,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, ref, kind)
+);
 CREATE TABLE IF NOT EXISTS public.growth_copilot_documents (
     user_id BIGINT NOT NULL,
     job_id TEXT NOT NULL,
@@ -122,6 +138,7 @@ def _reset(dsn: str) -> None:
         with conn.cursor() as cur:
             cur.execute(SCHEMA)
             cur.execute("DELETE FROM growth_copilot_credit_events")
+            cur.execute("DELETE FROM growth_copilot_credit_ops")
             cur.execute("DELETE FROM growth_copilot_credits")
             cur.execute("DELETE FROM growth_copilot_documents")
             cur.execute("DELETE FROM growth_copilot_ai_reports")
@@ -159,6 +176,72 @@ def _journal(dsn: str, user_id: int = USER_ID):
 
 def _store(dsn: str) -> CopilotStore:
     return CopilotStore(PsycopgGrowthStore(dsn))
+
+
+def _balance_set(dsn: str, balance: int, user_id: int = USER_ID) -> int:
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE growth_copilot_credits SET balance = %s WHERE user_id = %s",
+                (int(balance), int(user_id)),
+            )
+    return int(balance)
+
+
+def _operations(dsn: str, user_id: int = USER_ID):
+    """The rows of the registry of the credit operations."""
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ref, kind, state, attempt FROM growth_copilot_credit_ops "
+                "WHERE user_id = %s ORDER BY ref, kind",
+                (int(user_id),),
+            )
+            return [(row[0], row[1], row[2], int(row[3])) for row in cur.fetchall()]
+
+
+def _make_claim_stale(dsn: str) -> None:
+    """Make the claim of the document slot older than the stale window."""
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE growth_copilot_documents SET created_at = NOW() - INTERVAL '1 hour' "
+                "WHERE user_id = %s",
+                (USER_ID,),
+            )
+
+
+def _make_ai_claim_stale(dsn: str) -> None:
+    """Make the claim of the analysis slot older than the stale window."""
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE growth_copilot_ai_reports SET updated_at = NOW() - INTERVAL '1 hour' "
+                "WHERE user_id = %s",
+                (USER_ID,),
+            )
+
+
+def _ai_report(dsn: str):
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT model, answer FROM growth_copilot_ai_reports "
+                "WHERE user_id = %s AND job_id = %s",
+                (USER_ID, REF),
+            )
+            row = cur.fetchone()
+            return tuple(row) if row else None
 
 
 def _parallel(dsn: str, jobs):
@@ -427,17 +510,13 @@ def scenario_balance_matches_journal(dsn: str) -> dict:
 
 
 def scenario_reservation_without_claim(dsn: str) -> dict:
-    """The measurement of the reservation that runs without a claim.
+    """The reservation of one operation without a claim.
 
-    The reservation counts the journal of the operation, and a parallel
-    transaction cannot see the event of the other one yet. So the
-    reservation alone is not safe: two parallel reservations of one operation
-    can charge the user twice.
-
-    The flows of the product are safe, because a costed action holds the
-    claim of its operation before it reserves the credit, and the claim is
-    the unique key of the operation. This scenario is a measurement, not a
-    test: it shows the size of the remaining window of the primitive.
+    The reservation used to count the journal of the operation, and a
+    parallel transaction cannot see the event of the other one yet, so two
+    parallel reservations of one operation charged the user twice. The state
+    of the operation is a row of the registry now, and the database refuses a
+    second reservation of the same attempt, so the user is charged once.
     """
     _reset(dsn)
 
@@ -456,6 +535,165 @@ def scenario_reservation_without_claim(dsn: str) -> dict:
     }
 
 
+def scenario_many_parallel_reservations(dsn: str, calls: int = 8) -> dict:
+    """Many parallel reservations of one operation charge the user once."""
+    _reset(dsn)
+
+    def reserve(store):
+        return store.reserve_credit(
+            USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
+        )
+
+    results = _parallel(dsn, [reserve] * calls)
+    journal = _journal(dsn)
+    return {
+        "granted": sum(1 for item in results if item is True),
+        "spends": sum(1 for r, _d, _r2 in journal if r == REASON_SPEND),
+        "balance": _balance(dsn),
+    }
+
+
+def scenario_parallel_releases(dsn: str, calls: int = 4) -> dict:
+    """Many parallel releases of one reservation give the credit back once.
+
+    The release is the mirror image of the reservation: a user who gets the
+    credit back twice would be able to spend it again for free.
+    """
+    _reset(dsn)
+    store = _store(dsn)
+    try:
+        store.reserve_credit(USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE)
+    finally:
+        store._store.close()
+
+    def release(store):
+        return store.release_credit(
+            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND
+        )
+
+    results = _parallel(dsn, [release] * calls)
+    journal = _journal(dsn)
+    return {
+        "granted": sum(1 for item in results if item is True),
+        "releases": sum(1 for r, _d, _r2 in journal if r == REASON_RELEASE),
+        "balance": _balance(dsn),
+    }
+
+
+def scenario_reservation_without_balance(dsn: str) -> dict:
+    """A reservation without balance changes nothing.
+
+    The reservation must not leave the operation of the user in a paid state
+    when the balance is empty, or the user would get the document for free.
+    """
+    _reset(dsn)
+    _balance_set(dsn, 0)
+    store = _store(dsn)
+    try:
+        reserved = store.reserve_credit(
+            USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
+        )
+    finally:
+        store._store.close()
+    journal = _journal(dsn)
+    return {
+        "reserved": bool(reserved),
+        "spends": len(journal),
+        "balance": _balance(dsn),
+        "operations": _operations(dsn),
+    }
+
+
+def scenario_expired_claim_two_reservations(dsn: str) -> dict:
+    """A claim that expired in the middle of the build cannot charge twice.
+
+    The first build holds the claim of the vacancy, the claim goes stale while
+    the build waits, the second build takes the claim over and both builds
+    reserve the credit of the same vacancy. The user is charged once.
+    """
+    _reset(dsn)
+
+    def first_build(store):
+        claim = store.claim_document(USER_ID, REF, "cv.pdf")
+        if not claim:
+            return {"claim": None, "reserved": False}
+        # The claim goes stale while the build waits for the credit check.
+        _make_claim_stale(dsn)
+        second = store.claim_document(USER_ID, REF, "cv.pdf")
+        reserved = store.reserve_credit(
+            USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
+        )
+        return {"claim": claim, "second": second, "reserved": bool(reserved)}
+
+    results = _parallel(dsn, [first_build, first_build])
+    journal = _journal(dsn)
+    return {
+        "results": results,
+        "granted": sum(1 for item in results if item.get("reserved")),
+        "spends": sum(1 for r, _d, _r2 in journal if r == REASON_SPEND),
+        "balance": _balance(dsn),
+    }
+
+
+def scenario_late_write_after_release(dsn: str) -> dict:
+    """A build whose slot was released cannot write its file.
+
+    The build of the first owner loses the slot of the vacancy, the second
+    owner takes it over and gives it back, and the first owner writes its file
+    afterwards. The write is refused and the slot stays free: the old upsert
+    created the row again and delivered a file that nobody owns.
+    """
+    _reset(dsn)
+    store = _store(dsn)
+    try:
+        first = store.claim_document(USER_ID, REF, "cv.pdf")
+        _make_claim_stale(dsn)
+        second = store.claim_document(USER_ID, REF, "cv.pdf")
+        released = store.release_document_claim(USER_ID, REF, second)
+        late_write = store.save_document(
+            USER_ID,
+            REF,
+            telegram_file_id="FILE-OLD",
+            filename="cv.pdf",
+            fit_score=10,
+            claim=first,
+        )
+        row = _document(dsn)
+    finally:
+        store._store.close()
+    return {
+        "first": first,
+        "second": second,
+        "released": released,
+        "late_write": late_write,
+        "row": row,
+    }
+
+
+def scenario_late_report_after_release(dsn: str) -> dict:
+    """An analysis whose slot was released cannot write its answer."""
+    _reset(dsn)
+    store = _store(dsn)
+    try:
+        first = store.claim_ai_report(USER_ID, REF)
+        _make_ai_claim_stale(dsn)
+        second = store.claim_ai_report(USER_ID, REF)
+        released = store.release_ai_report_claim(USER_ID, REF, second)
+        late_write = store.save_ai_report(
+            USER_ID, REF, claim=first, model="m", answer="late answer"
+        )
+        row = _ai_report(dsn)
+    finally:
+        store._store.close()
+    return {
+        "first": first,
+        "second": second,
+        "released": released,
+        "late_write": late_write,
+        "row": row,
+    }
+
+
 SCENARIOS = {
     "sequential": scenario_sequential,
     "parallel_same_operation": scenario_parallel_same_operation,
@@ -467,6 +705,12 @@ SCENARIOS = {
     "referral_grant": scenario_referral_grant,
     "balance_matches_journal": scenario_balance_matches_journal,
     "reservation_without_claim": scenario_reservation_without_claim,
+    "many_parallel_reservations": scenario_many_parallel_reservations,
+    "parallel_releases": scenario_parallel_releases,
+    "reservation_without_balance": scenario_reservation_without_balance,
+    "expired_claim_two_reservations": scenario_expired_claim_two_reservations,
+    "late_write_after_release": scenario_late_write_after_release,
+    "late_report_after_release": scenario_late_report_after_release,
 }
 
 
@@ -562,6 +806,69 @@ class CreditConcurrencyTests(unittest.TestCase):
                 )
                 row = cur.fetchone()
         self.assertEqual(int(row[0]), 1)
+
+    # ------------------------------------------------------------------
+    # The reservation of one operation cannot charge the user twice.
+    # ------------------------------------------------------------------
+    def test_two_parallel_reservations_of_one_operation_charge_once(self):
+        """The reservation alone is safe, without a claim in front of it.
+
+        The reservation used to count the journal, and a parallel transaction
+        does not see the event of the other one yet, so both of them charged
+        the user. The state of the operation is a row of the registry now.
+        """
+        result = scenario_reservation_without_claim(self.dsn)
+        self.assertEqual(result["granted"], 1, result)
+        self.assertEqual(result["spends"], 1, result)
+        self.assertEqual(result["balance"], BALANCE - 1, result)
+
+    def test_many_parallel_reservations_of_one_operation_charge_once(self):
+        result = scenario_many_parallel_reservations(self.dsn, calls=8)
+        self.assertEqual(result["granted"], 1, result)
+        self.assertEqual(result["spends"], 1, result)
+        self.assertEqual(result["balance"], BALANCE - 1, result)
+
+    def test_many_parallel_releases_give_the_credit_back_once(self):
+        result = scenario_parallel_releases(self.dsn, calls=4)
+        self.assertEqual(result["granted"], 1, result)
+        self.assertEqual(result["releases"], 1, result)
+        self.assertEqual(result["balance"], BALANCE, result)
+
+    def test_a_reservation_without_balance_charges_nothing(self):
+        """The operation must not stay paid for when the balance is empty."""
+        result = scenario_reservation_without_balance(self.dsn)
+        self.assertFalse(result["reserved"], result)
+        self.assertEqual(result["spends"], 0, result)
+        self.assertEqual(result["balance"], 0, result)
+        self.assertEqual(result["operations"], [], result)
+
+    def test_a_claim_that_expired_in_the_middle_cannot_charge_twice(self):
+        """The build of a claim that expired does not charge the user again."""
+        result = scenario_expired_claim_two_reservations(self.dsn)
+        self.assertEqual(result["granted"], 1, result)
+        self.assertEqual(result["spends"], 1, result)
+        self.assertEqual(result["balance"], BALANCE - 1, result)
+
+    # ------------------------------------------------------------------
+    # The write of a result needs the claim of its owner.
+    # ------------------------------------------------------------------
+    def test_a_write_after_the_slot_was_released_is_refused(self):
+        """The old upsert created the row again and delivered a lost file."""
+        result = scenario_late_write_after_release(self.dsn)
+        self.assertTrue(result["first"])
+        self.assertTrue(result["second"])
+        self.assertTrue(result["released"])
+        self.assertFalse(result["late_write"], result)
+        self.assertIsNone(result["row"], result)
+
+    def test_a_report_after_the_slot_was_released_is_refused(self):
+        """The same rule for the answer of the AI analysis."""
+        result = scenario_late_report_after_release(self.dsn)
+        self.assertTrue(result["first"])
+        self.assertTrue(result["second"])
+        self.assertTrue(result["released"])
+        self.assertFalse(result["late_write"], result)
+        self.assertIsNone(result["row"], result)
 
 
 if __name__ == "__main__":

@@ -165,6 +165,19 @@ class FakeStore:
                 counts[reason] = counts.get(reason, 0) + 1
         return counts
 
+    def credit_operation_state(self, user_id, ref, kind):
+        # This store has no operation registry, so the state of a costed
+        # operation is read from the journal.
+        return None
+
+    def confirm_credit_operation(self, user_id, ref, kind, reason):
+        self.events.append((int(user_id), 0, reason, ref))
+        return True
+
+    def mark_credit_operation_unknown(self, user_id, ref, kind, reason):
+        self.events.append((int(user_id), 0, reason, ref))
+        return True
+
     def log_credit_event(self, user_id, delta, reason, ref=""):
         self.events.append((int(user_id), int(delta), reason, ref))
         return True

@@ -296,6 +296,51 @@ class handler(BaseHTTPRequestHandler):
         manager = CreditManager(store)
         operation = cv_operation(store, user_id, job_hash)
         try:
+            return self._build_and_send(
+                db,
+                store,
+                user_id,
+                job_hash,
+                job,
+                title,
+                token,
+                content,
+                resume,
+                claimed,
+                operation,
+                manager,
+            )
+        except BaseException:
+            # The claim is given back on every path that does not deliver a
+            # document: a build that failed or that was interrupted must not
+            # block the next request for fifteen minutes. Only the owner of
+            # the claim releases it, so a build that took the slot over keeps
+            # it.
+            self._release_claim(store, user_id, job_hash, claimed)
+            raise
+
+    def _build_and_send(
+        self,
+        db,
+        store,
+        user_id,
+        job_hash,
+        job,
+        title,
+        token,
+        content,
+        resume,
+        claimed,
+        operation,
+        manager,
+    ):
+        """Assemble the CV of one vacancy and send it to the chat.
+
+        The caller owns the claim and releases it when this method raises, so
+        every step that can fail - the settings of the user, the analysis, the
+        PDF, its validation and the caption - cannot leak the claim.
+        """
+        try:
             manager.ensure_daily_allowance(user_id)
             balance = manager.balance(user_id)
             # An operation the user already paid for is not paid for again,
@@ -303,12 +348,10 @@ class handler(BaseHTTPRequestHandler):
             already_paid = operation.paid
         except Exception as exc:
             logger.warning("Copilot webapp credits failed: %s", type(exc).__name__)
-            self._release_claim(store, user_id, job_hash, claimed)
             raise copilot_webapp.WebappError(
                 503, "store_unavailable", "Не удалось проверить кредиты. Попробуй позже."
             ) from exc
         if balance < 1 and not already_paid:
-            self._release_claim(store, user_id, job_hash, claimed)
             raise copilot_webapp.WebappError(
                 402,
                 "no_credits",
@@ -322,10 +365,8 @@ class handler(BaseHTTPRequestHandler):
                 mime_type=str(resume.get("mime_type") or ""),
             )
         except ResumeDocumentError as exc:
-            self._release_claim(store, user_id, job_hash, claimed)
             raise copilot_webapp.WebappError(400, "invalid_resume", str(exc)) from exc
         except Exception as exc:
-            self._release_claim(store, user_id, job_hash, claimed)
             raise copilot_webapp.WebappError(
                 400, "invalid_resume", "Не удалось прочитать файл. Пришли PDF или DOCX."
             ) from exc
@@ -344,7 +385,6 @@ class handler(BaseHTTPRequestHandler):
             )
         except Exception as exc:
             logger.warning("Copilot webapp CV build failed: %s", type(exc).__name__)
-            self._release_claim(store, user_id, job_hash, claimed)
             raise copilot_webapp.WebappError(
                 500, "cv_failed", "Не удалось собрать CV. Попробуй позже."
             ) from exc
@@ -358,14 +398,12 @@ class handler(BaseHTTPRequestHandler):
         try:
             operation.reserve()
         except InsufficientCredits as exc:
-            self._release_claim(store, user_id, job_hash, claimed)
             raise copilot_webapp.WebappError(
                 402,
                 "no_credits",
                 "Бесплатные сборки на сегодня закончились. Пригласи друга — получите бонус.",
             ) from exc
         except CreditStoreUnavailable as exc:
-            self._release_claim(store, user_id, job_hash, claimed)
             raise copilot_webapp.WebappError(
                 503, "store_unavailable", "Не удалось списать кредит. Попробуй позже."
             ) from exc
@@ -378,12 +416,11 @@ class handler(BaseHTTPRequestHandler):
             # A rejected document is paid back, a lost answer keeps the credit
             # spent: Telegram may have stored the file anyway.
             settle_delivery(operation, exc.delivery or DELIVERY_UNKNOWN)
-            self._release_claim(store, user_id, job_hash, claimed)
             raise
 
         settle_delivery(operation, DELIVERY_DELIVERED)
         try:
-            store.save_document(
+            saved = store.save_document(
                 user_id,
                 job_hash,
                 telegram_file_id=str(sent.get("file_id") or ""),
@@ -397,6 +434,13 @@ class handler(BaseHTTPRequestHandler):
             # slot is released, so the next request builds it again and stays
             # free: the operation is already paid for.
             self._release_claim(store, user_id, job_hash, claimed)
+        else:
+            if not saved:
+                # The write was refused: the claim belongs to another build
+                # now, so this file is not cached. The delivery already
+                # happened and the operation is paid for.
+                logger.warning("Copilot webapp document cache write was refused")
+                self._release_claim(store, user_id, job_hash, claimed)
         db.log_event(user_id, "copilot_webapp_cv_sent", {"hash": job_hash, "score": report.score})
         return 200, {
             "ok": True,

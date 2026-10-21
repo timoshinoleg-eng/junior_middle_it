@@ -40,11 +40,12 @@ EDGE_BASE = "https://%s.supabase.co/functions/v1" % SUPABASE_PROJECT_REF
 VERCEL_PROJECT = "junior-middle-it"
 VERCEL_SCOPE = "olegs-projects-bfc4e11a"
 
-# Tables of the migrations P9-P12, in the order of the migrations.
+# Tables of the migrations P9-P13, in the order of the migrations.
 EXPECTED_TABLES = (
     "growth_copilot_ai_reports",
     "growth_copilot_applications",
     "growth_copilot_credit_events",
+    "growth_copilot_credit_ops",
     "growth_copilot_credits",
     "growth_copilot_documents",
     "growth_copilot_enrichments",

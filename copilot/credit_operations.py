@@ -5,8 +5,16 @@ reserved, the document is produced and the document is delivered. The credit
 must not be lost when the production or the delivery fails, and it must not be
 spent twice when the user repeats the request.
 
-The state of one operation is derived from two tables that already exist, so
-no schema change is needed:
+The state of one operation is the row of the operation registry of the store,
+``growth_copilot_credit_ops``. One row per user, reference and kind of
+operation holds the state of the operation and is the gate of the reservation:
+the database refuses a second reservation of the same attempt, so two parallel
+requests of one vacancy cannot both charge the user. The rule used to be
+derived from the journal, and that rule cannot be made safe: under READ
+COMMITTED a parallel transaction does not see the event of the other one yet,
+so both of them counted the same number of reservations.
+
+The journal stays the history of the credits:
 
 * ``growth_copilot_credit_events`` - the journal. A ``spend`` entry marks the
   reservation, a ``spend_release`` entry the refund, ``cv_delivered`` a
@@ -28,12 +36,6 @@ States of one operation:
 The ambiguity is deliberate. A Telegram timeout does not prove that the
 document was not delivered, so the credit is not returned automatically; the
 state records that the operation was already paid for.
-
-The reservation is counted, not flagged. A spend without a matching release
-is an open reservation, so the same reference can be charged again after a
-refund but never twice for one attempt. The count is the same rule the SQL of
-``CopilotStore.reserve_credit`` uses, so the journal and the balance cannot
-disagree.
 """
 from __future__ import annotations
 
@@ -61,6 +63,15 @@ REASON_LLM_UNKNOWN = "llm_delivery_unknown"
 DELIVERY_DELIVERED = "delivered"
 DELIVERY_REJECTED = "rejected"
 DELIVERY_UNKNOWN = "unknown"
+
+# The states of the operation registry of the store and the states of this
+# module are the same, they are only named differently here.
+_OP_STATES = {
+    "reserved": STATE_RESERVED,
+    "released": STATE_RELEASED,
+    "delivered": STATE_DELIVERED,
+    "unknown": STATE_UNKNOWN,
+}
 
 # A claim of the document slot that is older than this is taken over, so a
 # build that died in the middle does not block the user forever.
@@ -147,6 +158,23 @@ class CostedOperation:
             ) from exc
 
     def _read_state(self) -> str:
+        """The state of the operation.
+
+        The state is the row of the operation registry of the store, because
+        that row is the gate of the reservation: the state that is read here
+        is the state that the database used to refuse a second charge. A
+        production without the registry falls back to the journal.
+        """
+        try:
+            registered = self._store.credit_operation_state(
+                self._user_id, self._ref, self._spend_reason
+            )
+        except Exception as exc:
+            raise CreditStoreUnavailable(
+                "credit operation is unavailable: %s" % type(exc).__name__
+            ) from exc
+        if registered:
+            return _OP_STATES.get(str(registered), STATE_NEW)
         counts = self._event_counts()
         spends = int(counts.get(self._spend_reason, 0))
         releases = int(counts.get(self._release_reason, 0))
@@ -229,13 +257,16 @@ class CostedOperation:
         if state in (STATE_DELIVERED, STATE_RELEASED):
             return state
         try:
-            self._store.log_credit_event(
-                self._user_id, 0, self._delivered_reason, self._ref
+            confirmed = self._store.confirm_credit_operation(
+                self._user_id, self._ref, self._spend_reason, self._delivered_reason
             )
         except Exception as exc:
             logger.warning("Credit confirmation failed: %s", type(exc).__name__)
             return state
-        self._state = STATE_DELIVERED
+        if confirmed:
+            self._state = STATE_DELIVERED
+        else:
+            self._state = self._read_state()
         return self._state
 
     def mark_unknown(self) -> str:
@@ -249,13 +280,16 @@ class CostedOperation:
         if state != STATE_RESERVED:
             return state
         try:
-            self._store.log_credit_event(
-                self._user_id, 0, self._unknown_reason, self._ref
+            marked = self._store.mark_credit_operation_unknown(
+                self._user_id, self._ref, self._spend_reason, self._unknown_reason
             )
         except Exception as exc:
             logger.warning("Credit state update failed: %s" % type(exc).__name__)
             return state
-        self._state = STATE_UNKNOWN
+        if marked:
+            self._state = STATE_UNKNOWN
+        else:
+            self._state = self._read_state()
         return self._state
 
 

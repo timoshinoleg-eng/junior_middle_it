@@ -151,6 +151,18 @@ def _statements():
     store.grant_credits_with_event(42, 5, copilot_credits.REASON_REFERRAL, "")
     store.log_credit_event(42, 0, credit_ops.REASON_DELIVERED, credit_cases.JOB["hash"])
     store.credit_event_counts(42, (credit_ops.REASON_SPEND,), credit_cases.JOB["hash"])
+    store.confirm_credit_operation(
+        42,
+        credit_cases.JOB["hash"],
+        credit_ops.REASON_SPEND,
+        credit_ops.REASON_DELIVERED,
+    )
+    store.mark_credit_operation_unknown(
+        42,
+        credit_cases.JOB["hash"],
+        credit_ops.REASON_SPEND,
+        credit_ops.REASON_UNKNOWN,
+    )
     manager = copilot_credits.CreditManager(store)
     manager.reserve_llm_call(42, credit_cases.JOB["hash"])
     return backend.statements

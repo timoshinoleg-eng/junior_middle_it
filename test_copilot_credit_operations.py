@@ -114,6 +114,7 @@ class FakeGrowthStore:
         self.documents = {}
         self.ai_reports = {}
         self.rate_limits = {}
+        self.ops = {}
         self.clock = 0.0
         self.failures = set()
         self.statements = []
@@ -167,7 +168,21 @@ class FakeGrowthStore:
         sql = re.sub(r"\s+", " ", str(query)).strip()
         values = list(params or ())
         self._rows = []
-        if "WITH debit AS" in sql:
+        if "op_reserved AS" in sql:
+            self._guard("debit")
+            self._rows = self._reserve_operation(values)
+        elif "op_released AS" in sql:
+            self._guard("refund")
+            self._rows = self._release_operation(values)
+        elif "op_delivered AS" in sql:
+            self._guard("journal")
+            self._rows = self._settle_operation(values, "delivered")
+        elif "op_unknown AS" in sql:
+            self._guard("journal")
+            self._rows = self._settle_operation(values, "unknown")
+        elif "SELECT state FROM growth_copilot_credit_ops" in sql:
+            self._rows = self._operation_state(values)
+        elif "WITH debit AS" in sql:
             self._guard("debit")
             self._rows = self._reserve(values)
         elif "WITH credit AS" in sql:
@@ -184,6 +199,10 @@ class FakeGrowthStore:
             self._rows = self._grant(values)
         elif "SELECT reason, COUNT(*)" in sql:
             self._rows = self._counts(values)
+        elif "UPDATE growth_copilot_documents" in sql:
+            self._rows = self._save_document(values)
+        elif "UPDATE growth_copilot_ai_reports" in sql:
+            self._rows = self._save_ai_report(values)
         elif "INSERT INTO growth_copilot_documents" in sql and "EXCLUDED.telegram_file_id" in sql:
             self._rows = self._save_document(values)
         elif "INSERT INTO growth_copilot_documents" in sql and "DO UPDATE" in sql:
@@ -255,6 +274,79 @@ class FakeGrowthStore:
         self.credits[user_id] = self._balance(user_id) - amount
         self.events.append((user_id, -amount, reason, ref))
         return [(1,)]
+
+    # -- the registry of the operations ---------------------------
+    def _operation_key(self, user_id, ref, kind):
+        return (int(user_id), str(ref), str(kind))
+
+    def _operation_state(self, values):
+        key = self._operation_key(values[0], values[1], values[2])
+        row = self.ops.get(key)
+        if not row:
+            return []
+        return [(row["state"],)]
+
+    def _reserve_operation(self, values):
+        """The reservation of the registry.
+
+        The row of the operation is the gate: an operation that is already
+        paid for keeps its state and the statement changes nothing, and an
+        operation that was given back is charged again as a new attempt.
+        """
+        user_id = int(values[0])
+        ref = str(values[2])
+        kind = str(values[3])
+        amount = int(values[4])
+        key = self._operation_key(user_id, ref, kind)
+        row = self.ops.get(key)
+        if row is not None and row["state"] != "released":
+            return []
+        if self._balance(user_id) < amount:
+            return []
+        attempt = (row["attempt"] + 1) if row else 1
+        self.ops[key] = {"state": "reserved", "amount": amount, "attempt": attempt}
+        self.credits[user_id] = self._balance(user_id) - amount
+        self.events.append((user_id, -amount, kind, ref))
+        return [(len(self.events),)]
+
+    def _release_operation(self, values):
+        """The release of the registry.
+
+        Only the owner of an open reservation can change its state, so two
+        parallel releases cannot credit the user twice.
+        """
+        user_id = int(values[0])
+        ref = str(values[2])
+        kind = str(values[3])
+        amount = int(values[4])
+        reason = str(values[8])
+        key = self._operation_key(user_id, ref, kind)
+        row = self.ops.get(key)
+        if not row or row["state"] != "reserved":
+            return []
+        row["state"] = "released"
+        self.credits[user_id] = self._balance(user_id) + amount
+        self.events.append((user_id, amount, reason, ref))
+        return [(len(self.events),)]
+
+    def _settle_operation(self, values, state):
+        """The end of an operation: delivered or of an unknown outcome."""
+        user_id = int(values[0])
+        ref = str(values[1])
+        kind = str(values[2])
+        reason = str(values[4])
+        key = self._operation_key(user_id, ref, kind)
+        row = self.ops.get(key)
+        if not row:
+            return []
+        if state == "delivered":
+            if row["state"] not in ("reserved", "unknown"):
+                return []
+        elif row["state"] != "reserved":
+            return []
+        row["state"] = state
+        self.events.append((user_id, 0, reason, ref))
+        return [(len(self.events),)]
 
     def _refund(self, values):
         amount = int(values[0])
@@ -338,30 +430,27 @@ class FakeGrowthStore:
         return []
 
     def _save_document(self, values):
-        key = (int(values[0]), str(values[1]))
-        file_id = str(values[2] or "")
-        filename = str(values[3] or "")
-        fit_score = int(values[4] or 0)
+        """The write of the file: an update of the claimed row.
+
+        The row is never created, so a build whose claim was taken over and
+        released cannot deliver a file into a free slot.
+        """
+        file_id = str(values[0] or "")
+        filename = str(values[1] or "")
+        fit_score = int(values[2] or 0)
+        key = (int(values[3]), str(values[4]))
         claim = str(values[5] or "")
         row = self.documents.get(key)
-        if row is None:
-            self.documents[key] = {
-                "telegram_file_id": file_id,
-                "filename": filename,
-                "fit_score": fit_score,
-                "created_at": self.clock,
-            }
-            return [(key[1],)]
         # Only the owner of the claim may write the file.
-        if not row["telegram_file_id"] and row["filename"] == claim:
-            self.documents[key] = {
-                "telegram_file_id": file_id,
-                "filename": filename,
-                "fit_score": fit_score,
-                "created_at": self.clock,
-            }
-            return [(key[1],)]
-        return []
+        if row is None or row["telegram_file_id"] or row["filename"] != claim:
+            return []
+        self.documents[key] = {
+            "telegram_file_id": file_id,
+            "filename": filename,
+            "fit_score": fit_score,
+            "created_at": self.clock,
+        }
+        return [(key[1],)]
 
     def _get_document(self, values):
         key = (int(values[0]), str(values[1]))
@@ -429,13 +518,18 @@ class FakeGrowthStore:
         return []
 
     def _save_ai_report(self, values):
-        key = (int(values[0]), str(values[1]))
-        model = str(values[2] or "")
-        answer = str(values[3] or "")
-        used_resume = bool(values[4])
+        """The write of the answer: an update of the claimed row.
+
+        The row is never created, so an answer of an attempt whose claim was
+        taken over cannot create a report that nobody owns.
+        """
+        model = str(values[0] or "")
+        answer = str(values[1] or "")
+        used_resume = bool(values[2])
+        key = (int(values[3]), str(values[4]))
         claim = str(values[5] or "")
         row = self.ai_reports.get(key)
-        if row is not None and row["model"] != claim:
+        if row is None or row["model"] != claim:
             # Only the owner of the claim may write the answer.
             return []
         self.ai_reports[key] = {
@@ -820,7 +914,20 @@ class MiniAppCreditTests(unittest.TestCase):
         self.assertEqual(event_reasons(self.backend).count(credit_ops.REASON_SPEND), 1)
 
     def test_a_cached_document_is_sent_again_without_a_credit(self):
-        self.backend._save_document((42, JOB["hash"], "FILE-9", "cv.pdf", 70, "claim:x"))
+        # The cache is written by the owner of a claim, so the row of the
+        # vacancy is claimed before the file is stored.
+        claim = self.store.claim_document(42, JOB["hash"], "cv.pdf")
+        self.assertTrue(claim)
+        self.assertTrue(
+            self.store.save_document(
+                42,
+                JOB["hash"],
+                telegram_file_id="FILE-9",
+                filename="cv.pdf",
+                fit_score=70,
+                claim=claim,
+            )
+        )
         with patch.object(
             copilot_webapp, "resend_document", return_value={"file_id": "FILE-9"}
         ) as resend:
@@ -1238,6 +1345,167 @@ class RuntimeFakeBot:
 
     def __init__(self, db):
         self.db = db
+
+
+class ClaimReleasedOnFailureTests(unittest.TestCase):
+    """A build that fails gives the claim of the vacancy back.
+
+    The claim is the lock of the vacancy: a build that fails without giving
+    it back blocks the next request for the whole stale window. Every step
+    that can fail after the claim has to release it, and a refused write of
+    the result must not be read as a success.
+    """
+
+    def setUp(self):
+        patcher = patch.dict(os.environ, {"COPILOT_FREE_PER_DAY": "0"}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.store, self.backend = make_store(balance=3)
+        self.db = FakeDb(self.backend, JOB)
+
+    def _call(self, payload=None):
+        return call_api(self.store, self.db, payload or pdf_request())
+
+    def test_a_failing_settings_read_releases_the_claim(self):
+        def broken_settings(user_id):
+            raise RuntimeError("the database is down")
+
+        self.db.get_user_settings = broken_settings
+        status, _payload = self._call()
+        self.assertEqual(status, 503)
+        self.assertEqual(self.backend.documents, {})
+
+    def test_a_failing_analysis_releases_the_claim(self):
+        with patch.object(
+            api_copilot.copilot_fit, "compute_fit", side_effect=RuntimeError("no analysis")
+        ):
+            status, _payload = self._call()
+        self.assertEqual(status, 503)
+        self.assertEqual(self.backend.documents, {})
+
+    def test_a_failing_validation_releases_the_claim(self):
+        with patch.object(
+            api_copilot.copilot_pdf,
+            "validate_pdf_bytes",
+            side_effect=RuntimeError("no text layer"),
+        ):
+            status, _payload = self._call()
+        self.assertEqual(status, 503)
+        self.assertEqual(self.backend.documents, {})
+
+    def test_a_failing_caption_releases_the_claim(self):
+        class BrokenReport:
+            ok = True
+            pages = 1
+            has_text_layer = True
+            keyword_coverage_pct = 0
+            problems = ()
+
+            def summary(self):
+                raise RuntimeError("no summary")
+
+        with patch.object(
+            api_copilot.copilot_pdf, "validate_pdf_bytes", return_value=BrokenReport()
+        ):
+            status, _payload = self._call()
+        self.assertEqual(status, 503)
+        self.assertEqual(self.backend.documents, {})
+
+    def test_a_refused_cache_write_is_not_a_cached_document(self):
+        """A write that was refused is not a success.
+
+        The document was delivered, so the request is answered, but the cache
+        does not know the file and the claim of the vacancy is free again.
+        """
+        with patch.object(
+            copilot_webapp, "send_document_to_chat", return_value={"file_id": "FILE-1"}
+        ), patch.object(CopilotStore, "save_document", return_value=False):
+            status, payload = self._call()
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["cached"])
+        self.assertEqual(self.backend.documents, {})
+
+    def test_a_failing_model_releases_the_analysis_claim(self):
+        import asyncio
+
+        from test_copilot_runtime import FakeDb as RuntimeDb
+        from test_copilot_runtime import FakeMessage, FakeQuery, FakeUpdate
+
+        backend = FakeGrowthStore()
+        backend.seed_credits(4242, 3)
+        db = RuntimeDb(JOB)
+        db._growth_store = backend
+        message = FakeMessage()
+        query = FakeQuery(message)
+        query.data = "copilot_ai:" + JOB["hash"]
+        update = FakeUpdate(message=message, query=query)
+
+        def broken_analyze(job, skills, deterministic, resume_text, **kwargs):
+            raise RuntimeError("the model is down")
+
+        env = {
+            "COPILOT_ENABLED": "true",
+            "COPILOT_LLM_ENABLED": "true",
+            "COPILOT_LLM_API_KEY": "test-key",
+        }
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            copilot_runtime.copilot_llm, "analyze", new=broken_analyze
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(
+                    copilot_runtime._copilot_handle_callback(
+                        RuntimeFakeBot(db), update, SimpleNamespace()
+                    )
+                )
+        # The slot of the analysis is free again.
+        self.assertEqual(backend.ai_reports, {})
+
+    def test_a_refused_report_write_releases_the_analysis_claim(self):
+        """The answer that was not written must not keep the slot locked."""
+        import asyncio
+
+        from copilot import llm as copilot_llm
+        from test_copilot_runtime import FakeDb as RuntimeDb
+        from test_copilot_runtime import FakeMessage, FakeQuery, FakeUpdate
+
+        backend = FakeGrowthStore()
+        backend.seed_credits(4242, 3)
+        db = RuntimeDb(JOB)
+        db._growth_store = backend
+        message = FakeMessage()
+        query = FakeQuery(message)
+        query.data = "copilot_ai:" + JOB["hash"]
+        update = FakeUpdate(message=message, query=query)
+
+        def fake_analyze(job, skills, deterministic, resume_text, **kwargs):
+            return copilot_llm.LLMResult(
+                ok=True,
+                summary="Нормальная junior-вакансия",
+                sections={
+                    "strengths": ["Совпадает Python"],
+                    "gaps": [],
+                    "risks": [],
+                    "next_steps": [],
+                    "questions": [],
+                },
+                model="test-model",
+            )
+
+        env = {
+            "COPILOT_ENABLED": "true",
+            "COPILOT_LLM_ENABLED": "true",
+            "COPILOT_LLM_API_KEY": "test-key",
+        }
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            copilot_runtime.copilot_llm, "analyze", new=fake_analyze
+        ), patch.object(CopilotStore, "save_ai_report", return_value=False):
+            asyncio.run(
+                copilot_runtime._copilot_handle_callback(
+                    RuntimeFakeBot(db), update, SimpleNamespace()
+                )
+            )
+        # The slot of the analysis is free again.
+        self.assertEqual(backend.ai_reports, {})
 
 
 class DocumentClaimOwnershipTests(unittest.TestCase):

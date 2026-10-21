@@ -19,6 +19,7 @@ EVALUATIONS_TABLE = "growth_copilot_evaluations"
 DOCUMENTS_TABLE = "growth_copilot_documents"
 CREDITS_TABLE = "growth_copilot_credits"
 CREDIT_EVENTS_TABLE = "growth_copilot_credit_events"
+CREDIT_OPS_TABLE = "growth_copilot_credit_ops"
 GRADE_AUDITS_TABLE = "growth_copilot_grade_audits"
 ENRICHMENTS_TABLE = "growth_copilot_enrichments"
 AI_REPORTS_TABLE = "growth_copilot_ai_reports"
@@ -40,6 +41,34 @@ APPLICATION_RETENTION_DAYS = 180
 # so the request limiter cannot reset the budget and the budget cannot block
 # a user.
 LLM_BUDGET_SCOPE = 0
+
+# The state of a costed operation lives in one row of the operation
+# registry, so the database itself refuses a second reservation of the same
+# attempt. A count of the journal cannot do that: under READ COMMITTED a
+# parallel transaction cannot see the event of the other one yet, so both of
+# them would count the same number of reservations and both of them would
+# charge the user for one operation.
+OP_STATE_RESERVED = "reserved"
+OP_STATE_RELEASED = "released"
+OP_STATE_DELIVERED = "delivered"
+OP_STATE_UNKNOWN = "unknown"
+
+# The registry is an additive table of the migration P13. A production that
+# does not have it yet keeps the old statements, and the credit system stays
+# usable until the migration is applied. The flag is shared by every store of
+# the process, so the missing table is reported once and not on every request.
+_CREDIT_OPS_TABLE_MISSING = False
+
+# The SQLSTATE of a statement that names a relation that does not exist.
+MISSING_RELATION_SQLSTATE = "42P01"
+
+
+def _is_missing_relation(exc: Exception) -> bool:
+    """Whether the error says that a relation does not exist."""
+    sqlstate = getattr(exc, "sqlstate", None)
+    if not sqlstate:
+        sqlstate = getattr(getattr(exc, "diag", None), "sqlstate", None)
+    return str(sqlstate or "") == MISSING_RELATION_SQLSTATE
 
 
 class CopilotStoreUnavailable(RuntimeError):
@@ -295,28 +324,34 @@ class CopilotStore:
 
         The claim token of the owner is required, so a build that lost the
         slot cannot overwrite a file that was delivered in the meantime.
+
+        The write is an update of the claimed row and never an insert. An
+        insert would create a row again when the slot is free, so a build
+        whose claim was taken over and released could still deliver its file:
+        the check of the owner only guarded the conflict branch of the old
+        upsert. An update touches the row of the claim, so a build that lost
+        the slot changes nothing and is told that its write was refused.
         """
         with self._cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO growth_copilot_documents
-                    (user_id, job_id, telegram_file_id, filename, fit_score, created_at)
-                VALUES (%s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (user_id, job_id) DO UPDATE SET
-                    telegram_file_id = EXCLUDED.telegram_file_id,
-                    filename = EXCLUDED.filename,
-                    fit_score = EXCLUDED.fit_score,
+                UPDATE growth_copilot_documents
+                SET telegram_file_id = %s,
+                    filename = %s,
+                    fit_score = %s,
                     created_at = NOW()
-                WHERE growth_copilot_documents.telegram_file_id = ''
-                  AND growth_copilot_documents.filename = %s
+                WHERE user_id = %s
+                  AND job_id = %s
+                  AND filename = %s
+                  AND telegram_file_id = ''
                 RETURNING job_id
                 """,
                 (
-                    int(user_id),
-                    str(job_id),
                     str(telegram_file_id or ""),
                     str(filename or ""),
                     int(fit_score),
+                    int(user_id),
+                    str(job_id),
                     str(claim),
                 ),
             )
@@ -431,29 +466,30 @@ class CopilotStore:
 
         Only the owner of the claim may write the answer: a late answer of an
         attempt whose claim was taken over is refused, so it cannot overwrite
-        the report of the newer attempt.
+        the report of the newer attempt. The write is an update of the claimed
+        row and never an insert, so an answer cannot recreate a slot that was
+        released in the meantime.
         """
         with self._cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO growth_copilot_ai_reports
-                    (user_id, job_id, model, answer, used_resume, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
-                ON CONFLICT (user_id, job_id) DO UPDATE SET
-                    model = EXCLUDED.model,
-                    answer = EXCLUDED.answer,
-                    used_resume = EXCLUDED.used_resume,
+                UPDATE growth_copilot_ai_reports
+                SET model = %s,
+                    answer = %s,
+                    used_resume = %s,
                     created_at = NOW(),
                     updated_at = NOW()
-                WHERE growth_copilot_ai_reports.model = %s
+                WHERE user_id = %s
+                  AND job_id = %s
+                  AND model = %s
                 RETURNING job_id
                 """,
                 (
-                    int(user_id),
-                    str(job_id),
                     str(model or ""),
                     str(answer or ""),
                     bool(used_resume),
+                    int(user_id),
+                    str(job_id),
                     str(claim),
                 ),
             )
@@ -937,6 +973,117 @@ class CopilotStore:
         paid for. The debit only happens when no reservation of this operation
         is unmatched, so a repeated request cannot charge the user twice, and
         a request after a refund is charged again as a new attempt.
+
+        The state of the operation is the row of the operation registry, and
+        the row is the gate of the statement: the database refuses a second
+        reservation of the same attempt, so two parallel requests cannot both
+        charge the user. A count of the journal cannot do that, because a
+        parallel transaction does not see the event of the other one yet.
+        """
+        global _CREDIT_OPS_TABLE_MISSING
+        if not _CREDIT_OPS_TABLE_MISSING:
+            try:
+                return self._reserve_credit_operation(user_id, amount, reason, ref)
+            except Exception as exc:
+                if not _is_missing_relation(exc):
+                    raise
+                _CREDIT_OPS_TABLE_MISSING = True
+                logger.warning(
+                    "The credit operation registry is missing: the reservation "
+                    "is not protected against parallel requests. Apply the "
+                    "migration of the operation registry to close the race."
+                )
+        return self._reserve_credit_journal(user_id, amount, reason, ref, release_reason)
+
+    def _reserve_credit_operation(
+        self, user_id: int, amount: int, reason: str, ref: str
+    ) -> bool:
+        """Reserve a credit with the operation registry as the gate.
+
+        The statement runs in three steps that depend on each other, so the
+        order of the steps is the order of the data, not a guess of the
+        planner:
+
+        1. the row of the user is locked and its balance is read;
+        2. the row of the operation is written: a new one is created, and an
+           operation that was given back is charged again as a new attempt.
+           An operation that is already paid for keeps its state, so the
+           statement changes nothing;
+        3. the balance is debited and the journal entry is written.
+
+        The lock of step 1 is held until the end of the statement, so the
+        balance that step 1 read is the balance that step 3 debits: the debit
+        cannot fail after the operation was reserved, and an operation is
+        never reserved for free.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                WITH locked AS (
+                    SELECT user_id, balance
+                    FROM growth_copilot_credits
+                    WHERE user_id = %s
+                    FOR UPDATE
+                ),
+                op_reserved AS (
+                    INSERT INTO growth_copilot_credit_ops
+                        (user_id, ref, kind, state, amount, attempt, created_at, updated_at)
+                    SELECT %s, %s, %s, 'reserved', %s, 1, NOW(), NOW()
+                    FROM locked
+                    WHERE locked.balance >= %s
+                    ON CONFLICT (user_id, ref, kind) DO UPDATE SET
+                        state = 'reserved',
+                        amount = EXCLUDED.amount,
+                        attempt = growth_copilot_credit_ops.attempt + 1,
+                        updated_at = NOW()
+                    WHERE growth_copilot_credit_ops.state = 'released'
+                    RETURNING attempt
+                ),
+                debit AS (
+                    UPDATE growth_copilot_credits
+                    SET balance = balance - %s, updated_at = NOW()
+                    WHERE user_id = %s
+                      AND balance >= %s
+                      AND EXISTS (SELECT 1 FROM op_reserved)
+                    RETURNING balance
+                )
+                INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                SELECT %s, %s, %s, %s, NOW() FROM debit
+                RETURNING id
+                """,
+                (
+                    int(user_id),
+                    int(user_id),
+                    str(ref or ""),
+                    str(reason or ""),
+                    int(amount),
+                    int(amount),
+                    int(amount),
+                    int(user_id),
+                    int(amount),
+                    int(user_id),
+                    -int(amount),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def _reserve_credit_journal(
+        self,
+        user_id: int,
+        amount: int,
+        reason: str,
+        ref: str,
+        release_reason: str,
+    ) -> bool:
+        """Reserve a credit by counting the journal.
+
+        This is the statement of a production without the operation registry.
+        It cannot be made safe: under READ COMMITTED a parallel transaction
+        does not see the event of the other one yet, so both of them count the
+        same number of reservations and both of them charge the user. It is
+        only used until the migration of the registry is applied.
         """
         with self._cursor() as cur:
             cur.execute(
@@ -991,6 +1138,101 @@ class CopilotStore:
         The credit is only returned when a reservation of this operation is
         unmatched, so a repeated release cannot credit the user twice.
         """
+        global _CREDIT_OPS_TABLE_MISSING
+        if not _CREDIT_OPS_TABLE_MISSING:
+            try:
+                return self._release_credit_operation(
+                    user_id, amount, reason, ref, reserved_reason
+                )
+            except Exception as exc:
+                if not _is_missing_relation(exc):
+                    raise
+                _CREDIT_OPS_TABLE_MISSING = True
+                logger.warning(
+                    "The credit operation registry is missing: the release is "
+                    "not protected against parallel requests. Apply the "
+                    "migration of the operation registry to close the race."
+                )
+        return self._release_credit_journal(
+            user_id, amount, reason, ref, reserved_reason
+        )
+
+    def _release_credit_operation(
+        self,
+        user_id: int,
+        amount: int,
+        reason: str,
+        ref: str,
+        reserved_reason: str,
+    ) -> bool:
+        """Give a credit back with the operation registry as the gate.
+
+        The row of the operation is the gate: only the owner of an open
+        reservation can change its state, so two parallel releases cannot
+        credit the user twice. The row of the user is locked before the row of
+        the operation, exactly as the reservation does it, so the two
+        statements cannot lock each other.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                WITH locked AS (
+                    SELECT user_id, balance
+                    FROM growth_copilot_credits
+                    WHERE user_id = %s
+                    FOR UPDATE
+                ),
+                op_released AS (
+                    UPDATE growth_copilot_credit_ops
+                    SET state = 'released', updated_at = NOW()
+                    WHERE user_id = %s
+                      AND ref = %s
+                      AND kind = %s
+                      AND state = 'reserved'
+                      AND EXISTS (SELECT 1 FROM locked)
+                    RETURNING attempt
+                ),
+                refund AS (
+                    UPDATE growth_copilot_credits
+                    SET balance = balance + %s, updated_at = NOW()
+                    WHERE user_id = %s
+                      AND EXISTS (SELECT 1 FROM op_released)
+                    RETURNING balance
+                )
+                INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                SELECT %s, %s, %s, %s, NOW() FROM refund
+                RETURNING id
+                """,
+                (
+                    int(user_id),
+                    int(user_id),
+                    str(ref or ""),
+                    str(reserved_reason or ""),
+                    int(amount),
+                    int(user_id),
+                    int(user_id),
+                    int(amount),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def _release_credit_journal(
+        self,
+        user_id: int,
+        amount: int,
+        reason: str,
+        ref: str,
+        reserved_reason: str,
+    ) -> bool:
+        """Give a credit back by counting the journal.
+
+        This is the statement of a production without the operation registry.
+        It cannot be made safe: two parallel releases count the same number
+        of reservations and both of them credit the user. It is only used
+        until the migration of the registry is applied.
+        """
         with self._cursor() as cur:
             cur.execute(
                 """
@@ -1027,6 +1269,140 @@ class CopilotStore:
                 ),
             )
             return bool(cur.fetchone())
+
+    def credit_operation_state(
+        self, user_id: int, ref: str, kind: str
+    ) -> Optional[str]:
+        """The state of a costed operation, or ``None`` when it is unknown.
+
+        The state is the row of the operation registry, so it is the same
+        state that the reservation used as its gate. A production without the
+        registry has no state here and the caller falls back to the journal.
+        """
+        global _CREDIT_OPS_TABLE_MISSING
+        if _CREDIT_OPS_TABLE_MISSING:
+            return None
+        try:
+            with self._cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT state
+                    FROM growth_copilot_credit_ops
+                    WHERE user_id = %s AND ref = %s AND kind = %s
+                    """,
+                    (int(user_id), str(ref or ""), str(kind or "")),
+                )
+                row = cur.fetchone()
+        except Exception as exc:
+            if not _is_missing_relation(exc):
+                raise
+            _CREDIT_OPS_TABLE_MISSING = True
+            logger.warning(
+                "The credit operation registry is missing: the state of a "
+                "costed operation is read from the journal until the migration "
+                "is applied."
+            )
+            return None
+        return str(row[0]) if row and row[0] is not None else None
+
+    def confirm_credit_operation(
+        self, user_id: int, ref: str, kind: str, reason: str
+    ) -> bool:
+        """Mark a costed operation as delivered and log it in one statement.
+
+        Only an open reservation can be confirmed, so a repeated confirmation
+        cannot write a second journal entry.
+        """
+        global _CREDIT_OPS_TABLE_MISSING
+        if not _CREDIT_OPS_TABLE_MISSING:
+            try:
+                with self._cursor() as cur:
+                    cur.execute(
+                        """
+                        WITH op_delivered AS (
+                            UPDATE growth_copilot_credit_ops
+                            SET state = 'delivered', updated_at = NOW()
+                            WHERE user_id = %s
+                              AND ref = %s
+                              AND kind = %s
+                              AND state IN ('reserved', 'unknown')
+                            RETURNING attempt
+                        )
+                        INSERT INTO growth_copilot_credit_events
+                            (user_id, delta, reason, ref, created_at)
+                        SELECT %s, 0, %s, %s, NOW() FROM op_delivered
+                        RETURNING id
+                        """,
+                        (
+                            int(user_id),
+                            str(ref or ""),
+                            str(kind or ""),
+                            int(user_id),
+                            str(reason or ""),
+                            str(ref or ""),
+                        ),
+                    )
+                    return bool(cur.fetchone())
+            except Exception as exc:
+                if not _is_missing_relation(exc):
+                    raise
+                _CREDIT_OPS_TABLE_MISSING = True
+                logger.warning(
+                    "The credit operation registry is missing: the state of a "
+                    "costed operation is read from the journal until the "
+                    "migration is applied."
+                )
+        return self.log_credit_event(int(user_id), 0, str(reason or ""), str(ref or ""))
+
+    def mark_credit_operation_unknown(
+        self, user_id: int, ref: str, kind: str, reason: str
+    ) -> bool:
+        """Mark a costed operation as ambiguous and log it in one statement.
+
+        The credit stays spent: the answer may have reached the user anyway.
+        Only an open reservation can become ambiguous, so the state of a newer
+        attempt is never overwritten.
+        """
+        global _CREDIT_OPS_TABLE_MISSING
+        if not _CREDIT_OPS_TABLE_MISSING:
+            try:
+                with self._cursor() as cur:
+                    cur.execute(
+                        """
+                        WITH op_unknown AS (
+                            UPDATE growth_copilot_credit_ops
+                            SET state = 'unknown', updated_at = NOW()
+                            WHERE user_id = %s
+                              AND ref = %s
+                              AND kind = %s
+                              AND state = 'reserved'
+                            RETURNING attempt
+                        )
+                        INSERT INTO growth_copilot_credit_events
+                            (user_id, delta, reason, ref, created_at)
+                        SELECT %s, 0, %s, %s, NOW() FROM op_unknown
+                        RETURNING id
+                        """,
+                        (
+                            int(user_id),
+                            str(ref or ""),
+                            str(kind or ""),
+                            int(user_id),
+                            str(reason or ""),
+                            str(ref or ""),
+                        ),
+                    )
+                    return bool(cur.fetchone())
+            except Exception as exc:
+                if not _is_missing_relation(exc):
+                    raise
+                _CREDIT_OPS_TABLE_MISSING = True
+                logger.warning(
+                    "The credit operation registry is missing: the state of a "
+                    "costed operation is read from the journal until the "
+                    "migration is applied."
+                )
+        return self.log_credit_event(int(user_id), 0, str(reason or ""), str(ref or ""))
 
     def grant_daily_allowance_with_event(
         self, user_id: int, amount: int, reason: str, ref: str
@@ -1183,6 +1559,14 @@ class CopilotStore:
                 APPLICATIONS_TABLE,
                 f"DELETE FROM {APPLICATIONS_TABLE} "
                 f"WHERE created_at < NOW() - INTERVAL '{APPLICATION_RETENTION_DAYS} days'",
+            ),
+            (
+                # An open reservation is never dropped: the state of the row is
+                # what keeps a paid operation from being paid for twice.
+                CREDIT_OPS_TABLE,
+                f"DELETE FROM {CREDIT_OPS_TABLE} "
+                f"WHERE state <> 'reserved' "
+                f"AND updated_at < NOW() - INTERVAL '{DOCUMENT_RETENTION_DAYS} days'",
             ),
         )
         for table, statement in statements:
