@@ -76,6 +76,7 @@ curl.exe -s https://uucjptyqfsdzqsftgiro.supabase.co/functions/v1/interactive-gr
 | `20261020130000_p10_copilot_ai_reports.sql` | `growth_copilot_ai_reports` + индекс |
 | `20261020140000_p11_copilot_forward_and_applications.sql` | `growth_copilot_forwarded_jobs`, `growth_copilot_applications` + 2 индекса |
 | `20261020150000_p12_copilot_rate_limits.sql` | `growth_copilot_rate_limits` |
+| `20261021060000_p13_copilot_credit_operations.sql` | реестр операций кредитов `growth_copilot_credit_ops` + индекс; применяется отдельно, см. §1.6 |
 
 ## 1.1 Вариант A — Supabase SQL Editor (рекомендуемый)
 
@@ -370,7 +371,18 @@ ORDER BY table_name, grantee;
 
 ## 1.5 Чего делать не надо
 
-`supabase db push` здесь **не использовать**: в репозитории нет `supabase/config.toml`, а в базе нет истории `supabase_migrations.schema_migrations`, поэтому `db push` попытается применить все 15 файлов (P1–P12) и может задеть уже работающие таблицы публикации. Только SQL Editor, Management API или psql.
+`supabase db push` здесь **не использовать**: в репозитории нет `supabase/config.toml`, а в базе нет истории `supabase_migrations.schema_migrations`, поэтому `db push` попытается применить все 16 файлов (P1–P13) и может задеть уже работающие таблицы публикации. Только SQL Editor, Management API или psql.
+
+## 1.6 P13 — реестр операций кредитов (отдельная процедура)
+
+P13 защищает от двойного списания и от возврата чужого кредита, поэтому у него два отличия от P9–P12:
+
+1. **DDL можно применить заранее** — таблица `growth_copilot_credit_ops` аддитивна, старый код её не читает.
+2. **Перенос состояния требует окна без платных операций** — backfill читает журнал одним снимком, и операция, записанная старым кодом во время переноса, в реестр не попадёт.
+
+Полная процедура с готовыми SQL-блоками, проверками и откатом: **[`docs/P13_CUTOVER.md`](P13_CUTOVER.md)**.
+
+Порядок: сначала миграция P13, потом деплой кода. Обратный порядок оставляет гонку открытой до применения миграции.
 
 ---
 
