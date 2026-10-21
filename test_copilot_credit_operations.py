@@ -19,6 +19,7 @@ import os
 import re
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlencode
@@ -111,6 +112,7 @@ class FakeGrowthStore:
         self.granted_today = set()
         self.events = []
         self.documents = {}
+        self.ai_reports = {}
         self.rate_limits = {}
         self.clock = 0.0
         self.failures = set()
@@ -126,6 +128,16 @@ class FakeGrowthStore:
 
     def advance(self, minutes=0):
         self.clock += float(minutes) * 60.0
+
+    def _stamp(self, written=None):
+        """The wall time of a row of the fake.
+
+        The clock of the fake only moves forward, so the wall time of a row
+        that was written earlier moves backwards: the runtime compares the
+        stored time with the real clock, and a cache has to expire.
+        """
+        moment = self.clock if written is None else float(written)
+        return datetime.now(timezone.utc) - timedelta(seconds=self.clock - moment)
 
     def seed_credits(self, user_id, balance):
         self.credits[int(user_id)] = int(balance)
@@ -158,6 +170,12 @@ class FakeGrowthStore:
         if "WITH debit AS" in sql:
             self._guard("debit")
             self._rows = self._reserve(values)
+        elif "WITH credit AS" in sql:
+            self._guard("grant_with_event")
+            self._rows = self._grant_with_event(values)
+        elif "WITH slot AS" in sql:
+            self._guard("budget")
+            self._rows = self._reserve_llm_attempt(values)
         elif "WITH refund AS" in sql:
             self._guard("refund")
             self._rows = self._refund(values)
@@ -175,6 +193,17 @@ class FakeGrowthStore:
             self._rows = self._release_claim(values)
         elif "INSERT INTO growth_copilot_documents" in sql:
             self._rows = self._save_document(values)
+        elif "DELETE FROM growth_copilot_ai_reports" in sql:
+            self._rows = self._release_ai_claim(values)
+        elif "FROM growth_copilot_ai_reports" in sql:
+            self._rows = self._get_ai_report(values)
+        elif "INSERT INTO growth_copilot_ai_reports" in sql and "answer <> ''" in sql:
+            self._guard("ai_claim")
+            self._rows = self._claim_ai_report(values)
+        elif "INSERT INTO growth_copilot_ai_reports" in sql:
+            self._rows = self._save_ai_report(values)
+        elif "INSERT INTO growth_copilot_evaluations" in sql:
+            self._rows = [(1,)]
         elif "SELECT telegram_file_id" in sql:
             self._rows = self._get_document(values)
         elif "INSERT INTO growth_copilot_rate_limits" in sql:
@@ -249,6 +278,18 @@ class FakeGrowthStore:
         self.events.append((user_id, delta, reason, ref))
         return [(len(self.events),)]
 
+    def _reserve_llm_attempt(self, values):
+        user_id = int(values[0])
+        reason = str(values[1])
+        ref = str(values[2])
+        budget = int(values[4])
+        # The budget is global: the attempts of every user are counted.
+        used = sum(1 for _uid, _delta, item_reason, _ref in self.events if item_reason == reason)
+        if used >= budget:
+            return []
+        self.events.append((user_id, 0, reason, ref))
+        return [(len(self.events),)]
+
     def _counts(self, values):
         user_id = int(values[0])
         ref = str(values[1])
@@ -267,14 +308,14 @@ class FakeGrowthStore:
     def _claim(self, values):
         user_id = int(values[0])
         job_id = str(values[1])
-        filename = str(values[2])
-        stale_minutes = int(values[3])
+        token = str(values[2])
+        stale_minutes = int(values[4])
         key = (user_id, job_id)
         row = self.documents.get(key)
         if row is None:
             self.documents[key] = {
                 "telegram_file_id": "",
-                "filename": filename,
+                "filename": token,
                 "fit_score": 0,
                 "created_at": self.clock,
             }
@@ -282,27 +323,45 @@ class FakeGrowthStore:
         if row["telegram_file_id"]:
             return []
         if self.clock - row["created_at"] >= stale_minutes * 60.0:
+            row["filename"] = token
             row["created_at"] = self.clock
             return [(job_id,)]
         return []
 
     def _release_claim(self, values):
         key = (int(values[0]), str(values[1]))
+        token = str(values[2])
         row = self.documents.get(key)
-        if row and not row["telegram_file_id"]:
+        if row and not row["telegram_file_id"] and row["filename"] == token:
             del self.documents[key]
             return [(key[1],)]
         return []
 
     def _save_document(self, values):
         key = (int(values[0]), str(values[1]))
-        self.documents[key] = {
-            "telegram_file_id": str(values[2] or ""),
-            "filename": str(values[3] or ""),
-            "fit_score": int(values[4] or 0),
-            "created_at": self.clock,
-        }
-        return [(key[1],)]
+        file_id = str(values[2] or "")
+        filename = str(values[3] or "")
+        fit_score = int(values[4] or 0)
+        claim = str(values[5] or "")
+        row = self.documents.get(key)
+        if row is None:
+            self.documents[key] = {
+                "telegram_file_id": file_id,
+                "filename": filename,
+                "fit_score": fit_score,
+                "created_at": self.clock,
+            }
+            return [(key[1],)]
+        # Only the owner of the claim may write the file.
+        if not row["telegram_file_id"] and row["filename"] == claim:
+            self.documents[key] = {
+                "telegram_file_id": file_id,
+                "filename": filename,
+                "fit_score": fit_score,
+                "created_at": self.clock,
+            }
+            return [(key[1],)]
+        return []
 
     def _get_document(self, values):
         key = (int(values[0]), str(values[1]))
@@ -315,6 +374,89 @@ class FakeGrowthStore:
                 row["filename"],
                 row["fit_score"],
                 row["created_at"],
+            )
+        ]
+
+    def _grant_with_event(self, values):
+        amount = int(values[0])
+        user_id = int(values[1])
+        delta = int(values[3])
+        reason = str(values[4])
+        ref = str(values[5])
+        self.credits[user_id] = self._balance(user_id) + amount
+        self.events.append((user_id, delta, reason, ref))
+        return [(len(self.events),)]
+
+    def _reserve_llm_attempt(self, values):
+        scope = int(values[0])
+        budget = int(values[1])
+        user_id = int(values[2])
+        reason = str(values[3])
+        ref = str(values[4])
+        used = self.rate_limits.get(scope, 0)
+        if used >= budget:
+            return []
+        self.rate_limits[scope] = used + 1
+        self.events.append((user_id, 0, reason, ref))
+        return [(len(self.events),)]
+
+    def _claim_ai_report(self, values):
+        user_id = int(values[0])
+        job_id = str(values[1])
+        token = str(values[2])
+        stale_minutes = int(values[4])
+        key = (user_id, job_id)
+        row = self.ai_reports.get(key)
+        stale = row is not None and self.clock - row["clock"] >= stale_minutes * 60.0
+        if row is None or row["answer"] or stale:
+            # A free slot, a stored report or a dead claim may be taken over.
+            self.ai_reports[key] = {
+                "model": token,
+                "answer": "",
+                "used_resume": False,
+                "clock": self.clock,
+            }
+            return [(job_id,)]
+        return []
+
+    def _release_ai_claim(self, values):
+        key = (int(values[0]), str(values[1]))
+        token = str(values[2])
+        row = self.ai_reports.get(key)
+        if row and not row["answer"] and row["model"] == token:
+            del self.ai_reports[key]
+            return [(key[1],)]
+        return []
+
+    def _save_ai_report(self, values):
+        key = (int(values[0]), str(values[1]))
+        model = str(values[2] or "")
+        answer = str(values[3] or "")
+        used_resume = bool(values[4])
+        claim = str(values[5] or "")
+        row = self.ai_reports.get(key)
+        if row is not None and row["model"] != claim:
+            # Only the owner of the claim may write the answer.
+            return []
+        self.ai_reports[key] = {
+            "model": model,
+            "answer": answer,
+            "used_resume": used_resume,
+            "clock": self.clock,
+        }
+        return [(key[1],)]
+
+    def _get_ai_report(self, values):
+        key = (int(values[0]), str(values[1]))
+        row = self.ai_reports.get(key)
+        if not row:
+            return []
+        return [
+            (
+                row["model"],
+                row["answer"],
+                row["used_resume"],
+                self._stamp(row["clock"]),
             )
         ]
 
@@ -653,7 +795,7 @@ class MiniAppCreditTests(unittest.TestCase):
 
     def test_a_second_request_of_a_running_build_is_refused(self):
         # The first request holds the slot of the vacancy.
-        self.backend._claim((42, JOB["hash"], "cv.pdf", 15))
+        self.backend._claim((42, JOB["hash"], "claim:owner", "claim:owner", 15))
         status, payload = self._call()
         self.assertEqual(status, 409)
         self.assertEqual(payload["error"], "cv_in_progress")
@@ -678,7 +820,7 @@ class MiniAppCreditTests(unittest.TestCase):
         self.assertEqual(event_reasons(self.backend).count(credit_ops.REASON_SPEND), 1)
 
     def test_a_cached_document_is_sent_again_without_a_credit(self):
-        self.backend._save_document((42, JOB["hash"], "FILE-9", "cv.pdf", 70))
+        self.backend._save_document((42, JOB["hash"], "FILE-9", "cv.pdf", 70, "claim:x"))
         with patch.object(
             copilot_webapp, "resend_document", return_value={"file_id": "FILE-9"}
         ) as resend:
@@ -843,7 +985,7 @@ class TelegramCreditTests(unittest.TestCase):
 
     def test_a_stale_claim_is_taken_over(self):
         store, backend = make_store(balance=3)
-        backend._claim((42, JOB["hash"], "cv.pdf", 15))
+        backend._claim((42, JOB["hash"], "claim:owner", "claim:owner", 15))
         backend.advance(minutes=20)
         message, _db, _context = run_telegram_build(store, backend)
         self.assertTrue(message.replies)
@@ -851,24 +993,422 @@ class TelegramCreditTests(unittest.TestCase):
         self.assertEqual(backend._balance(42), 2)
 
 
-class EdgeStatementTests(unittest.TestCase):
-    """The new statements must pass the validator of the Edge bridge."""
+class DeliveryOutcomeMatrixTests(unittest.TestCase):
+    """Every failure of the delivery leaves a proven state behind.
 
-    RELATION_PATTERNS = (
-        r"\bFROM\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)",
-        r"\bJOIN\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)",
-        r"\bINTO\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)",
-        r"\bDELETE\s+FROM\s+((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)",
-        r"\bUPDATE\s+(?!SET\b)((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)",
+    The matrix covers the answers of the Telegram API that the bot sees and
+    the HTTP answers of the same API behind the Mini App. For every case the
+    state of the operation, the balance, the journal and the possibility of a
+    repeat are checked, because a wrong classification either steals a credit
+    or gives one away.
+    """
+
+    # The answers of the bot API and their proven outcome.
+    TELEGRAM_CASES = (
+        ("bad_request", "BadRequest", credit_ops.DELIVERY_REJECTED),
+        ("forbidden", "Forbidden", credit_ops.DELIVERY_REJECTED),
+        ("retry_after", "RetryAfter", credit_ops.DELIVERY_REJECTED),
+        ("invalid_token", "InvalidToken", credit_ops.DELIVERY_REJECTED),
+        ("timed_out", "TimedOut", credit_ops.DELIVERY_UNKNOWN),
+        ("network_error", "NetworkError", credit_ops.DELIVERY_UNKNOWN),
+        # A server error of the API reaches the bot as a plain error.
+        ("server_error", "TelegramError", credit_ops.DELIVERY_UNKNOWN),
     )
-    FORBIDDEN = re.compile(
-        r"\b(pg_catalog|information_schema|auth\.|storage\.|vault\.|extensions\.|realtime\.|"
-        r"graphql\.|supabase_|alter\b|drop\b|truncate\b|grant\b|revoke\b|copy\b|call\b|"
-        r"do\s+\$|prepare\b|execute\b|deallocate\b|listen\b|notify\b|vacuum\b|set_config\b|"
-        r"pg_sleep\b|pg_read_file\b|pg_ls_dir\b|dblink\b|lo_import\b|lo_export\b)",
-        re.IGNORECASE,
+
+    # The HTTP answers of the same API behind the Mini App.
+    HTTP_CASES = (
+        (400, copilot_webapp.DELIVERY_REJECTED),
+        (403, copilot_webapp.DELIVERY_REJECTED),
+        (429, copilot_webapp.DELIVERY_REJECTED),
+        (500, copilot_webapp.DELIVERY_UNKNOWN),
+        (503, copilot_webapp.DELIVERY_UNKNOWN),
     )
-    DISTINCT_FROM = re.compile(r"\bIS\s+(?:NOT\s+)?DISTINCT\s+FROM\b", re.IGNORECASE)
+
+    def setUp(self):
+        # The free allowance would hide the balance of the operation.
+        patcher = patch.dict(os.environ, {"COPILOT_FREE_PER_DAY": "0"}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _telegram_error(self, name):
+        from telegram import error as telegram_error
+
+        if name == "RetryAfter":
+            return telegram_error.RetryAfter(5)
+        return getattr(telegram_error, name)("boom")
+
+    def _http_error(self, code):
+        import urllib.error
+
+        return urllib.error.HTTPError(
+            "https://api.telegram.org/bot123/sendDocument",
+            code,
+            "boom",
+            None,
+            io.BytesIO(b""),
+        )
+
+    def test_the_telegram_matrix_keeps_the_credit_only_when_it_must(self):
+        for case, error_name, expected in self.TELEGRAM_CASES:
+            with self.subTest(case=case):
+                store, backend = make_store(balance=3)
+                message, _db, _context = run_telegram_build(
+                    store, backend, failure=self._telegram_error(error_name)
+                )
+                self.assertTrue(message.replies)
+                state = credit_ops.cv_operation(store, 42, JOB["hash"]).state()
+                reasons = event_reasons(backend)
+                self.assertEqual(reasons.count(credit_ops.REASON_SPEND), 1)
+                if expected == credit_ops.DELIVERY_REJECTED:
+                    self.assertEqual(state, credit_ops.STATE_RELEASED)
+                    self.assertEqual(backend._balance(42), 3)
+                    self.assertEqual(reasons.count(credit_ops.REASON_RELEASE), 1)
+                    self.assertEqual(reasons.count(credit_ops.REASON_UNKNOWN), 0)
+                else:
+                    self.assertEqual(state, credit_ops.STATE_UNKNOWN)
+                    self.assertEqual(backend._balance(42), 2)
+                    self.assertEqual(reasons.count(credit_ops.REASON_UNKNOWN), 1)
+                    self.assertEqual(reasons.count(credit_ops.REASON_RELEASE), 0)
+                # The slot of the vacancy is free again in every case.
+                self.assertEqual(backend.documents, {})
+
+    def test_the_mini_app_matrix_classifies_every_http_answer(self):
+        for code, expected in self.HTTP_CASES:
+            with self.subTest(code=code):
+                with patch("urllib.request.urlopen", side_effect=self._http_error(code)):
+                    with self.assertRaises(copilot_webapp.WebappError) as caught:
+                        copilot_webapp.send_document_to_chat(
+                            "123456:TEST-TOKEN", 42, "cv.pdf", b"%PDF-1.4 payload"
+                        )
+                self.assertEqual(caught.exception.delivery, expected)
+
+    def test_the_mini_app_matrix_keeps_the_credit_only_when_it_must(self):
+        for code, expected in self.HTTP_CASES:
+            with self.subTest(code=code):
+                store, backend = make_store(balance=3)
+                with patch("urllib.request.urlopen", side_effect=self._http_error(code)):
+                    status, payload = call_api(store, FakeDb(backend, JOB), pdf_request())
+                self.assertEqual(status, 502)
+                self.assertEqual(payload["error"], "telegram_error")
+                state = credit_ops.cv_operation(store, 42, JOB["hash"]).state()
+                reasons = event_reasons(backend)
+                self.assertEqual(reasons.count(credit_ops.REASON_SPEND), 1)
+                if expected == copilot_webapp.DELIVERY_REJECTED:
+                    self.assertEqual(state, credit_ops.STATE_RELEASED)
+                    self.assertEqual(backend._balance(42), 3)
+                    self.assertEqual(reasons.count(credit_ops.REASON_RELEASE), 1)
+                else:
+                    self.assertEqual(state, credit_ops.STATE_UNKNOWN)
+                    self.assertEqual(backend._balance(42), 2)
+                    self.assertEqual(reasons.count(credit_ops.REASON_UNKNOWN), 1)
+                self.assertEqual(backend.documents, {})
+
+    def test_a_repeat_after_a_refusal_is_charged_again(self):
+        from telegram import error as telegram_error
+
+        store, backend = make_store(balance=3)
+        run_telegram_build(
+            store, backend, failure=telegram_error.BadRequest("chat not found")
+        )
+        self.assertEqual(backend._balance(42), 3)
+        # The refusal gave the credit back, so the next attempt is a new
+        # attempt and is charged again.
+        message, _db, _context = run_telegram_build(store, backend)
+        self.assertIn("Готово", message.replies[-1][0])
+        self.assertEqual(backend._balance(42), 2)
+        reasons = event_reasons(backend)
+        self.assertEqual(reasons.count(credit_ops.REASON_SPEND), 2)
+        self.assertEqual(reasons.count(credit_ops.REASON_RELEASE), 1)
+
+    def test_a_repeat_after_an_open_outcome_is_free(self):
+        from telegram import error as telegram_error
+
+        store, backend = make_store(balance=3)
+        run_telegram_build(store, backend, failure=telegram_error.TimedOut("timeout"))
+        self.assertEqual(backend._balance(42), 2)
+        # The outcome is open, so the credit stays spent: the vacancy was paid
+        # for once and the document may have reached the user.
+        message, _db, _context = run_telegram_build(store, backend)
+        self.assertIn("Готово", message.replies[-1][0])
+        self.assertEqual(backend._balance(42), 2)
+        reasons = event_reasons(backend)
+        self.assertEqual(reasons.count(credit_ops.REASON_SPEND), 1)
+        self.assertEqual(reasons.count(credit_ops.REASON_RELEASE), 0)
+
+
+class FailClosedTests(unittest.TestCase):
+    """A paid document never leaves the service without a confirmed credit.
+
+    The tests of this class have to fail when the code goes back to a
+    fail-open behaviour: every one of them counts the calls of the delivery
+    and looks for the marker of a successful delivery.
+    """
+
+    def setUp(self):
+        patcher = patch.dict(os.environ, {"COPILOT_FREE_PER_DAY": "0"}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_broken_credit_store_sends_no_document(self):
+        store, backend = make_store(balance=3, failures=("debit",))
+        with patch.object(
+            copilot_webapp, "send_document_to_chat", return_value={"file_id": "FILE-1"}
+        ) as send:
+            status, payload = call_api(store, FakeDb(backend, JOB), pdf_request())
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"], "store_unavailable")
+        # No call of the delivery, no marker of a delivery and no credit.
+        self.assertEqual(send.call_count, 0)
+        self.assertEqual(backend._balance(42), 3)
+        self.assertEqual(event_reasons(backend), [])
+        self.assertNotIn(credit_ops.REASON_DELIVERED, event_reasons(backend))
+        self.assertNotIn(credit_ops.REASON_SPEND, event_reasons(backend))
+        # The slot of the vacancy is free again.
+        self.assertEqual(backend.documents, {})
+
+    def test_a_broken_credit_store_sends_no_document_in_the_bot(self):
+        store, backend = make_store(balance=3, failures=("debit",))
+        message, _db, context = run_telegram_build(store, backend)
+        self.assertTrue(message.replies)
+        # No call of the delivery and no marker of a delivery.
+        self.assertEqual(context.bot.sent, [])
+        self.assertEqual(backend._balance(42), 3)
+        self.assertEqual(event_reasons(backend), [])
+        self.assertNotIn(credit_ops.REASON_DELIVERED, event_reasons(backend))
+        self.assertEqual(backend.documents, {})
+
+    def test_a_failed_reservation_answers_that_the_check_failed(self):
+        """The answer must not tell the user that the balance is empty.
+
+        An empty balance and an unreachable store are different problems, and
+        the user must not be told that the free allowance is over when the
+        service simply could not look it up.
+        """
+        store, backend = make_store(balance=3, failures=("debit",))
+        message, _db, _context = run_telegram_build(store, backend)
+        self.assertTrue(message.replies)
+        text = message.replies[-1][0]
+        self.assertIn("Не удалось проверить кредиты", text)
+        self.assertNotIn("закончились", text)
+
+    def test_a_broken_credit_store_sends_no_ai_analysis(self):
+        """The paid model call needs a confirmed credit as well."""
+        import asyncio
+
+        from test_copilot_runtime import FakeDb as RuntimeDb
+        from test_copilot_runtime import FakeMessage, FakeQuery, FakeUpdate
+
+        from test_copilot_credit_operations import FakeGrowthStore
+
+        backend = FakeGrowthStore()
+        backend.failures = {"debit"}
+        db = RuntimeDb(JOB)
+        db._growth_store = backend
+        message = FakeMessage()
+        query = FakeQuery(message)
+        query.data = "copilot_ai:" + JOB["hash"]
+        update = FakeUpdate(message=message, query=query)
+        calls = []
+
+        def fake_analyze(job, skills, deterministic, resume_text, **kwargs):
+            calls.append(job)
+            raise AssertionError("the model must not be called without a credit")
+
+        env = {
+            "COPILOT_ENABLED": "true",
+            "COPILOT_LLM_ENABLED": "true",
+            "COPILOT_LLM_API_KEY": "test-key",
+        }
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            copilot_runtime.copilot_llm, "analyze", new=fake_analyze
+        ):
+            asyncio.run(
+                copilot_runtime._copilot_handle_callback(
+                    RuntimeFakeBot(db), update, SimpleNamespace()
+                )
+            )
+        self.assertEqual(calls, [])
+        self.assertNotIn(
+            "copilot_ai_viewed", [name for name, _props in db.events]
+        )
+
+
+class RuntimeFakeBot:
+    """The bot of the runtime tests."""
+
+    def __init__(self, db):
+        self.db = db
+
+
+class DocumentClaimOwnershipTests(unittest.TestCase):
+    """Only the owner of a claim may release it or write the document.
+
+    A claim that was taken over belongs to the new owner: a late release of
+    the old owner must not delete the slot, and a late write of the old owner
+    must not overwrite the file of the new one.
+    """
+
+    def test_a_late_release_does_not_delete_the_claim_of_the_new_owner(self):
+        store, backend = make_store(balance=3)
+        first = store.claim_document(42, JOB["hash"], "cv.pdf")
+        self.assertTrue(first)
+        # The claim goes stale and another build takes it over.
+        backend.advance(minutes=20)
+        second = store.claim_document(42, JOB["hash"], "cv.pdf")
+        self.assertTrue(second)
+        self.assertNotEqual(first, second)
+        # The late release of the first owner must not free the slot.
+        self.assertFalse(store.release_document_claim(42, JOB["hash"], first))
+        row = sent_document(store, backend)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["filename"], second)
+        self.assertEqual(row["telegram_file_id"], "")
+
+    def test_a_late_write_does_not_overwrite_the_document_of_the_new_owner(self):
+        store, backend = make_store(balance=3)
+        first = store.claim_document(42, JOB["hash"], "cv.pdf")
+        backend.advance(minutes=20)
+        second = store.claim_document(42, JOB["hash"], "cv.pdf")
+        # The old owner writes its file too late.
+        store.save_document(
+            42,
+            JOB["hash"],
+            telegram_file_id="FILE-OLD",
+            filename="cv.pdf",
+            fit_score=10,
+            claim=first,
+        )
+        row = sent_document(store, backend)
+        self.assertEqual(row["telegram_file_id"], "")
+        self.assertEqual(row["filename"], second)
+        # The new owner writes its own file.
+        store.save_document(
+            42,
+            JOB["hash"],
+            telegram_file_id="FILE-NEW",
+            filename="cv.pdf",
+            fit_score=20,
+            claim=second,
+        )
+        self.assertEqual(sent_document(store, backend)["telegram_file_id"], "FILE-NEW")
+
+    def test_a_delivered_document_is_not_overwritten_by_a_late_build(self):
+        store, backend = make_store(balance=3)
+        claim = store.claim_document(42, JOB["hash"], "cv.pdf")
+        store.save_document(
+            42,
+            JOB["hash"],
+            telegram_file_id="FILE-NEW",
+            filename="cv.pdf",
+            fit_score=20,
+            claim=claim,
+        )
+        # A build that was overtaken writes its file too late.
+        store.save_document(
+            42,
+            JOB["hash"],
+            telegram_file_id="FILE-OLD",
+            filename="cv.pdf",
+            fit_score=10,
+            claim="claim:somebody-else",
+        )
+        self.assertEqual(sent_document(store, backend)["telegram_file_id"], "FILE-NEW")
+
+    def test_a_takeover_during_the_build_keeps_the_file_of_the_new_owner(self):
+        """The end to end version of the two tests above.
+
+        Another build takes the stale claim while the first build is still
+        running. The first build must not delete the slot of the second one
+        and must not write its file into the cache of the second one.
+        """
+        store, backend = make_store(balance=3)
+        original = copilot_runtime.copilot_pdf.build_cv_pdf
+
+        def build_with_takeover(*args, **kwargs):
+            backend.advance(minutes=20)
+            backend._claim((42, JOB["hash"], "claim:other", "claim:other", 15))
+            return original(*args, **kwargs)
+
+        with patch.object(
+            copilot_runtime.copilot_pdf, "build_cv_pdf", new=build_with_takeover
+        ):
+            message, _db, _context = run_telegram_build(store, backend)
+        self.assertTrue(message.replies)
+        row = sent_document(store, backend)
+        self.assertIsNotNone(row)
+        # The slot of the other build is still there and holds no file.
+        self.assertEqual(row["filename"], "claim:other")
+        self.assertEqual(row["telegram_file_id"], "")
+
+    def test_a_failing_build_does_not_delete_the_claim_of_the_new_owner(self):
+        store, backend = make_store(balance=3)
+
+        def build_with_takeover(*args, **kwargs):
+            backend.advance(minutes=20)
+            backend._claim((42, JOB["hash"], "claim:other", "claim:other", 15))
+            raise RuntimeError("no font")
+
+        with patch.object(
+            copilot_runtime.copilot_pdf, "build_cv_pdf", new=build_with_takeover
+        ):
+            message, _db, _context = run_telegram_build(store, backend)
+        self.assertTrue(message.replies)
+        row = sent_document(store, backend)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["filename"], "claim:other")
+
+
+class ReferralAtomicityTests(unittest.TestCase):
+    """The bonus of a referral and its journal entry are one statement."""
+
+    def test_the_referral_writes_the_balance_and_the_journal_together(self):
+        store, backend = make_store(balance=0)
+        manager = copilot_credits.CreditManager(store)
+        with patch.dict(
+            os.environ, {"COPILOT_REFERRAL_BONUS": "5"}, clear=False
+        ):
+            self.assertEqual(manager.grant_referral(42), 5)
+        self.assertEqual(backend._balance(42), 5)
+        reasons = event_reasons(backend)
+        self.assertEqual(reasons.count(copilot_credits.REASON_REFERRAL), 1)
+        # One statement writes the balance and the journal entry.
+        touching = [
+            query
+            for query, _params in backend.statements
+            if "WITH credit AS" in query
+        ]
+        self.assertEqual(len(touching), 1, touching)
+
+    def test_a_failed_referral_writes_neither_the_balance_nor_the_journal(self):
+        store, backend = make_store(balance=0, failures=("grant_with_event",))
+        manager = copilot_credits.CreditManager(store)
+        with patch.dict(
+            os.environ, {"COPILOT_REFERRAL_BONUS": "5"}, clear=False
+        ):
+            with self.assertRaises(Exception):
+                manager.grant_referral(42)
+        self.assertEqual(backend._balance(42), 0)
+        self.assertNotIn(copilot_credits.REASON_REFERRAL, event_reasons(backend))
+
+    def test_the_rules_of_the_bonus_are_unchanged(self):
+        store, backend = make_store(balance=0)
+        manager = copilot_credits.CreditManager(store)
+        with patch.dict(
+            os.environ, {"COPILOT_REFERRAL_BONUS": "0"}, clear=False
+        ):
+            self.assertEqual(manager.grant_referral(42), 0)
+        self.assertEqual(backend._balance(42), 0)
+        self.assertEqual(event_reasons(backend), [])
+
+
+class EdgeStatementTests(unittest.TestCase):
+    """The new statements must reach the Edge bridge unharmed.
+
+    The rules of the validator live in the TypeScript of the Edge functions,
+    so they are not copied here: ``test_copilot_edge_validator`` runs the
+    real validators. This class only checks the conversion of the
+    placeholders, which the bridge does on the way.
+    """
 
     def _statements(self):
         store, backend = make_store(balance=3)
@@ -876,51 +1416,27 @@ class EdgeStatementTests(unittest.TestCase):
         operation.reserve()
         operation.release()
         copilot_credits.CreditManager(store).ensure_daily_allowance(42)
+        copilot_credits.CreditManager(store).grant_referral(42)
         store.claim_document(42, JOB["hash"], "cv.pdf")
-        store.release_document_claim(42, JOB["hash"])
+        store.release_document_claim(42, JOB["hash"], "claim:test")
+        store.save_document(
+            42,
+            JOB["hash"],
+            telegram_file_id="FILE-1",
+            filename="cv.pdf",
+            fit_score=50,
+            claim="claim:test",
+        )
+        store.claim_ai_report(42, JOB["hash"])
+        store.save_ai_report(
+            42, JOB["hash"], claim="claim:test", model="m", answer="a"
+        )
+        store.release_ai_report_claim(42, JOB["hash"], "claim:test")
+        store.grant_credits_with_event(42, 5, copilot_credits.REASON_REFERRAL, "")
         store.log_credit_event(42, 0, credit_ops.REASON_DELIVERED, JOB["hash"])
         store.credit_event_counts(42, (credit_ops.REASON_SPEND,), JOB["hash"])
+        copilot_credits.CreditManager(store).reserve_llm_call(42, JOB["hash"])
         return backend.statements
-
-    def test_every_new_statement_survives_the_edge_validator(self):
-        statements = self._statements()
-        self.assertTrue(statements)
-        for query, params in statements:
-            normalized = re.sub(r"\s+", " ", query.strip())
-            self.assertNotIn(";", normalized, normalized[:80])
-            self.assertNotIn("--", normalized, normalized[:80])
-            self.assertIsNone(self.FORBIDDEN.search(normalized), normalized[:120])
-            self.assertTrue(
-                re.match(
-                    r"^(select\b|with\b|insert\b|update\b|delete\b|create table if not exists\b|"
-                    r"create index if not exists\b)",
-                    normalized,
-                    re.IGNORECASE,
-                ),
-                normalized[:80],
-            )
-            ctes = {
-                match.group(1).lower()
-                for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", normalized)
-            }
-            scan = self.DISTINCT_FROM.sub("IS DISTINCT_FROM", normalized)
-            for pattern in self.RELATION_PATTERNS:
-                for match in re.finditer(pattern, scan, re.IGNORECASE):
-                    relation = match.group(1).lower()
-                    parts = relation.split(".")
-                    self.assertLessEqual(len(parts), 2, relation)
-                    if len(parts) == 2:
-                        self.assertEqual(parts[0], "public", relation)
-                    name = parts[-1]
-                    self.assertTrue(
-                        name.startswith("growth_") or name in ctes,
-                        "relation outside the growth allowlist: %s" % relation,
-                    )
-            self.assertEqual(
-                query.count("%s"),
-                len(params),
-                "placeholder and parameter count differ: %s" % normalized[:120],
-            )
 
     def test_the_placeholders_survive_the_bridge_conversion(self):
         from http_growth_patch import _convert_placeholders
@@ -930,6 +1446,14 @@ class EdgeStatementTests(unittest.TestCase):
             self.assertNotIn("%s", converted)
             self.assertEqual(len(values), len(params))
             self.assertEqual(converted.count("$"), len(params))
+
+    def test_every_statement_has_one_parameter_per_placeholder(self):
+        for query, params in self._statements():
+            self.assertEqual(
+                query.count("%s"),
+                len(params),
+                "placeholder and parameter count differ: %s" % query[:120],
+            )
 
 
 if __name__ == "__main__":

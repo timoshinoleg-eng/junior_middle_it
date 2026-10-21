@@ -42,6 +42,12 @@ class FakeStore:
         self.balances[uid] = self.get_balance(uid) + int(amount)
         return self.balances[uid]
 
+    def grant_credits_with_event(self, user_id, amount, reason, ref=""):
+        uid = int(user_id)
+        self.balances[uid] = self.get_balance(uid) + int(amount)
+        self.events.append((uid, int(amount), reason, ref))
+        return True
+
     def spend_credits(self, user_id, amount):
         uid = int(user_id)
         if self.get_balance(uid) < int(amount):
@@ -87,6 +93,13 @@ class FakeStore:
 
     def log_credit_event(self, user_id, delta, reason, ref=""):
         self.events.append((int(user_id), int(delta), reason, ref))
+        return True
+
+    def reserve_llm_attempt(self, user_id, budget, reason, ref=""):
+        used = sum(1 for _uid, _delta, item_reason, _ref in self.events if item_reason == reason)
+        if used >= int(budget):
+            return False
+        self.events.append((int(user_id), 0, reason, ref))
         return True
 
     def count_credit_events(self, reason, today_only=False):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
@@ -32,6 +33,13 @@ ENRICHMENT_RETENTION_DAYS = 14
 AI_REPORT_RETENTION_DAYS = 14
 FORWARDED_JOB_RETENTION_DAYS = 30
 APPLICATION_RETENTION_DAYS = 180
+
+# The rate limit table keeps one row per scope. The rows of the users belong
+# to the request limiter of the Mini App; the row of scope 0 is the counter
+# of the global daily budget of the model calls. The two never share a row,
+# so the request limiter cannot reset the budget and the budget cannot block
+# a user.
+LLM_BUDGET_SCOPE = 0
 
 
 class CopilotStoreUnavailable(RuntimeError):
@@ -281,8 +289,13 @@ class CopilotStore:
         telegram_file_id: str,
         filename: str,
         fit_score: int = 0,
+        claim: str,
     ) -> bool:
-        """Remember the generated CV so a repeated tap sends the cached file."""
+        """Remember the generated CV so a repeated tap sends the cached file.
+
+        The claim token of the owner is required, so a build that lost the
+        slot cannot overwrite a file that was delivered in the meantime.
+        """
         with self._cursor() as cur:
             cur.execute(
                 """
@@ -294,6 +307,8 @@ class CopilotStore:
                     filename = EXCLUDED.filename,
                     fit_score = EXCLUDED.fit_score,
                     created_at = NOW()
+                WHERE growth_copilot_documents.telegram_file_id = ''
+                  AND growth_copilot_documents.filename = %s
                 RETURNING job_id
                 """,
                 (
@@ -302,6 +317,7 @@ class CopilotStore:
                     str(telegram_file_id or ""),
                     str(filename or ""),
                     int(fit_score),
+                    str(claim),
                 ),
             )
             return bool(cur.fetchone())
@@ -329,11 +345,80 @@ class CopilotStore:
     # ------------------------------------------------------------------
     # AI report cache
     # ------------------------------------------------------------------
+    def claim_ai_report(
+        self, user_id: int, job_id: str, *, stale_after_minutes: int = 15
+    ) -> Optional[str]:
+        """Claim the analysis slot of one (user, job) pair.
+
+        The slot is the unique key of the report cache, so a second tap on
+        the same button cannot start a second analysis in parallel. Without
+        the claim two parallel taps would call the model twice, burn two
+        slots of the global budget and could charge the user twice for one
+        vacancy.
+
+        A stored report may always be taken over, because it is the report of
+        an older attempt. A claim without a report is taken over only when it
+        is older than ``stale_after_minutes``, so an analysis that died does
+        not block the user forever.
+
+        The returned token identifies the owner of the claim. Only the owner
+        may write the answer or release the slot, so a late answer cannot
+        overwrite the report of a newer attempt. The token lives in the model
+        column of the claim row, so no column has to be added to the table.
+        """
+        token = "claim:%s" % uuid.uuid4().hex
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_ai_reports
+                    (user_id, job_id, model, answer, used_resume, created_at, updated_at)
+                VALUES (%s, %s, %s, '', %s, NOW(), NOW())
+                ON CONFLICT (user_id, job_id) DO UPDATE SET
+                    model = EXCLUDED.model,
+                    answer = '',
+                    used_resume = EXCLUDED.used_resume,
+                    updated_at = NOW()
+                WHERE growth_copilot_ai_reports.answer <> ''
+                   OR growth_copilot_ai_reports.updated_at
+                      < NOW() - (%s * INTERVAL '1 minute')
+                RETURNING job_id
+                """,
+                (
+                    int(user_id),
+                    str(job_id),
+                    token,
+                    False,
+                    int(stale_after_minutes),
+                ),
+            )
+            row = cur.fetchone()
+        return token if row else None
+
+    def release_ai_report_claim(self, user_id: int, job_id: str, claim: str) -> bool:
+        """Release a claim that produced no answer.
+
+        Only the owner of the claim releases the slot, and only while the
+        claim still holds no answer, so a late release cannot delete the
+        report of a newer attempt.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM growth_copilot_ai_reports
+                WHERE user_id = %s AND job_id = %s
+                  AND model = %s AND answer = ''
+                RETURNING job_id
+                """,
+                (int(user_id), str(job_id), str(claim)),
+            )
+            return bool(cur.fetchone())
+
     def save_ai_report(
         self,
         user_id: int,
         job_id: str,
         *,
+        claim: str,
         model: str = "",
         answer: str = "",
         used_resume: bool = False,
@@ -343,6 +428,10 @@ class CopilotStore:
         The answer text is only stored when it was produced without the resume:
         an answer that was built from a resume may echo personal data, and the
         privacy invariant forbids keeping resume content in the database.
+
+        Only the owner of the claim may write the answer: a late answer of an
+        attempt whose claim was taken over is refused, so it cannot overwrite
+        the report of the newer attempt.
         """
         with self._cursor() as cur:
             cur.execute(
@@ -354,7 +443,9 @@ class CopilotStore:
                     model = EXCLUDED.model,
                     answer = EXCLUDED.answer,
                     used_resume = EXCLUDED.used_resume,
+                    created_at = NOW(),
                     updated_at = NOW()
+                WHERE growth_copilot_ai_reports.model = %s
                 RETURNING job_id
                 """,
                 (
@@ -363,6 +454,7 @@ class CopilotStore:
                     str(model or ""),
                     str(answer or ""),
                     bool(used_resume),
+                    str(claim),
                 ),
             )
             return bool(cur.fetchone())
@@ -677,6 +769,93 @@ class CopilotStore:
             row = cur.fetchone()
         return int(row[0]) if row and row[0] is not None else None
 
+    def reserve_llm_attempt(
+        self, user_id: int, budget: int, reason: str, ref: str = ""
+    ) -> bool:
+        """Take one slot of the global daily model budget.
+
+        The budget is a counter in a row of its own, and the check and the
+        increment happen in one statement. The lock of that row serializes
+        parallel callers, so two requests that arrive at the same moment
+        cannot both take the last slot. A plain ``COUNT(*)`` of the journal
+        would be racy: a parallel transaction cannot see the event of the
+        other one yet, so both of them would count the same number of calls.
+
+        The attempt is written before the call, because a call that fails
+        still costs the operator.
+        """
+        limit = int(budget)
+        if limit <= 0:
+            return False
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                WITH slot AS (
+                    INSERT INTO growth_copilot_rate_limits
+                        (user_id, window_start, hits, updated_at)
+                    VALUES (%s, CURRENT_DATE, 1, NOW())
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        hits = CASE
+                            WHEN growth_copilot_rate_limits.window_start < CURRENT_DATE
+                            THEN 1
+                            ELSE growth_copilot_rate_limits.hits + 1
+                        END,
+                        window_start = CASE
+                            WHEN growth_copilot_rate_limits.window_start < CURRENT_DATE
+                            THEN CURRENT_DATE
+                            ELSE growth_copilot_rate_limits.window_start
+                        END,
+                        updated_at = NOW()
+                    WHERE growth_copilot_rate_limits.window_start < CURRENT_DATE
+                       OR growth_copilot_rate_limits.hits < %s
+                    RETURNING hits
+                )
+                INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                SELECT %s, 0, %s, %s, NOW() FROM slot
+                RETURNING id
+                """,
+                (
+                    LLM_BUDGET_SCOPE,
+                    limit,
+                    int(user_id),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def grant_credits_with_event(
+        self, user_id: int, amount: int, reason: str, ref: str = ""
+    ) -> bool:
+        """Credit the balance and log the credit in one statement.
+
+        The balance and the journal entry are written together, so a failed
+        write can no longer leave a credited balance without a journal entry.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                WITH credit AS (
+                    UPDATE growth_copilot_credits
+                    SET balance = balance + %s, updated_at = NOW()
+                    WHERE user_id = %s
+                    RETURNING balance
+                )
+                INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                SELECT %s, %s, %s, %s, NOW() FROM credit
+                RETURNING id
+                """,
+                (
+                    int(amount),
+                    int(user_id),
+                    int(user_id),
+                    int(amount),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
     def grant_credits(self, user_id: int, amount: int) -> Optional[int]:
         with self._cursor() as cur:
             cur.execute(
@@ -905,14 +1084,21 @@ class CopilotStore:
 
     def claim_document(
         self, user_id: int, job_id: str, filename: str, *, stale_after_minutes: int = 15
-    ) -> bool:
+    ) -> Optional[str]:
         """Claim the document slot of one (user, job) pair.
 
         The slot is the unique key of the document cache, so a second request
         for the same vacancy cannot start a parallel build. A claim without a
         file id that is older than ``stale_after_minutes`` is taken over, so a
         build that died does not block the user forever.
+
+        The returned token identifies the owner of the claim. Only the owner
+        may release the slot or write the file: a build that took over a
+        stale claim keeps it, and a late build cannot overwrite a file that
+        was delivered in the meantime. The token lives in the file name of the
+        claim row, so no column has to be added to the table.
         """
+        token = "claim:%s" % uuid.uuid4().hex
         with self._cursor() as cur:
             cur.execute(
                 """
@@ -920,26 +1106,39 @@ class CopilotStore:
                     (user_id, job_id, telegram_file_id, filename, fit_score, created_at)
                 VALUES (%s, %s, '', %s, 0, NOW())
                 ON CONFLICT (user_id, job_id) DO UPDATE SET
+                    filename = %s,
                     created_at = NOW()
                 WHERE growth_copilot_documents.telegram_file_id = ''
                   AND growth_copilot_documents.created_at
                       < NOW() - (%s * INTERVAL '1 minute')
                 RETURNING job_id
                 """,
-                (int(user_id), str(job_id), str(filename or ""), int(stale_after_minutes)),
+                (
+                    int(user_id),
+                    str(job_id),
+                    token,
+                    token,
+                    int(stale_after_minutes),
+                ),
             )
-            return bool(cur.fetchone())
+            row = cur.fetchone()
+        return token if row else None
 
-    def release_document_claim(self, user_id: int, job_id: str) -> bool:
-        """Release a claim that produced no document."""
+    def release_document_claim(self, user_id: int, job_id: str, claim: str) -> bool:
+        """Release a claim that produced no document.
+
+        Only the owner of the claim releases the slot: a build that took over
+        a stale claim keeps it, so a third request cannot start in parallel.
+        """
         with self._cursor() as cur:
             cur.execute(
                 """
                 DELETE FROM growth_copilot_documents
-                WHERE user_id = %s AND job_id = %s AND telegram_file_id = ''
+                WHERE user_id = %s AND job_id = %s
+                  AND telegram_file_id = '' AND filename = %s
                 RETURNING job_id
                 """,
-                (int(user_id), str(job_id)),
+                (int(user_id), str(job_id), str(claim)),
             )
             return bool(cur.fetchone())
 

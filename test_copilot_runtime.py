@@ -6,6 +6,7 @@ from unittest.mock import patch
 import copilot_webhook_runtime as copilot_runtime
 import durable_product_state as durable
 from message_formatter import build_copilot_url, copilot_enabled
+from test_copilot_credit_operations import FakeGrowthStore
 
 
 JOB = {
@@ -23,6 +24,9 @@ class FakeDb:
         self.job = job
         self.events = []
         self.saved = []
+        # The credit store of the copilot. Without it the paid AI analysis
+        # must not run at all.
+        self._growth_store = None
         self.settings = {"skills": "python, fastapi", "enabled_categories": ["development"]}
         self.feed = [
             {
@@ -232,6 +236,7 @@ class CopilotAIRuntimeTests(unittest.TestCase):
         import asyncio
 
         db = FakeDb(JOB)
+        db._growth_store = FakeGrowthStore()
         message = FakeMessage()
         query = FakeQuery(message)
         query.data = "copilot_ai:" + JOB["hash"]
@@ -256,10 +261,46 @@ class CopilotAIRuntimeTests(unittest.TestCase):
         self.assertIn("AI-разбор", message.replies[0][0])
         self.assertTrue(any(name == "copilot_ai_viewed" for name, _props in db.events))
 
+    def test_without_a_credit_store_the_paid_model_is_not_called(self):
+        """The credit store is missing: the model must not be called at all.
+
+        A paid call that nobody is charged for is a free service for the
+        operator, so the request is refused with the free report instead.
+        """
+        import asyncio
+
+        db = FakeDb(JOB)
+        db._growth_store = None
+        message = FakeMessage()
+        query = FakeQuery(message)
+        query.data = "copilot_ai:" + JOB["hash"]
+        update = FakeUpdate(message=message, query=query)
+        calls = []
+
+        def fake_analyze(job, skills, deterministic, resume_text, **kwargs):
+            calls.append(job)
+            return self._result()
+
+        env = {
+            "COPILOT_ENABLED": "true",
+            "COPILOT_LLM_ENABLED": "true",
+            "COPILOT_LLM_API_KEY": "test-key",
+        }
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            copilot_runtime.copilot_llm, "analyze", new=fake_analyze
+        ):
+            asyncio.run(copilot_runtime._copilot_handle_callback(FakeBot(db), update, SimpleNamespace()))
+        self.assertEqual(calls, [])
+        self.assertTrue(message.replies)
+        self.assertIn("без нейросети", message.replies[0][0])
+        self.assertTrue(any(name == "copilot_ai_no_store" for name, _props in db.events))
+        self.assertFalse(any(name == "copilot_ai_viewed" for name, _props in db.events))
+
     def test_ai_failure_falls_back_to_the_deterministic_report(self):
         import asyncio
 
         db = FakeDb(JOB)
+        db._growth_store = FakeGrowthStore()
         message = FakeMessage()
         query = FakeQuery(message)
         query.data = "copilot_ai:" + JOB["hash"]

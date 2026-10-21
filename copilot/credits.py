@@ -77,12 +77,20 @@ class CreditManager:
         return self._store.get_balance(user_id)
 
     def grant_referral(self, user_id: int, amount: Optional[int] = None) -> int:
-        """Credit a referral reward and return the new balance."""
+        """Credit a referral reward and return the new balance.
+
+        The balance and the journal entry are written by one statement, so a
+        failed write can no longer leave a credited balance without a journal
+        entry. The rules of the bonus itself are unchanged.
+        """
         bonus = referral_bonus() if amount is None else int(amount)
-        self._store.ensure_credit_row(user_id)
-        balance = self._store.grant_credits(user_id, bonus)
         if bonus:
-            self._safe_event(user_id, bonus, REASON_REFERRAL)
+            self._store.ensure_credit_row(user_id)
+            self._store.grant_credits_with_event(
+                int(user_id), int(bonus), REASON_REFERRAL, ""
+            )
+        else:
+            self._store.ensure_credit_row(user_id)
         return self._store.get_balance(user_id)
 
     def spend(self, user_id: int, amount: int = 1, reason: str = REASON_SPEND, ref: str = "") -> bool:
@@ -130,6 +138,20 @@ class CreditManager:
     def llm_allowed(self) -> bool:
         """Whether the global LLM budget still allows one more call."""
         return self.llm_budget_left() > 0
+
+    def reserve_llm_call(self, user_id: int, ref: str = "") -> bool:
+        """Take one slot of the global daily model budget.
+
+        The slot is taken and the attempt is recorded by one statement, so
+        the call of the model is counted exactly once and cannot slip past
+        the budget. ``False`` means the budget is exhausted and the model
+        must not be called.
+        """
+        return bool(
+            self._store.reserve_llm_attempt(
+                int(user_id), llm_daily_budget(), REASON_LLM_ATTEMPT, str(ref or "")
+            )
+        )
 
     def _safe_event(self, user_id: int, delta: int, reason: str, ref: str = "") -> None:
         try:

@@ -44,8 +44,8 @@ from copilot.credit_operations import (
     llm_operation,
     settle_delivery,
 )
-from copilot.credits import REASON_LLM_ATTEMPT, CreditManager
-from copilot.store import CopilotStore
+from copilot.credits import CreditManager
+from copilot.store import CopilotStore, CopilotStoreUnavailable
 from resume_documents import MAX_FILE_BYTES, ResumeDocumentError, extract_resume_document
 
 logger = logging.getLogger(__name__)
@@ -501,6 +501,21 @@ async def _handle_enrich(job_bot, update, job_hash: str) -> None:
     job_bot.db.log_event(user_id, "copilot_enrichment_viewed", {"hash": job_hash})
 
 
+def _release_ai_claim(store, user_id: int, job_hash: str, claim: str) -> None:
+    """Release the analysis slot of an attempt that produced no answer.
+
+    The slot has to be free again, otherwise the vacancy would be blocked for
+    the next fifteen minutes. A release that fails is not fatal: the claim
+    goes stale on its own and a later attempt takes it over.
+    """
+    if store is None or not claim:
+        return
+    try:
+        store.release_ai_report_claim(user_id, job_hash, claim)
+    except Exception as exc:
+        logger.info("Copilot AI claim release failed: %s", type(exc).__name__)
+
+
 async def _handle_ai(job_bot, update, job_hash: str) -> None:
     """Run the optional LLM analysis behind the explicit button."""
     query = update.callback_query
@@ -538,31 +553,6 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
         job_bot.db.log_event(user_id, "copilot_ai_cached", {"hash": job_hash})
         return
 
-    if manager is not None:
-        try:
-            manager.ensure_daily_allowance(user_id)
-            if manager.balance(user_id) < 1:
-                await query.answer(
-                    "Бесплатные AI-разборы на сегодня закончились. "
-                    "Пригласи друга — он получит бонус, а ты — +5 кредитов.",
-                    show_alert=True,
-                )
-                return
-            if not manager.llm_allowed():
-                await query.answer(
-                    "Дневной лимит AI-разборов исчерпан. Попробуй позже.",
-                    show_alert=True,
-                )
-                return
-        except Exception as exc:
-            # The balance could not be confirmed, so the paid analysis is not
-            # started at all.
-            logger.info("Copilot AI budget check failed: %s", type(exc).__name__)
-            await query.answer("Не удалось проверить кредиты. Попробуй позже.", show_alert=True)
-            return
-    else:
-        job_bot.db.log_event(user_id, "copilot_ai_uncharged", {"hash": job_hash})
-
     settings = job_bot.db.get_user_settings(user_id)
     profile = _profile_from_settings(settings)
     analysis = analyse_job(job, profile)
@@ -574,14 +564,71 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
         "grade": analysis["audit"].declared_grade,
     }
 
-    if store is not None:
-        # Every real call of the model is counted for the global budget, even
-        # when the user is not charged for it again: the operator pays for the
-        # call either way.
-        try:
-            store.log_credit_event(user_id, 0, REASON_LLM_ATTEMPT, job_hash)
-        except Exception as exc:
-            logger.warning("Copilot AI attempt log failed: %s", type(exc).__name__)
+    if manager is None:
+        # The credit store is unavailable. A paid call to the model must not
+        # be started at all, because the user could not be charged for it.
+        job_bot.db.log_event(user_id, "copilot_ai_no_store", {"hash": job_hash})
+        await query.answer("Показываю обычный разбор")
+        await query.message.reply_text(
+            "AI-разбор недоступен: не удалось проверить кредиты. "
+            "Ниже — обычный разбор без нейросети.\n\n" + format_analysis(job, analysis),
+            disable_web_page_preview=True,
+        )
+        return
+
+    try:
+        manager.ensure_daily_allowance(user_id)
+        if manager.balance(user_id) < 1:
+            await query.answer(
+                "Бесплатные AI-разборы на сегодня закончились. "
+                "Пригласи друга — он получит бонус, а ты — +5 кредитов.",
+                show_alert=True,
+            )
+            return
+    except Exception as exc:
+        # The balance could not be confirmed, so the paid analysis is not
+        # started at all.
+        logger.info("Copilot AI budget check failed: %s", type(exc).__name__)
+        await query.answer("Не удалось проверить кредиты. Попробуй позже.", show_alert=True)
+        return
+
+    # The analysis slot of this vacancy is claimed before the call. Without
+    # the claim two parallel taps would call the model twice, would burn two
+    # slots of the global budget and could charge the user twice for one
+    # vacancy: the credit of the operation is reserved by a statement that
+    # cannot see the parallel transaction yet.
+    try:
+        claim = store.claim_ai_report(user_id, job_hash)
+    except Exception as exc:
+        logger.warning("Copilot AI claim failed: %s", type(exc).__name__)
+        await query.answer("Не удалось проверить кредиты. Попробуй позже.", show_alert=True)
+        return
+    if not claim:
+        await query.answer(
+            "Этот разбор уже выполняется. Попробуй через минуту.",
+            show_alert=True,
+        )
+        return
+
+    # The slot of the global budget is taken before the call. A call of the
+    # model costs the operator even when the user is not charged for it
+    # again, and repeated requests for the same vacancy must not pass the
+    # budget.
+    try:
+        slot = manager.reserve_llm_call(user_id, job_hash)
+    except Exception as exc:
+        logger.warning("Copilot AI budget reservation failed: %s", type(exc).__name__)
+        _release_ai_claim(store, user_id, job_hash, claim)
+        await query.answer(
+            "Не удалось проверить лимит AI-разборов. Попробуй позже.", show_alert=True
+        )
+        return
+    if not slot:
+        _release_ai_claim(store, user_id, job_hash, claim)
+        await query.answer(
+            "Дневной лимит AI-разборов исчерпан. Попробуй позже.", show_alert=True
+        )
+        return
 
     await query.answer("Разбираю вакансию…")
     result = await _run_in_thread(
@@ -592,6 +639,7 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
         None,
     )
     if not result.ok:
+        _release_ai_claim(store, user_id, job_hash, claim)
         await query.message.reply_text(
             "AI-разбор не получился. Ниже — обычный разбор без нейросети.\n\n"
             + format_analysis(job, analysis),
@@ -612,6 +660,7 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
             operation.reserve()
         except (InsufficientCredits, CreditStoreUnavailable) as exc:
             logger.info("Copilot AI credit reservation failed: %s", type(exc).__name__)
+            _release_ai_claim(store, user_id, job_hash, claim)
             job_bot.db.log_event(user_id, "copilot_ai_not_charged", {"hash": job_hash})
             await query.message.reply_text(
                 "AI-разбор не показан: не удалось списать кредит.\n\n"
@@ -624,10 +673,15 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
             store.save_ai_report(
                 user_id,
                 job_hash,
+                claim=claim,
                 model=result.model,
                 answer="" if result.used_resume else text,
                 used_resume=result.used_resume,
             )
+        except Exception as exc:
+            logger.info("Copilot AI report cache failed: %s", type(exc).__name__)
+            _release_ai_claim(store, user_id, job_hash, claim)
+        try:
             store.save_evaluation(
                 user_id,
                 job_hash,
@@ -921,12 +975,16 @@ def _telegram_delivery_outcome(exc: BaseException) -> str:
     return DELIVERY_UNKNOWN
 
 
-def _release_pdf_claim(store, user_id: int, job_hash: str) -> None:
-    """Give the document slot back after a build that produced nothing."""
-    if store is None:
+def _release_pdf_claim(store, user_id: int, job_hash: str, claim: str) -> None:
+    """Give the document slot back after a build that produced nothing.
+
+    Only the owner of the claim releases the slot: a build that took over a
+    stale claim keeps it.
+    """
+    if store is None or not claim:
         return
     try:
-        store.release_document_claim(user_id, job_hash)
+        store.release_document_claim(user_id, job_hash, claim)
     except Exception as exc:
         logger.info("Copilot document claim release failed: %s", type(exc).__name__)
 
@@ -1015,6 +1073,9 @@ async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> Non
         await message.reply_text("Сборка CV по этой вакансии уже идёт. Попробуй через минуту.")
         return
 
+    # The claim is owned by this request from here on. Every exit below
+    # either delivers the document or releases the slot, so a failure never
+    # blocks the vacancy.
     try:
         pdf_bytes = await _run_in_thread(
             copilot_pdf.build_cv_pdf,
@@ -1024,17 +1085,18 @@ async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> Non
             skills=analysis["report"].matched_skills,
             note="Собрано под эту вакансию: совпавшие навыки из твоего профиля.",
         )
+        report = await _run_in_thread(copilot_pdf.validate_pdf_bytes, pdf_bytes, job=job)
+        if resume_bytes:
+            source_report = await _run_in_thread(
+                copilot_pdf.validate_pdf_bytes, resume_bytes, job=job
+            )
+        else:
+            source_report = None
     except Exception as exc:
         logger.warning("CV build failed: %s", type(exc).__name__)
-        _release_pdf_claim(store, user_id, job_hash)
+        _release_pdf_claim(store, user_id, job_hash, claimed)
         await message.reply_text("Не удалось собрать CV. Попробуй текстом резюме или позже.")
         return
-
-    report = await _run_in_thread(copilot_pdf.validate_pdf_bytes, pdf_bytes, job=job)
-    if resume_bytes:
-        source_report = await _run_in_thread(copilot_pdf.validate_pdf_bytes, resume_bytes, job=job)
-    else:
-        source_report = None
 
     caption = "🧾 CV под вакансию «{}».".format(str(job.get("title") or "вакансия"))
     caption += "\n" + report.summary()
@@ -1049,16 +1111,24 @@ async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> Non
         CreditManager(store).ensure_daily_allowance(user_id)
         operation.reserve()
     except InsufficientCredits:
-        _release_pdf_claim(store, user_id, job_hash)
+        _release_pdf_claim(store, user_id, job_hash, claimed)
         await message.reply_text(
             "Бесплатные сборки на сегодня закончились. Пригласи друга — он получит бонус, а ты — +5 кредитов."
         )
         return
-    except Exception as exc:
-        # A store outage must not leave the document slot taken: the user
-        # would be told that a build is running for the next fifteen minutes.
+    except (CreditStoreUnavailable, CopilotStoreUnavailable) as exc:
+        # The store is unavailable. Nothing was reserved, so the claim is
+        # released and the user is told that the check failed, not that the
+        # balance is empty.
         logger.warning("Copilot credit reservation failed: %s", type(exc).__name__)
-        _release_pdf_claim(store, user_id, job_hash)
+        _release_pdf_claim(store, user_id, job_hash, claimed)
+        await message.reply_text("Не удалось проверить кредиты. Попробуй позже.")
+        return
+    except Exception as exc:
+        # Any other failure of the credit check leaves the operation in the
+        # same state: no credit was reserved, the claim is released.
+        logger.warning("Copilot credit reservation failed: %s", type(exc).__name__)
+        _release_pdf_claim(store, user_id, job_hash, claimed)
         await message.reply_text("Не удалось проверить кредиты. Попробуй позже.")
         return
 
@@ -1072,8 +1142,11 @@ async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> Non
         file_id = str(getattr(getattr(sent, "document", None), "file_id", "") or "")
     except Exception as exc:
         logger.warning("CV delivery failed: %s", type(exc).__name__)
+        # Telegram may have stored the file even though the answer was lost,
+        # so a proven refusal pays the credit back and an open outcome does
+        # not.
         settle_delivery(operation, _telegram_delivery_outcome(exc))
-        _release_pdf_claim(store, user_id, job_hash)
+        _release_pdf_claim(store, user_id, job_hash, claimed)
         await message.reply_text("Не удалось отправить файл. Попробуй позже.")
         return
 
@@ -1087,9 +1160,14 @@ async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> Non
                 telegram_file_id=file_id,
                 filename=CV_FILENAME,
                 fit_score=analysis["report"].score,
+                claim=claimed,
             )
         except Exception as exc:
             logger.info("Copilot document cache write failed: %s", type(exc).__name__)
+            # The document was delivered, but the cache does not know it. The
+            # slot is released, so the next request builds it again and stays
+            # free: the operation is already paid for.
+            _release_pdf_claim(store, user_id, job_hash, claimed)
 
     job_bot.db.log_event(
         user_id,

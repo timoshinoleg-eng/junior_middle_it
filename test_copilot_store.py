@@ -169,11 +169,20 @@ class CopilotStoreTests(unittest.TestCase):
     def test_ai_report_is_cached(self):
         store = self._store()
         self.assertTrue(
-            store.save_ai_report(1, "hash", model="m", answer="answer", used_resume=False)
+            store.save_ai_report(
+                1, "hash", claim="claim:1", model="m", answer="answer", used_resume=False
+            )
         )
         query, params = self.backend.queries[-1]
         self.assertIn("growth_copilot_ai_reports", query)
         self.assertIn("answer", params)
+
+    def test_ai_report_needs_the_claim_of_its_owner(self):
+        store = self._store()
+        self.assertTrue(store.claim_ai_report(1, "hash"))
+        query, params = self.backend.queries[-1]
+        self.assertIn("growth_copilot_ai_reports", query)
+        self.assertIn("claim:", params[2])
 
     def test_ai_report_is_read_back(self):
         store = self._store(

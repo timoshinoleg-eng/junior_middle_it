@@ -89,18 +89,18 @@ class FakeStore:
     def get_document(self, user_id, job_id):
         return self.document
 
-    def save_document(self, user_id, job_id, **kwargs):
+    def save_document(self, user_id, job_id, *, claim=None, **kwargs):
         self.saved.append((user_id, job_id, kwargs))
         return True
 
     def claim_document(self, user_id, job_id, filename, *, stale_after_minutes=15):
         key = (int(user_id), str(job_id))
         if key in self.claimed:
-            return False
+            return None
         self.claimed.add(key)
-        return True
+        return "claim:%s" % key[1]
 
-    def release_document_claim(self, user_id, job_id):
+    def release_document_claim(self, user_id, job_id, claim=None):
         key = (int(user_id), str(job_id))
         if key in self.claimed:
             self.claimed.discard(key)
