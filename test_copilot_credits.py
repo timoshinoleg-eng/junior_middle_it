@@ -142,11 +142,25 @@ class CreditManagerTests(unittest.TestCase):
     def test_llm_budget_is_global_and_bounded(self):
         with patch.dict(os.environ, {"COPILOT_LLM_DAILY_BUDGET": "2"}, clear=False):
             self.assertTrue(self.manager.llm_allowed())
-            self.store.log_credit_event(1, -1, copilot_credits.REASON_LLM_CALL)
+            self.store.log_credit_event(1, 0, copilot_credits.REASON_LLM_ATTEMPT)
             self.assertTrue(self.manager.llm_allowed())
-            self.store.log_credit_event(2, -1, copilot_credits.REASON_LLM_CALL)
+            self.store.log_credit_event(2, 0, copilot_credits.REASON_LLM_ATTEMPT)
             self.assertFalse(self.manager.llm_allowed())
             self.assertEqual(self.manager.llm_budget_left(), 0)
+
+    def test_the_llm_budget_counts_every_call_and_not_only_the_charged_ones(self):
+        # A repeated analysis of the same vacancy is free for the user, but
+        # the operator still pays for the call, so the budget has to see it.
+        self.manager.ensure_daily_allowance(1)
+        with patch.dict(os.environ, {"COPILOT_LLM_DAILY_BUDGET": "2"}, clear=False):
+            self.store.log_credit_event(1, 0, copilot_credits.REASON_LLM_ATTEMPT)
+            self.assertTrue(self.manager.spend(1, 1, copilot_credits.REASON_LLM_CALL, "job-1"))
+            self.assertEqual(self.manager.llm_calls_today(), 1)
+            # The second analysis of the same vacancy is not charged again.
+            self.assertFalse(self.manager.spend(1, 1, copilot_credits.REASON_LLM_CALL, "job-1"))
+            self.store.log_credit_event(1, 0, copilot_credits.REASON_LLM_ATTEMPT)
+            self.assertEqual(self.manager.llm_calls_today(), 2)
+            self.assertFalse(self.manager.llm_allowed())
 
     def test_free_allowance_is_configurable(self):
         with patch.dict(os.environ, {"COPILOT_FREE_PER_DAY": "7"}, clear=False):

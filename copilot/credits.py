@@ -27,6 +27,10 @@ LLM_DAILY_BUDGET_DEFAULT = 200
 
 REASON_DAILY_GRANT = "daily_grant"
 REASON_REFERRAL = "referral"
+# Every real call of the model is written with this reason, so the global
+# budget counts the calls and not only the charged ones: a repeated analysis
+# of the same vacancy is free for the user but still costs the operator.
+REASON_LLM_ATTEMPT = "llm_attempt"
 
 
 def release_reason_for(reason: str) -> str:
@@ -107,8 +111,14 @@ class CreditManager:
         )
 
     def llm_calls_today(self) -> int:
+        """How many model calls were made today.
+
+        The attempts are counted, not the charges: a repeated analysis of the
+        same vacancy costs the operator a call even when the user is not
+        charged for it again.
+        """
         try:
-            return self._store.count_credit_events(REASON_LLM_CALL, today_only=True)
+            return self._store.count_credit_events(REASON_LLM_ATTEMPT, today_only=True)
         except Exception as exc:
             logger.info("LLM budget read failed: %s", type(exc).__name__)
             return 0

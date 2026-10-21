@@ -44,7 +44,7 @@ from copilot.credit_operations import (
     llm_operation,
     settle_delivery,
 )
-from copilot.credits import CreditManager
+from copilot.credits import REASON_LLM_ATTEMPT, CreditManager
 from copilot.store import CopilotStore
 from resume_documents import MAX_FILE_BYTES, ResumeDocumentError, extract_resume_document
 
@@ -574,6 +574,15 @@ async def _handle_ai(job_bot, update, job_hash: str) -> None:
         "grade": analysis["audit"].declared_grade,
     }
 
+    if store is not None:
+        # Every real call of the model is counted for the global budget, even
+        # when the user is not charged for it again: the operator pays for the
+        # call either way.
+        try:
+            store.log_credit_event(user_id, 0, REASON_LLM_ATTEMPT, job_hash)
+        except Exception as exc:
+            logger.warning("Copilot AI attempt log failed: %s", type(exc).__name__)
+
     await query.answer("Разбираю вакансию…")
     result = await _run_in_thread(
         copilot_llm.analyze,
@@ -894,10 +903,18 @@ def _telegram_delivery_outcome(exc: BaseException) -> str:
         from telegram import error as telegram_error
     except Exception:
         return DELIVERY_UNKNOWN
-    rejected = (
-        telegram_error.BadRequest,
-        telegram_error.Forbidden,
-        telegram_error.InvalidToken,
+    rejected = tuple(
+        error
+        for error in (
+            telegram_error.BadRequest,
+            telegram_error.Forbidden,
+            telegram_error.InvalidToken,
+            # A flood control answer means the request was not processed at
+            # all, so the document is provably not delivered. The Mini App
+            # treats the same 429 as a rejection.
+            getattr(telegram_error, "RetryAfter", None),
+        )
+        if error is not None
     )
     if isinstance(exc, rejected):
         return DELIVERY_REJECTED
@@ -1037,7 +1054,9 @@ async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> Non
             "Бесплатные сборки на сегодня закончились. Пригласи друга — он получит бонус, а ты — +5 кредитов."
         )
         return
-    except CreditStoreUnavailable as exc:
+    except Exception as exc:
+        # A store outage must not leave the document slot taken: the user
+        # would be told that a build is running for the next fifteen minutes.
         logger.warning("Copilot credit reservation failed: %s", type(exc).__name__)
         _release_pdf_claim(store, user_id, job_hash)
         await message.reply_text("Не удалось проверить кредиты. Попробуй позже.")

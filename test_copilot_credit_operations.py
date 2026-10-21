@@ -447,7 +447,7 @@ def run_telegram_build(store, backend, *, failure=None, user_id=42):
     asyncio.run(
         copilot_runtime._build_cv_from_message(job_bot, update, context, pending)
     )
-    return message, db
+    return message, db, context
 
 
 def sent_document(store, backend):
@@ -741,7 +741,7 @@ class MiniAppCreditTests(unittest.TestCase):
         self.assertEqual(status, 200)
         # The same vacancy through the Telegram bot: the credit is not taken
         # a second time.
-        message, _db = run_telegram_build(self.store, self.backend)
+        message, _db, _context = run_telegram_build(self.store, self.backend)
         self.assertTrue(message.replies)
         self.assertEqual(self.backend._balance(42), 2)
         self.assertEqual(event_reasons(self.backend).count(credit_ops.REASON_SPEND), 1)
@@ -757,7 +757,7 @@ class TelegramCreditTests(unittest.TestCase):
 
     def test_a_successful_build_and_delivery_costs_one_credit(self):
         store, backend = make_store(balance=3)
-        message, db = run_telegram_build(store, backend)
+        message, db, _context = run_telegram_build(store, backend)
         self.assertTrue(message.replies)
         self.assertIn("Готово", message.replies[-1][0])
         self.assertEqual(backend._balance(42), 2)
@@ -770,7 +770,7 @@ class TelegramCreditTests(unittest.TestCase):
         from telegram import error as telegram_error
 
         store, backend = make_store(balance=3)
-        message, _db = run_telegram_build(
+        message, _db, _context = run_telegram_build(
             store, backend, failure=telegram_error.BadRequest("chat not found")
         )
         self.assertTrue(message.replies)
@@ -783,7 +783,7 @@ class TelegramCreditTests(unittest.TestCase):
         from telegram import error as telegram_error
 
         store, backend = make_store(balance=3)
-        message, _db = run_telegram_build(
+        message, _db, _context = run_telegram_build(
             store, backend, failure=telegram_error.TimedOut("timeout")
         )
         self.assertTrue(message.replies)
@@ -798,7 +798,7 @@ class TelegramCreditTests(unittest.TestCase):
         with patch.object(
             copilot_runtime.copilot_pdf, "build_cv_pdf", side_effect=RuntimeError("no font")
         ):
-            message, _db = run_telegram_build(store, backend)
+            message, _db, _context = run_telegram_build(store, backend)
         self.assertTrue(message.replies)
         self.assertEqual(backend._balance(42), 3)
         self.assertEqual(event_reasons(backend), [])
@@ -806,16 +806,46 @@ class TelegramCreditTests(unittest.TestCase):
 
     def test_a_database_error_keeps_the_credit(self):
         store, backend = make_store(balance=3, failures=("debit",))
-        message, _db = run_telegram_build(store, backend)
+        message, _db, context = run_telegram_build(store, backend)
         self.assertTrue(message.replies)
         self.assertEqual(backend._balance(42), 3)
         self.assertEqual(event_reasons(backend), [])
+        # The paid document must not reach the user when the credit could not
+        # be confirmed: this is the defect the test has to keep closed.
+        self.assertEqual(context.bot.sent, [])
+
+    def test_a_store_outage_releases_the_document_slot(self):
+        # The daily allowance fails after the slot was taken.
+        store, backend = make_store(balance=3, failures=("grant",))
+        with patch.dict(os.environ, {"COPILOT_FREE_PER_DAY": "3"}, clear=False):
+            message, _db, context = run_telegram_build(store, backend)
+        self.assertTrue(message.replies)
+        self.assertEqual(context.bot.sent, [])
+        self.assertEqual(backend._balance(42), 3)
+        # The slot must be free again, otherwise the vacancy is blocked for
+        # the next fifteen minutes.
+        self.assertEqual(backend.documents, {})
+
+    def test_a_telegram_rate_limit_is_a_proven_rejection(self):
+        from telegram import error as telegram_error
+
+        store, backend = make_store(balance=3)
+        message, _db, _context = run_telegram_build(
+            store, backend, failure=telegram_error.RetryAfter(5)
+        )
+        self.assertTrue(message.replies)
+        # A flood control answer means the file was not delivered, so the
+        # credit comes back, like in the Mini App.
+        self.assertEqual(backend._balance(42), 3)
+        reasons = event_reasons(backend)
+        self.assertEqual(reasons.count(credit_ops.REASON_SPEND), 1)
+        self.assertEqual(reasons.count(credit_ops.REASON_RELEASE), 1)
 
     def test_a_stale_claim_is_taken_over(self):
         store, backend = make_store(balance=3)
         backend._claim((42, JOB["hash"], "cv.pdf", 15))
         backend.advance(minutes=20)
-        message, _db = run_telegram_build(store, backend)
+        message, _db, _context = run_telegram_build(store, backend)
         self.assertTrue(message.replies)
         self.assertIn("Готово", message.replies[-1][0])
         self.assertEqual(backend._balance(42), 2)
