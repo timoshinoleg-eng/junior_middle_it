@@ -3121,6 +3121,14 @@ async def check_telethon_post_permissions() -> Dict:
         await parser.disconnect()
 
 
+def _render_crawl_blocked() -> bool:
+    """Render may serve private bot traffic, but Vercel alone publishes channels."""
+    return bool(os.getenv("RENDER_SERVICE_ID")) and not (
+        os.getenv("VERCEL") == "1"
+        and os.getenv("VERCEL_ENV", "").lower() == "production"
+    )
+
+
 async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: Optional[int] = None) -> Dict:
     """Run a single collection/publication cycle for serverless cron deployments."""
     if not Config.validate():
@@ -3129,10 +3137,7 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
     # its periodic collector wastes API traffic and always ends in denied
     # sends. The Vercel production cron is the only publisher. Leave Render's
     # private bot / digests intact while skipping this redundant crawl.
-    if os.getenv("RENDER_SERVICE_ID") and not (
-        os.getenv("VERCEL") == "1"
-        and os.getenv("VERCEL_ENV", "").lower() == "production"
-    ):
+    if _render_crawl_blocked():
         logger.info("Skipping Render collection: public publishing belongs to Vercel production")
         return {
             'ok': True, 'skipped': True, 'reason': 'vercel_publication_authority',
@@ -4379,6 +4384,16 @@ async def main():
     except (NotImplementedError, RuntimeError) as e:
         logger.warning(f"Signal handlers not available on this platform: {e}")
     
+    # Keep the long-polling worker and scheduled personal digests alive, but do
+    # not run the separate, perpetual public-collection loop on Render. The
+    # collect_and_post_once() guard does not protect this path.
+    if _render_crawl_blocked():
+        CYCLE_TELEMETRY["sources_total"] = 0
+        CYCLE_TELEMETRY["last_source"] = "disabled_noncanonical_render"
+        logger.info("Render collection loop disabled: Vercel cron is the canonical publisher")
+        while True:
+            await asyncio.sleep(3600)
+
     # Main collection loop
     api_fetch_functions = get_api_fetch_functions()
     CYCLE_TELEMETRY["sources_total"] = len(api_fetch_functions)
