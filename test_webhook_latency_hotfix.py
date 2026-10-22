@@ -359,6 +359,14 @@ class SingleReadStartTests(unittest.TestCase):
         self.assertEqual(params, (77, 77, 77))
         self.assertNotIn("INSERT", sql)
         self.assertNotIn("UPDATE", sql)
+        # The Edge SQL bridge serializes rows by column name; duplicate
+        # unaliased COALESCE columns overwrite one another before returning.
+        for alias in ("language", "onboarding_done", "alerts_enabled", "digest_enabled", "search_count"):
+            self.assertIn("AS " + alias, sql)
+        self.assertEqual(len(set((
+            "language", "onboarding_done", "alerts_enabled",
+            "digest_enabled", "search_count",
+        ))), 5)
 
     def test_fast_start_does_not_mutate_profile(self):
         db = object.__new__(runtime_v8.DatabaseConnection)
