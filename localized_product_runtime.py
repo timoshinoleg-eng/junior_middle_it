@@ -269,14 +269,22 @@ class JobBot(p8.JobBot):
         language = hint[1] if isinstance(hint, tuple) and hint[0] == user_id else self.db.get_user_language(user_id)
         if not language:
             await update.message.reply_text(t("ru", "choose_language"), reply_markup=self._language_keyboard(payload))
-            self.db.log_event(user_id, "start", {"payload": payload, "language_pending": True})
+            try:
+                self.db.log_event(user_id, "start", {"payload": payload, "language_pending": True})
+            except Exception as exc:
+                # The reply was already delivered. A failed analytics write must
+                # not cause Telegram to retry and duplicate the welcome text.
+                core.logger.warning("Start analytics failed after reply: %s", type(exc).__name__)
             return
         if not payload:
             # Send the visible response before non-critical bookkeeping. The
             # synchronous Edge round-trips used to delay /start by seconds.
             await self._send_retention_hub(update.message, user_id)
-            self.db.log_event(user_id, "start", {"payload": None})
-            self.db.maybe_unlock_premium(user_id)
+            try:
+                self.db.log_event(user_id, "start", {"payload": None})
+                self.db.maybe_unlock_premium(user_id)
+            except Exception as exc:
+                core.logger.warning("Start bookkeeping failed after reply: %s", type(exc).__name__)
             return
         if payload == "web_home":
             self.db.log_event(user_id, "start", {"payload": payload})
