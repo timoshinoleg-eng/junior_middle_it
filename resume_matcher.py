@@ -182,11 +182,12 @@ def analyze_resume_match(resume_text: str, job: Dict) -> ResumeMatchReport:
     missing = sorted(required - resume_skills)
 
     if required:
-        skill_pct = len(matched) / len(required)
-        skill_points = 75.0 * skill_pct
+        # One generic matching skill cannot justify 75%: apply minimum
+        # evidence size, while preserving weighting for substantive stacks.
+        skill_points = 75.0 * len(matched) / max(3, len(required))
     else:
-        # Avoid pretending precision when a vacancy does not expose a useful stack.
-        skill_points = 30.0
+        # No extracted requirements => no evidence for skill-fit credit.
+        skill_points = 0.0
 
     vacancy_keywords = _keywords(vacancy_text)
     resume_keywords = _keywords(resume_text)
@@ -261,8 +262,16 @@ def format_resume_match_report(report: ResumeMatchReport, job: Dict) -> str:
         lines.append("✅ Совпадает: " + ", ".join(report.matched_skills[:8]))
     if report.missing_skills:
         lines.append("⚠️ Не нашёл в резюме: " + ", ".join(report.missing_skills[:8]))
-    if not report.required_skills:
-        lines.append("ℹ️ В вакансии мало явно указанных технологий — точность оценки ниже.")
+    if len(report.required_skills) < 3 or report.keyword_overlap_pct < 10:
+        lines.append(
+            "⚠️ Низкая уверенность оценки: мало подтверждённых требований "
+            "или почти нет совпадения текста. Не используйте процент "
+            "как вероятность найма."
+        )
+        lines.append(
+            f"Найдено требований: {len(report.required_skills)}, "
+            f"совпало навыков: {len(report.matched_skills)}."
+        )
     lines.append(f"🔎 Пересечение ключевых слов: {report.keyword_overlap_pct}%")
     lines.append("")
     lines.append("Что улучшить перед откликом:")

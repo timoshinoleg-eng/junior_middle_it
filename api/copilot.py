@@ -22,7 +22,7 @@ import os
 import sys
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -51,6 +51,15 @@ configure_sensitive_http_logging()
 logger = logging.getLogger(__name__)
 
 CV_FILENAME = "cv.pdf"
+
+def is_pdf_route(url: str) -> bool:
+    """Recognize direct or rewritten PDF requests without skipping authentication."""
+    parsed = urlsplit(url)
+    if parsed.path.rstrip("/").endswith("/pdf"):
+        return True
+    return (parsed.path.rstrip("/") == "/api/copilot"
+            and parse_qs(parsed.query).get("__copilot_route") == ["pdf"])
+
 
 
 def _profile_from_settings(settings):
@@ -168,20 +177,20 @@ class handler(BaseHTTPRequestHandler):
         self.do_POST()
 
     def do_POST(self):
-        path = urlsplit(self.path).path.rstrip("/")
+        pdf_request = is_pdf_route(self.path)
         db = None
         try:
             payload = self._read_json()
             user = self._authenticate(payload)
             user_id = int(user["id"])
-            if path.endswith("/pdf") and not paid_operations_enabled(pdf=True):
+            if pdf_request and not paid_operations_enabled(pdf=True):
                 raise copilot_webapp.WebappError(
                     503, "maintenance",
                     "Разбор резюме временно недоступен: технические работы. Попробуй позже.",
                 )
             db, job_bot, store = self._runtime()
             self._rate_limit(store, user_id)
-            if path.endswith("/pdf"):
+            if pdf_request:
                 status, body = self._handle_pdf(db, store, payload, user_id)
             else:
                 status, body = self._handle_fit(db, store, payload, user_id)

@@ -4309,7 +4309,13 @@ async def main():
     # Start bot
     await application.initialize()
     await application.start()
-    await application.updater.start_polling()
+    if _render_crawl_blocked():
+        # Render is an outbound digest worker. Vercel webhook exclusively
+        # consumes inbound Telegram updates, preventing 409 getUpdates races.
+        logger.info("Telegram polling disabled: Vercel webhook is canonical")
+    else:
+        await application.updater.start_polling()
+        logger.info("Telegram polling started on non-Render runtime")
 
     # Daily channel digest + personal DM digests
     if Config.ENABLE_DAILY_DIGEST and getattr(application, 'job_queue', None):

@@ -103,6 +103,8 @@ def health_snapshot() -> tuple[int, dict]:
             "service": "junior_middle_it_bot",
             "uptime_s": int(time.time() - STATE["started_at"]),
             "bot": "running" if running else "crashed" if failed else "starting",
+            "telegram_updates": "disabled_vercel_webhook_canonical" if os.getenv("RENDER_SERVICE_ID") else "polling",
+            "receives_telegram_updates": not bool(os.getenv("RENDER_SERVICE_ID")),
             "error": STATE["error"],
             "config": config_summary(),
             "cycle": None,
