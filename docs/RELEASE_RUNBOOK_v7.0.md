@@ -301,6 +301,38 @@ ALTER TABLE public.growth_copilot_rate_limits ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON TABLE public.growth_copilot_rate_limits FROM anon, authenticated;
 ```
 
+### Блок 5 — P13
+
+Реестр кредитных операций. Таблица аддитивна: старый код её не знает и
+продолжает работать как раньше, поэтому миграцию можно применить **до**
+деплоя нового кода, а откат кода не требует откатывать DDL.
+
+```sql
+-- Файл: supabase/migrations/20261021060000_p13_copilot_credit_operations.sql
+-- Одна строка на операцию: состояние и номер попытки.
+CREATE TABLE IF NOT EXISTS public.growth_copilot_credit_ops (
+    user_id BIGINT NOT NULL,
+    ref TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'reserved'
+        CHECK (state IN ('reserved', 'released', 'delivered', 'unknown')),
+    amount INTEGER NOT NULL DEFAULT 1,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, ref, kind)
+);
+CREATE INDEX IF NOT EXISTS growth_copilot_credit_ops_updated_at_idx
+    ON public.growth_copilot_credit_ops (updated_at);
+CREATE INDEX IF NOT EXISTS growth_copilot_credit_events_user_ref_idx
+    ON public.growth_copilot_credit_events (user_id, ref);
+ALTER TABLE public.growth_copilot_credit_ops ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE public.growth_copilot_credit_ops FROM anon, authenticated;
+```
+
+Файл миграции содержит ещё перенос открытых операций из журнала в реестр
+(идемпотентный `INSERT ... ON CONFLICT DO NOTHING`).
+
 ## 1.2 Вариант B — Management API
 
 Нужен personal access token Supabase (**Dashboard → Account → Access Tokens → Generate**). Токен — только в переменную окружения, в репозиторий, коммиты и чат не попадает.
@@ -314,7 +346,8 @@ foreach ($file in @(
   "supabase/migrations/20261020120000_p9_copilot_tables.sql",
   "supabase/migrations/20261020130000_p10_copilot_ai_reports.sql",
   "supabase/migrations/20261020140000_p11_copilot_forward_and_applications.sql",
-  "supabase/migrations/20261020150000_p12_copilot_rate_limits.sql"
+  "supabase/migrations/20261020150000_p12_copilot_rate_limits.sql",
+  "supabase/migrations/20261021060000_p13_copilot_credit_operations.sql"
 )) {
   $body = @{ query = (Get-Content $file -Raw -Encoding UTF8) } | ConvertTo-Json -Compress
   try {
@@ -340,6 +373,39 @@ psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261020150000
 ```
 
 `-v ON_ERROR_STOP=1` обязателен: без него psql продолжит после ошибки и покажет ложный «успех».
+
+## 1.6 Переключение кредитной системы: порядок, который не теряет кредиты
+
+Новый код **не умеет** работать без реестра `growth_copilot_credit_ops`:
+транспорт production (Edge-мост) не передаёт SQLSTATE, поэтому «таблицы нет»
+не отличить от любой другой ошибки, и код на такой ошибке **останавливает**
+кредитную систему, а не откатывается на старые statement'ы журнала.
+
+Поэтому переключение делается так, чтобы в момент перехода не осталось
+операций, которые знает только старый код.
+
+| # | Действие | Как | Проверка |
+|---|---|---|---|
+| 1 | Применить P13 | SQL Editor или Management API (блок 5) | `SELECT count(*) FROM public.growth_copilot_credit_ops` отвечает |
+| 2 | **Пауза** кредитных операций | `COPILOT_PDF_ENABLED=false` на Vercel + redeploy; на Render — тот же флаг | `vercel env ls production` показывает `false`; сборка CV в Telegram не работает |
+| 3 | Дренирование | подождать 5 минут, пока старые инстансы доработают запросы в-flight | в `growth_copilot_credit_events` перестали появляться новые `spend` |
+| 4 | Сверка | выполнить `tools/reconcile_credit_operations.sql` (идемпотентно) | скрипт можно запускать повторно |
+| 5 | Проверка готовности | `python tools/verify_release_v7.py` | `supabase.credit_registry_ready` = PASS, `supabase.copilot_tables` = PASS |
+| 6 | Деплой нового кода | Vercel (бот + Mini App API) и Render, **пауза всё ещё включена** | деплой зелёный, `vercel env ls production` показывает `COPILOT_PDF_ENABLED=false` |
+| 7 | Повторная сверка | `tools/reconcile_credit_operations.sql` + `python tools/verify_release_v7.py` | `supabase.credit_registry_ready` = PASS |
+| 8 | Снятие паузы | `COPILOT_PDF_ENABLED=true` + `vercel redeploy --target production` | сборка CV в Telegram работает, кредит списывается **один** раз |
+| 9 | Контроль | `python tools/verify_release_v7.py` | оба чека PASS |
+
+Почему пауза обязательна: старый код пишет расход только в журнал, у него
+нет реестра. Пока он работает, операция, оплаченная старым кодом, не
+известна новому — а новый код по журналу такие операции **уже** узнаёт
+(он их переносит в реестр при чтении состояния, «adoption»), но между
+оплатой старым кодом и первым чтением новым есть окно. Пауза закрывает
+окно, а сверка и проверка готовности доказывают, что окно закрыто.
+
+Что делать, если паузу поставить нельзя: не переключать код в production и
+не катить релиз — применить P13, оставить старый код, и вернуться к вопросу
+после того, как появится окно.
 
 ## 1.4 Проверка после применения (SQL Editor)
 
@@ -592,8 +658,14 @@ python tools\copilot_core_smoke.py --limit 20
 | Откатить флаги | то же для каждой переменной; Mini App и бот продолжают работать в обычном режиме |
 | Вернуть Edge-функцию | `supabase functions deploy growth-proxy --project-ref uucjptyqfsdzqsftgiro --no-verify-jwt --use-api` на предыдущем коммите (`git checkout 053608ee` в клоне) |
 | Откатить код Vercel | дашборд → Deployments → ⋯ → Promote to Production на деплое `053608ee`/`6a6978b` |
+| Откатить кредитную систему | сначала пауза (`COPILOT_PDF_ENABLED=false` + redeploy), потом откат кода, потом `tools/reconcile_credit_operations.sql` и `python tools/verify_release_v7.py` |
 
 DDL откатывается вручную: `DROP TABLE public.growth_copilot_*` — только если нужно, данные там производные и восстанавливаются.
+
+Реестр `growth_copilot_credit_ops` при откате кода **не удаляется**: он
+аддитивен, старый код его не читает, а новый при возврате снова найдёт в
+нём своё состояние. Откат кода возвращает и старую гонку двух параллельных
+списаний — это цена отката, её нужно принять осознанно, а не молча.
 
 ---
 
