@@ -93,6 +93,24 @@ class ProcessUpdateTests(unittest.IsolatedAsyncioTestCase):
         ledger.complete.assert_called_once_with(123)
         self.assertTrue(db.closed)
 
+    async def test_sql_timings_are_aggregated_without_private_fields(self):
+        db = self.FakeDB()
+        db._growth_store = SimpleNamespace(conn=SimpleNamespace(sql_metrics=[
+            ("growth_events", 19), ("growth_user_settings", 17),
+        ]))
+        app = self.FakeApp()
+        ledger = MagicMock()
+        ledger.claim.return_value = "claimed"
+        with patch.object(runtime, "build_runtime", return_value=(app, db, object())), \
+             patch.object(runtime, "TelegramUpdateLedger", return_value=ledger), \
+             patch("telegram.Update.de_json", return_value=object()), \
+             self.assertLogs(runtime.logger, level="INFO") as captured:
+            result = await runtime.process_update_payload({"update_id": 99881})
+        self.assertEqual(result, "processed")
+        summary = "\n".join(captured.output)
+        self.assertIn("sql_calls=2 sql_ms=36 sql_max_ms=19", summary)
+        self.assertNotIn("99881", summary)
+
     async def test_processed_duplicate_returns_200_semantic_without_dispatch(self):
         db = self.FakeDB()
         app = self.FakeApp()

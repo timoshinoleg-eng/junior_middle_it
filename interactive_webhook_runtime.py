@@ -315,14 +315,20 @@ async def process_update_payload(payload: Dict[str, Any]) -> str:
         handled_at = time.perf_counter()
         ledger.complete(update_id)
         committed_at = time.perf_counter()
-        # Never log Telegram content, user IDs, update IDs, resume text, or
-        # signatures. This exposes the cold start / SQL bridge / handler cost.
+        store = getattr(db, "_growth_store", None)
+        sql_metrics = getattr(getattr(store, "conn", None), "sql_metrics", ())
+        sql_ms = sum(duration for _, duration in sql_metrics)
+        max_sql_ms = max((duration for _, duration in sql_metrics), default=0)
+        # No Telegram content, user IDs, update IDs, SQL, params or credentials.
+        # SQL metrics are scoped to the request's own connection, not a global.
         logger.info(
-            "telegram_stage_latency runtime_ms=%d claim_ms=%d handler_ms=%d complete_ms=%d",
+            "telegram_stage_latency runtime_ms=%d claim_ms=%d handler_ms=%d "
+            "complete_ms=%d sql_calls=%d sql_ms=%d sql_max_ms=%d",
             round(1000 * (runtime_at - started_at)),
             round(1000 * (claimed_at - runtime_at)),
             round(1000 * (handled_at - claimed_at)),
             round(1000 * (committed_at - handled_at)),
+            len(sql_metrics), sql_ms, max_sql_ms,
         )
         return "processed"
     finally:

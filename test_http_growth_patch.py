@@ -76,6 +76,31 @@ class HttpGrowthPatchTests(unittest.TestCase):
         self.assertEqual(captured["token"], "123:bot-token")
         self.assertIsNone(captured["growth_key"])
 
+    def test_telegram_sql_timing_contains_no_user_data(self):
+        conn = bridge.RemoteGrowthConnection(
+            "https://x.supabase.co/functions/v1/interactive-growth-proxy",
+            "123:secret-bot-token", auth_mode="telegram",
+        )
+        with patch.object(bridge, "urlopen", return_value=FakeResponse({"rows": [], "columns": []})), \
+             self.assertLogs(bridge.logger, level="INFO") as captured:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM growth_events WHERE name=%s",
+                    ("private-test-resume",),
+                )
+        self.assertEqual(len(conn.sql_metrics), 1)
+        self.assertEqual(conn.sql_metrics[0][0], "growth_events")
+        self.assertGreaterEqual(conn.sql_metrics[0][1], 0)
+        joined = "\n".join(captured.output)
+        self.assertIn("growth_sql_latency call=1 relation=growth_events", joined)
+        self.assertNotIn("private-test-resume", joined)
+        self.assertNotIn("123:secret-bot-token", joined)
+        other = bridge.RemoteGrowthConnection(
+            "https://x.supabase.co/functions/v1/interactive-growth-proxy",
+            "123:secret-bot-token", auth_mode="telegram",
+        )
+        self.assertEqual(other.sql_metrics, [])
+
     def test_telegram_mode_never_forwards_schema_bootstrap(self):
         conn = bridge.RemoteGrowthConnection(
             "https://x.supabase.co/functions/v1/interactive-growth-proxy",
