@@ -403,6 +403,33 @@ SQL-запрос (шаг 0 в `docs/P13_CUTOVER.md`), который наход�
 удалось (нет доступа к базе): «не проверил» и «нечего переносить» — не одно и то же.
 Сам backfill переносит только `ref ~ '^[0-9a-f]{40}$'`, поэтому строки-сироты не создаются.
 
+Запросы аудита — те же, что в шаге 0 процедуры и в `tools/verify_release_v7.py`:
+
+```sql
+SELECT ref, reason, count(*) AS events,
+       min(created_at) AS first_seen, max(created_at) AS last_seen
+FROM public.growth_copilot_credit_events
+WHERE reason IN ('spend', 'spend_release', 'cv_delivered', 'cv_delivery_unknown', 'llm_call', 'llm_call_release', 'llm_delivered', 'llm_delivery_unknown')
+  AND ref IS DISTINCT FROM ''
+  AND ref !~ '^[0-9a-f]{40}$'
+GROUP BY ref, reason
+ORDER BY events DESC;
+
+SELECT ref, reason, count(*) AS events,
+       min(created_at) AS first_seen, max(created_at) AS last_seen
+FROM public.growth_copilot_credit_events
+WHERE reason IN ('spend', 'spend_release', 'cv_delivered', 'cv_delivery_unknown', 'llm_call', 'llm_call_release', 'llm_delivered', 'llm_delivery_unknown')
+  AND (ref = '' OR ref IS NULL)
+GROUP BY ref, reason
+ORDER BY events DESC;
+```
+
+Фильтр `reason IN (...)` — обязательная часть запроса: аудит сопоставляет с вакансией
+только **платные** операции. Бесплатные начисления `daily_grant` и `referral` пишутся с
+пустой ссылкой намеренно (это не вакансия), а `llm_attempt` — учёт вызовов модели для
+глобального бюджета (`delta = 0`). Без фильтра аудит заблокировал бы выпуск из-за
+безобидного ежедневного начисления.
+
 **Заморозка (шаг 2 процедуры) — сначала два флага, потом редеплой:**
 
 ```powershell

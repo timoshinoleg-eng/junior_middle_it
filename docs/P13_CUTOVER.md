@@ -145,19 +145,37 @@ P14 очищает старые токены из `model`, не переноси
 SELECT ref, reason, count(*) AS events,
        min(created_at) AS first_seen, max(created_at) AS last_seen
 FROM public.growth_copilot_credit_events
-WHERE ref IS DISTINCT FROM ''
+WHERE reason IN ('spend', 'spend_release', 'cv_delivered', 'cv_delivery_unknown', 'llm_call', 'llm_call_release', 'llm_delivered', 'llm_delivery_unknown')
+  AND ref IS DISTINCT FROM ''
   AND ref !~ '^[0-9a-f]{40}$'
 GROUP BY ref, reason
 ORDER BY events DESC;
 
--- 2. Отдельно: строки журнала вообще без ссылки (ref = '' или NULL)
+-- 2. Отдельно: платные операции вообще без ссылки (ref = '' или NULL)
 SELECT ref, reason, count(*) AS events,
        min(created_at) AS first_seen, max(created_at) AS last_seen
 FROM public.growth_copilot_credit_events
-WHERE ref = '' OR ref IS NULL
+WHERE reason IN ('spend', 'spend_release', 'cv_delivered', 'cv_delivery_unknown', 'llm_call', 'llm_call_release', 'llm_delivered', 'llm_delivery_unknown')
+  AND (ref = '' OR ref IS NULL)
 GROUP BY ref, reason
 ORDER BY events DESC;
 ```
+
+**Аудит смотрит только на платные операции.** Фильтр `reason IN (...)` — обязательная часть
+запроса, а не украшение:
+
+- `daily_grant` и `referral` — это **бесплатные начисления**. Они пишутся с пустой ссылкой
+  намеренно (`copilot/credits.py`: `grant_daily_allowance_with_event(..., "daily_grant", "")`
+  и `grant_credits_with_event(..., "referral", "")`), потому что начисление не относится ни к
+  какой вакансии. Их нечего сопоставлять с `job_hash`, и они **не должны** блокировать выпуск.
+- `llm_attempt` — учёт вызовов модели для глобального бюджета. Кредит пользователя он не
+  списывает (`delta = 0`), к вакансии не привязан и переносом в реестр не занимается.
+- Платные причины — `spend`, `spend_release`, `cv_delivered`, `cv_delivery_unknown`,
+  `llm_call`, `llm_call_release`, `llm_delivered`, `llm_delivery_unknown` — вот единственные,
+  которые сопоставляются с вакансией.
+
+Скобки вокруг `ref = '' OR ref IS NULL` обязательны: без них приоритет оператора неявный, и
+запрос молча меняет смысл при правке условий.
 
 Пустой результат **обоих** запросов — единственный допустимый. **Если строки есть, выпуск
 останавливается**: сопоставление таких операций с вакансиями и их перенос нужно
@@ -457,11 +475,22 @@ SELECT o.user_id, o.ref, o.kind, o.state
 FROM public.growth_copilot_credit_ops o
 WHERE o.ref !~ '^[0-9a-f]{40}$';
 
--- V7. Барьер шага 0 всё ещё пуст (журнал не изменился после backfill)
-SELECT ref, reason, count(*) AS events
+-- V7. Барьер шага 0 всё ещё пуст (журнал не изменился после backfill).
+-- Те же два запроса, что и в шаге 0, — по тем же платным причинам.
+SELECT ref, reason, count(*) AS events,
+       min(created_at) AS first_seen, max(created_at) AS last_seen
 FROM public.growth_copilot_credit_events
-WHERE ref IS DISTINCT FROM ''
+WHERE reason IN ('spend', 'spend_release', 'cv_delivered', 'cv_delivery_unknown', 'llm_call', 'llm_call_release', 'llm_delivered', 'llm_delivery_unknown')
+  AND ref IS DISTINCT FROM ''
   AND ref !~ '^[0-9a-f]{40}$'
+GROUP BY ref, reason
+ORDER BY events DESC;
+
+SELECT ref, reason, count(*) AS events,
+       min(created_at) AS first_seen, max(created_at) AS last_seen
+FROM public.growth_copilot_credit_events
+WHERE reason IN ('spend', 'spend_release', 'cv_delivered', 'cv_delivery_unknown', 'llm_call', 'llm_call_release', 'llm_delivered', 'llm_delivery_unknown')
+  AND (ref = '' OR ref IS NULL)
 GROUP BY ref, reason
 ORDER BY events DESC;
 ```
