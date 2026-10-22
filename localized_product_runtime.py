@@ -255,17 +255,17 @@ class JobBot(p8.JobBot):
                 card_text = self._job_text(job, lang)
                 if market_examples:
                     prefix = (
-                        "⚠️ ПРИМЕР ВНЕ ТВОИХ ФИЛЬТРОВ — не персональное совпадение.\\n"
+                        "⚠️ ПРИМЕР ВНЕ ТВОИХ ФИЛЬТРОВ — не персональное совпадение.\n"
                         if lang == "ru" else
-                        "⚠️ EXAMPLE OUTSIDE YOUR FILTERS — not a personal match.\\n"
+                        "⚠️ EXAMPLE OUTSIDE YOUR FILTERS — not a personal match.\n"
                     )
                     enabled = set(settings.get("enabled_categories") or [])
                     category = str(job.get("category") or "other")
                     if enabled and category not in enabled:
                         prefix += (
-                            f"Категория: {category_name(category, lang)}.\\n"
+                            f"Категория: {category_name(category, lang)}.\n"
                             if lang == "ru" else
-                            f"Category: {category_name(category, lang)}.\\n"
+                            f"Category: {category_name(category, lang)}.\n"
                         )
                     card_text = prefix + card_text
                 await self.application.bot.send_message(
