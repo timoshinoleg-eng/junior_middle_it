@@ -3125,6 +3125,19 @@ async def collect_and_post_once(use_sqlite: bool = True, source_budget_seconds: 
     """Run a single collection/publication cycle for serverless cron deployments."""
     if not Config.validate():
         return {'ok': False, 'error': 'invalid_config'}
+    # Render is not allowed to publish to public Telegram channels; running
+    # its periodic collector wastes API traffic and always ends in denied
+    # sends. The Vercel production cron is the only publisher. Leave Render's
+    # private bot / digests intact while skipping this redundant crawl.
+    if os.getenv("RENDER_SERVICE_ID") and not (
+        os.getenv("VERCEL") == "1"
+        and os.getenv("VERCEL_ENV", "").lower() == "production"
+    ):
+        logger.info("Skipping Render collection: public publishing belongs to Vercel production")
+        return {
+            'ok': True, 'skipped': True, 'reason': 'vercel_publication_authority',
+            'fetched': 0, 'posted': 0, 'failed': 0,
+        }
     configure_webshare_proxy()
 
     db = init_database() if use_sqlite else None
