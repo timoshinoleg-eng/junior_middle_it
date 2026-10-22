@@ -53,7 +53,7 @@ class ResumeDetailTests(unittest.TestCase):
             "title": "Engineer", "description": "Agile", "tags": [],
         })
         message = format_resume_match_report(score, {"title": "Engineer"})
-        self.assertIn("Уверенность: низкая", message)
+        self.assertIn("Низкая уверенность", message)
         self.assertIn("не вероятность найма", message)
 
 
