@@ -160,9 +160,11 @@ class RemoteGrowthCursor:
                 ).get("error", "http error")
             except Exception:
                 detail = "http error"
-            raise GrowthStoreUnavailable(
-                f"Growth proxy rejected query ({exc.code}): {detail}"
-            ) from exc
+            failure = GrowthStoreUnavailable(
+                f"Growth proxy rejected query (HTTP {exc.code}): {detail}"
+            )
+            failure.http_status = exc.code
+            raise failure from exc
         except (URLError, TimeoutError, OSError) as exc:
             raise GrowthStoreUnavailable(
                 f"Growth proxy unavailable: {type(exc).__name__}"

@@ -76,6 +76,7 @@ curl.exe -s https://uucjptyqfsdzqsftgiro.supabase.co/functions/v1/interactive-gr
 | `20261020130000_p10_copilot_ai_reports.sql` | `growth_copilot_ai_reports` + индекс |
 | `20261020140000_p11_copilot_forward_and_applications.sql` | `growth_copilot_forwarded_jobs`, `growth_copilot_applications` + 2 индекса |
 | `20261020150000_p12_copilot_rate_limits.sql` | `growth_copilot_rate_limits` |
+| `20261021060000_p13_copilot_credit_operations.sql` | реестр операций кредитов `growth_copilot_credit_ops` + индекс; применяется отдельно, см. §1.6 |
 
 ## 1.1 Вариант A — Supabase SQL Editor (рекомендуемый)
 
@@ -370,7 +371,85 @@ ORDER BY table_name, grantee;
 
 ## 1.5 Чего делать не надо
 
-`supabase db push` здесь **не использовать**: в репозитории нет `supabase/config.toml`, а в базе нет истории `supabase_migrations.schema_migrations`, поэтому `db push` попытается применить все 15 файлов (P1–P12) и может задеть уже работающие таблицы публикации. Только SQL Editor, Management API или psql.
+`supabase db push` здесь **не использовать**: в репозитории нет `supabase/config.toml`, а в базе нет истории `supabase_migrations.schema_migrations`, поэтому `db push` попытается применить весь каталог миграций (включая P13/P14) и может задеть уже работающие таблицы публикации. Только SQL Editor, Management API или psql.
+
+## 1.6 P13/P14 — реестр операций кредитов и AI-claim (отдельная процедура)
+
+P13 защищает от двойного списания и от возврата чужого кредита, поэтому у него два отличия от P9–P12:
+
+1. **DDL можно применить заранее** — таблица `growth_copilot_credit_ops` аддитивна, старый код её не читает.
+2. **Перенос состояния требует окна без платных операций** — backfill читает журнал одним снимком, и операция, записанная старым кодом во время переноса, в реестр не попадёт.
+
+Полная процедура с готовыми SQL-блоками, проверками и откатом: **[`docs/P13_CUTOVER.md`](P13_CUTOVER.md)**.
+
+Порядок: выставить оба production-флага в `false` → развернуть **этот** релиз (серверные
+гейты есть только в нём) → доказать остановку всех писателей журнала → повторить барьер
+исторических ссылок → применить P13 и P14 → выполнить backfill и сверку → включить флаги,
+сделать редеплой и провести контрольный E2E обоих транспортов. Без подтверждённого реестра
+новый код закрывает платные операции; legacy-fallback удалён. После отказа probe или 42P01
+проверка повторяется не чаще раза в 60 секунд и восстанавливает работу без рестарта. Прочие
+ошибки реального запроса отклоняют только этот запрос; следующий сразу обращается к БД.
+Порядок и риски принятия брошенной оплаты описаны в процедуре cutover.
+
+**Барьер до P13 (шаг 0 процедуры) — обязателен.** Старый код (до PR #70) списывал кредит с
+константными ссылками `cv` (Telegram) и `pdf` (Mini App), а новая схема ищет операцию по
+`job_hash` — 40-символьному hex-хешу вакансии. Перед P13 выполняется обязательный
+SQL-запрос (шаг 0 в `docs/P13_CUTOVER.md`), который находит в журнале ссылки, не
+совпадающие с `^[0-9a-f]{40}$`, и отдельно — строки с пустым `ref`. Любая такая строка
+останавливает выпуск: сопоставление операции с вакансией и перенос нужно согласовать с
+владельцем вручную, автоматически переносить их под неверными идентификаторами нельзя.
+Тот же аудит выполняет `tools/verify_release_v7.py` (пункты `supabase.copilot_legacy_refs`
+и `supabase.copilot_empty_refs`) и даёт FAIL — в том числе когда подтвердить аудит не
+удалось (нет доступа к базе): «не проверил» и «нечего переносить» — не одно и то же.
+Сам backfill переносит только `ref ~ '^[0-9a-f]{40}$'`, поэтому строки-сироты не создаются.
+
+Запросы аудита — те же, что в шаге 0 процедуры и в `tools/verify_release_v7.py`:
+
+```sql
+SELECT ref, reason, count(*) AS events,
+       min(created_at) AS first_seen, max(created_at) AS last_seen
+FROM public.growth_copilot_credit_events
+WHERE reason IN ('spend', 'spend_release', 'cv_delivered', 'cv_delivery_unknown', 'llm_call', 'llm_call_release', 'llm_delivered', 'llm_delivery_unknown')
+  AND ref IS DISTINCT FROM ''
+  AND ref !~ '^[0-9a-f]{40}$'
+GROUP BY ref, reason
+ORDER BY events DESC;
+
+SELECT ref, reason, count(*) AS events,
+       min(created_at) AS first_seen, max(created_at) AS last_seen
+FROM public.growth_copilot_credit_events
+WHERE reason IN ('spend', 'spend_release', 'cv_delivered', 'cv_delivery_unknown', 'llm_call', 'llm_call_release', 'llm_delivered', 'llm_delivery_unknown')
+  AND (ref = '' OR ref IS NULL)
+GROUP BY ref, reason
+ORDER BY events DESC;
+```
+
+Фильтр `reason IN (...)` — обязательная часть запроса: аудит сопоставляет с вакансией
+только **платные** операции. Бесплатные начисления `daily_grant` и `referral` пишутся с
+пустой ссылкой намеренно (это не вакансия), а `llm_attempt` — учёт вызовов модели для
+глобального бюджета (`delta = 0`). Без фильтра аудит заблокировал бы выпуск из-за
+безобидного ежедневного начисления.
+
+**Заморозка (шаг 2 процедуры) — сначала два флага, потом редеплой:**
+
+```powershell
+vercel env add COPILOT_ENABLED    production --value false --no-sensitive --force --yes
+vercel env add COPILOT_PDF_ENABLED production --value false --no-sensitive --force --yes
+vercel redeploy --target production
+```
+
+Остановка должна быть **доказана** тремя проверками: `POST /api/copilot/pdf` отвечает 503
+`maintenance` (а без подписи — 401), в логах Vercel есть `Copilot paid callback refused:
+maintenance`, и `growth_copilot_credit_events` не растёт в течение минуты (drain завершён).
+Только после этого применяются P13 и P14.
+
+Изменение переменной окружения **не влияет на уже работающие инстансы** — редеплой
+обязателен. Оба писателя кредитов — это два Vercel-приложения (бот и Mini App API), а
+Render (`render_main.py`) — только публикационный мост, кредитов он не касается.
+
+**Включение обратно (шаг 6 процедуры) — тоже два флага**, затем редеплой и контролируемый E2E обоих транспортов: платное действие через Mini App API и через Telegram-бота, одна запись `spend` в журнале и строка `delivered` в реестре. Если E2E не прошёл — вернуть флаги в `false`, редеплой, откат деплоя Vercel на предыдущий.
+
+**Проверка схемы:** `tools/verify_release_v7.py` требует и таблицу P13 `growth_copilot_credit_ops`, и колонку P14 `growth_copilot_ai_reports.claim` (тип `text`, `NOT NULL`, default `''`), и пустой аудит исторических ссылок. Без P14 проверка даёт FAIL.
 
 ---
 
@@ -592,8 +671,9 @@ python tools\copilot_core_smoke.py --limit 20
 | Откатить флаги | то же для каждой переменной; Mini App и бот продолжают работать в обычном режиме |
 | Вернуть Edge-функцию | `supabase functions deploy growth-proxy --project-ref uucjptyqfsdzqsftgiro --no-verify-jwt --use-api` на предыдущем коммите (`git checkout 053608ee` в клоне) |
 | Откатить код Vercel | дашборд → Deployments → ⋯ → Promote to Production на деплое `053608ee`/`6a6978b` |
+| Откатить релиз с P13/P14 | сначала Promote to Production на деплое **до PR #70**, и только потом (если нужно) сносить таблицу реестра |
 
-DDL откатывается вручную: `DROP TABLE public.growth_copilot_*` — только если нужно, данные там производные и восстанавливаются.
+DDL откатывается вручную: `DROP TABLE public.growth_copilot_*` — только если нужно, данные там производные и восстанавливаются. Таблицу реестра P13 (`growth_copilot_credit_ops`) можно сносить **только после** отката деплоя: новый код без реестра закрывает платные операции, а откат на код до PR #70 возвращает прежние гонки двойного списания. Полная процедура отката по этапам — в `docs/P13_CUTOVER.md`, §3.
 
 ---
 

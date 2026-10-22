@@ -2,10 +2,11 @@
 
 The tool is an operational helper for the manual rollout of v7.0, so its
 expectations must not drift away from the repository: the table list has to
-match the migrations of P9-P12, and the flag list has to stay documented in
+match the migrations of P9-P14, and the flag list has to stay documented in
 ``.env.example.txt``.
 """
 import re
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -242,3 +243,178 @@ class ValidatorVersionCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class P14ColumnTests(unittest.TestCase):
+    def test_missing_or_incorrect_claim_column_fails_release(self):
+        for key, value in ((None, None), ("data_type", "integer"), ("is_nullable", "YES"), ("column_default", None), ("column_default", "'claim'::text")):
+            with self.subTest(key=key, value=value):
+                row = dict(verify.EXPECTED_P14_CLAIM_COLUMN)
+                if key:
+                    row[key] = value
+                rows = [row] if key else []
+                results = []
+                with patch.object(verify, "http", return_value=(200, json.dumps(rows))):
+                    verify.check_p14_column(results, "https://example.test", {})
+                self.assertEqual(results[0]["status"], verify.FAIL)
+
+    def test_correct_claim_column_passes_release(self):
+        results = []
+        with patch.object(verify, "http", return_value=(200, json.dumps([dict(verify.EXPECTED_P14_CLAIM_COLUMN)]))):
+            verify.check_p14_column(results, "https://example.test", {})
+        self.assertEqual(results[0]["status"], verify.PASS)
+
+
+class P14IntegrationTests(unittest.TestCase):
+    def test_table_check_fails_when_p14_column_is_missing(self):
+        def respond(url, **kwargs):
+            query = json.loads(kwargs["body"])["query"]
+            if "pg_class" in query:
+                rows = [{"table_name": name, "rls_enabled": True} for name in verify.EXPECTED_TABLES]
+            else:
+                rows = []
+            return 200, json.dumps(rows)
+        results = []
+        with patch.dict("os.environ", {"SUPABASE_ACCESS_TOKEN": "test-only"}), patch.object(verify, "http", side_effect=respond):
+            verify.check_tables(results)
+        statuses = {row["name"]: row["status"] for row in results}
+        self.assertEqual(statuses["supabase.copilot_tables"], verify.PASS)
+        self.assertEqual(statuses["supabase.copilot_p14_claim"], verify.FAIL)
+
+
+class HistoricalCreditReferenceTests(unittest.TestCase):
+    def test_legacy_cv_and_pdf_references_block_release(self):
+        findings = [{"ref": "cv", "reason": "spend", "events": 3}, {"ref": "pdf", "reason": "spend", "events": 2}]
+        results = []
+        with patch.object(verify, "http", side_effect=[(200, json.dumps(findings)), (200, "[]")]):
+            verify.check_historical_credit_refs(results, "https://example.test", {})
+        self.assertEqual(results[0]["status"], verify.FAIL)
+        self.assertIn("'cv': 3 events", results[0]["detail"])
+        self.assertIn("'pdf': 2 events", results[0]["detail"])
+        self.assertEqual(results[1]["status"], verify.PASS)
+
+    def test_clean_or_hash_only_journal_passes_reference_audit(self):
+        # Both SELECTs return no findings for an empty or hash-only journal.
+        results = []
+        with patch.object(verify, "http", return_value=(200, "[]")):
+            verify.check_historical_credit_refs(results, "https://example.test", {})
+        self.assertEqual([row["status"] for row in results], [verify.PASS, verify.PASS])
+
+    def test_empty_reference_blocks_release_in_separate_result(self):
+        results = []
+        with patch.object(verify, "http", side_effect=[(200, "[]"), (200, json.dumps([{"ref": "", "reason": "spend", "events": 4}]))]):
+            verify.check_historical_credit_refs(results, "https://example.test", {})
+        self.assertEqual(results[0]["status"], verify.PASS)
+        self.assertEqual(results[1]["name"], "supabase.copilot_empty_refs")
+        self.assertEqual(results[1]["status"], verify.FAIL)
+        self.assertIn("4 events", results[1]["detail"])
+
+    def test_unconfirmed_audit_blocks_release_without_exposing_private_refs(self):
+        for response in ((503, "query failed"), (200, "not JSON")):
+            results = []
+            with patch.object(verify, "http", return_value=response):
+                verify.check_historical_credit_refs(results, "https://example.test", {})
+            self.assertEqual([row["status"] for row in results], [verify.FAIL, verify.FAIL])
+        results = []
+        with patch.object(verify, "http", side_effect=[(200, json.dumps([{"ref": "private-reference", "events": 1}])), (200, "[]")]):
+            verify.check_historical_credit_refs(results, "https://example.test", {})
+        self.assertEqual(results[0]["status"], verify.FAIL)
+        self.assertNotIn("private-reference", results[0]["detail"])
+
+    def test_missing_credentials_cannot_skip_pre_p13_barrier(self):
+        results = []
+        with patch.dict("os.environ", {"SUPABASE_ACCESS_TOKEN": ""}), patch.object(verify, "http") as request:
+            verify.check_tables(results)
+        request.assert_not_called()
+        statuses = {row["name"]: row["status"] for row in results}
+        self.assertEqual(statuses["supabase.copilot_legacy_refs"], verify.FAIL)
+        self.assertEqual(statuses["supabase.copilot_empty_refs"], verify.FAIL)
+
+
+class PaidOperationAuditScopeTests(unittest.TestCase):
+    """The audit maps paid operations to a job hash and nothing else."""
+
+    def test_paid_operation_reasons_match_the_code(self):
+        from copilot import credit_operations, credits as copilot_credits
+        expected = {
+            credit_operations.REASON_SPEND,
+            credit_operations.REASON_RELEASE,
+            credit_operations.REASON_DELIVERED,
+            credit_operations.REASON_UNKNOWN,
+            credit_operations.REASON_LLM_SPEND,
+            credit_operations.REASON_LLM_RELEASE,
+            credit_operations.REASON_LLM_DELIVERED,
+            credit_operations.REASON_LLM_UNKNOWN,
+        }
+        self.assertEqual(set(verify.PAID_OPERATION_REASONS), expected)
+
+    def test_free_reasons_stay_out_of_the_audit(self):
+        from copilot import credits as copilot_credits
+        for free in (copilot_credits.REASON_DAILY_GRANT,
+                     copilot_credits.REASON_REFERRAL,
+                     copilot_credits.REASON_LLM_ATTEMPT):
+            self.assertNotIn(free, verify.PAID_OPERATION_REASONS)
+
+    def test_audit_queries_filter_paid_operations_only(self):
+        for query in (verify.HISTORICAL_CREDIT_REFS_QUERY, verify.EMPTY_CREDIT_REFS_QUERY):
+            self.assertIn("reason IN (", query)
+            for reason in verify.PAID_OPERATION_REASONS:
+                self.assertIn("'%s'" % reason, query)
+            for free in ("daily_grant", "referral", "llm_attempt"):
+                self.assertNotIn("'%s'" % free, query)
+
+    def test_empty_reference_predicate_has_explicit_parentheses(self):
+        self.assertIn("(ref = '' OR ref IS NULL)", verify.EMPTY_CREDIT_REFS_QUERY)
+        self.assertIn("ref IS DISTINCT FROM ''", verify.HISTORICAL_CREDIT_REFS_QUERY)
+
+
+class CutoverAuditSqlTests(unittest.TestCase):
+    """The procedure and the runbook must run the very same audit."""
+
+    DOCS = Path(__file__).resolve().parent / "docs"
+
+    def _sql_blocks(self, name):
+        text = (self.DOCS / name).read_text(encoding="utf-8")
+        return [" ".join(block.split()) for block in re.findall(r"```sql\n(.*?)```", text, re.DOTALL)]
+
+    def _assert_contains_the_verifier_queries(self, name):
+        blocks = self._sql_blocks(name)
+        self.assertTrue(blocks, "%s must contain the audit queries" % name)
+        for query in (verify.HISTORICAL_CREDIT_REFS_QUERY, verify.EMPTY_CREDIT_REFS_QUERY):
+            wanted = " ".join(query.split())
+            self.assertTrue(
+                any(wanted in block for block in blocks),
+                "%s must contain the audit query of the release verifier" % name,
+            )
+
+    def test_cutover_document_uses_the_verifier_queries(self):
+        self._assert_contains_the_verifier_queries("P13_CUTOVER.md")
+
+    def test_runbook_uses_the_verifier_queries(self):
+        self._assert_contains_the_verifier_queries("RELEASE_RUNBOOK_v7.0.md")
+
+
+class HistoricalReferenceIntegrationTests(unittest.TestCase):
+    def test_reference_audit_is_a_required_release_check(self):
+        for ref in ("cv", "pdf", "", None):
+            with self.subTest(ref=ref):
+                def respond(url, **kwargs):
+                    query = json.loads(kwargs["body"])["query"]
+                    if "ref IS DISTINCT FROM ''" in query:
+                        rows = [{"ref": ref, "events": 1}] if ref in ("cv", "pdf") else []
+                    elif "(ref = '' OR ref IS NULL)" in query:
+                        rows = [{"ref": "", "events": 1}] if ref == "" else []
+                    elif "information_schema.columns" in query:
+                        rows = [dict(verify.EXPECTED_P14_CLAIM_COLUMN)]
+                    elif "pg_class" in query:
+                        rows = [{"table_name": name, "rls_enabled": True} for name in verify.EXPECTED_TABLES]
+                    else:
+                        rows = []
+                    return 200, json.dumps(rows)
+                results = []
+                with patch.dict("os.environ", {"SUPABASE_ACCESS_TOKEN": "test-only"}), patch.object(verify, "http", side_effect=respond):
+                    verify.check_tables(results)
+                self.assertEqual(results[0]["name"], "supabase.copilot_legacy_refs")
+                self.assertEqual(results[1]["name"], "supabase.copilot_empty_refs")
+                with patch.object(verify, "run_checks", return_value=results), patch("builtins.print"):
+                    self.assertEqual(verify.main([]), 0 if ref is None else 1)

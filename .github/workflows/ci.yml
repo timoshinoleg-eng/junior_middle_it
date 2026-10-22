@@ -17,6 +17,21 @@ jobs:
       matrix:
         python-version: ["3.12", "3.13"]
 
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: copilot_test
+          POSTGRES_PASSWORD: copilot_test
+          POSTGRES_DB: copilot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U copilot_test -d copilot_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -32,10 +47,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Compile Python sources
         run: python -m compileall -q .
 
       - name: Run unit and policy tests
+        env:
+          COPILOT_TEST_PG_DSN: postgresql://copilot_test:copilot_test@localhost:5432/copilot_test
         run: |
           python -m unittest -v \
             test_growth_utils \
@@ -83,6 +105,13 @@ jobs:
              test_copilot_enrich \
              test_copilot_store \
              test_copilot_credits \
+             test_copilot_credit_operations \
+             test_copilot_credit_concurrency \
+             test_copilot_registry_recovery \
+             test_copilot_maintenance \
+             test_copilot_pg_safety \
+             test_copilot_llm_accounting \
+             test_copilot_edge_validator \
              test_copilot_runtime \
              test_copilot_pdf \
              test_copilot_security \

@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import contextmanager
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+import uuid
+import time
+import threading
+from contextlib import ExitStack, contextmanager
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +21,7 @@ EVALUATIONS_TABLE = "growth_copilot_evaluations"
 DOCUMENTS_TABLE = "growth_copilot_documents"
 CREDITS_TABLE = "growth_copilot_credits"
 CREDIT_EVENTS_TABLE = "growth_copilot_credit_events"
+CREDIT_OPS_TABLE = "growth_copilot_credit_ops"
 GRADE_AUDITS_TABLE = "growth_copilot_grade_audits"
 ENRICHMENTS_TABLE = "growth_copilot_enrichments"
 AI_REPORTS_TABLE = "growth_copilot_ai_reports"
@@ -33,9 +37,73 @@ AI_REPORT_RETENTION_DAYS = 14
 FORWARDED_JOB_RETENTION_DAYS = 30
 APPLICATION_RETENTION_DAYS = 180
 
+# The rate limit table keeps one row per scope. The rows of the users belong
+# to the request limiter of the Mini App; the row of scope 0 is the counter
+# of the global daily budget of the model calls. The two never share a row,
+# so the request limiter cannot reset the budget and the budget cannot block
+# a user.
+LLM_BUDGET_SCOPE = 0
+
+# The state of a costed operation lives in one row of the operation
+# registry, so the database itself refuses a second reservation of the same
+# attempt. A count of the journal cannot do that: under READ COMMITTED a
+# parallel transaction cannot see the event of the other one yet, so both of
+# them would count the same number of reservations and both of them would
+# charge the user for one operation.
+OP_STATE_RESERVED = "reserved"
+OP_STATE_RELEASED = "released"
+OP_STATE_DELIVERED = "delivered"
+OP_STATE_UNKNOWN = "unknown"
+
+# Paid operations stay closed until P13 is confirmed. Retry failures once a minute.
+CLAIM_STALE_MINUTES = 15
+_CREDIT_OPS_TABLE_MISSING = True
+_CREDIT_OPS_RETRY_AT = 0.0
+_CREDIT_OPS_RETRY_SECONDS = 60
+_CREDIT_OPS_PROBE_LOCK = threading.Lock()
+
+# The SQLSTATE of a statement that names a relation that does not exist.
+MISSING_RELATION_SQLSTATE = "42P01"
+
+
+def _is_missing_relation(exc: Exception) -> bool:
+    """Whether the error says that a relation does not exist."""
+    sqlstate = getattr(exc, "sqlstate", None)
+    if not sqlstate:
+        sqlstate = getattr(getattr(exc, "diag", None), "sqlstate", None)
+    return str(sqlstate or "") == MISSING_RELATION_SQLSTATE
+
 
 class CopilotStoreUnavailable(RuntimeError):
     """Raised when the durable growth backend cannot serve a Copilot query."""
+
+
+class _CreditCursor:
+    """Classify database calls without intercepting consumer code errors."""
+
+    def __init__(self, cursor, on_failure):
+        self._cursor = cursor
+        self._on_failure = on_failure
+
+    def _call(self, name, *args, **kwargs):
+        try:
+            return getattr(self._cursor, name)(*args, **kwargs)
+        except Exception as exc:
+            self._on_failure(exc)
+            raise
+
+    def execute(self, *args, **kwargs):
+        self._call("execute", *args, **kwargs)
+        return self
+
+    def fetchone(self):
+        return self._call("fetchone")
+
+    def fetchall(self):
+        return self._call("fetchall")
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
 
 
 class CopilotStore:
@@ -281,27 +349,41 @@ class CopilotStore:
         telegram_file_id: str,
         filename: str,
         fit_score: int = 0,
+        claim: str,
     ) -> bool:
-        """Remember the generated CV so a repeated tap sends the cached file."""
+        """Remember the generated CV so a repeated tap sends the cached file.
+
+        The claim token of the owner is required, so a build that lost the
+        slot cannot overwrite a file that was delivered in the meantime.
+
+        The write is an update of the claimed row and never an insert. An
+        insert would create a row again when the slot is free, so a build
+        whose claim was taken over and released could still deliver its file:
+        the check of the owner only guarded the conflict branch of the old
+        upsert. An update touches the row of the claim, so a build that lost
+        the slot changes nothing and is told that its write was refused.
+        """
         with self._cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO growth_copilot_documents
-                    (user_id, job_id, telegram_file_id, filename, fit_score, created_at)
-                VALUES (%s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (user_id, job_id) DO UPDATE SET
-                    telegram_file_id = EXCLUDED.telegram_file_id,
-                    filename = EXCLUDED.filename,
-                    fit_score = EXCLUDED.fit_score,
+                UPDATE growth_copilot_documents
+                SET telegram_file_id = %s,
+                    filename = %s,
+                    fit_score = %s,
                     created_at = NOW()
+                WHERE user_id = %s
+                  AND job_id = %s
+                  AND filename = %s
+                  AND telegram_file_id = ''
                 RETURNING job_id
                 """,
                 (
-                    int(user_id),
-                    str(job_id),
                     str(telegram_file_id or ""),
                     str(filename or ""),
                     int(fit_score),
+                    int(user_id),
+                    str(job_id),
+                    str(claim),
                 ),
             )
             return bool(cur.fetchone())
@@ -329,11 +411,84 @@ class CopilotStore:
     # ------------------------------------------------------------------
     # AI report cache
     # ------------------------------------------------------------------
+    def claim_ai_report(
+        self, user_id: int, job_id: str, *, stale_after_minutes: int = CLAIM_STALE_MINUTES
+    ) -> Optional[str]:
+        """Claim the analysis slot of one (user, job) pair.
+
+        The slot is the unique key of the report cache, so a second tap on
+        the same button cannot start a second analysis in parallel. Without
+        the claim two parallel taps would call the model twice, burn two
+        slots of the global budget and could charge the user twice for one
+        vacancy.
+
+        An unclaimed row may be taken immediately. An active token is taken
+        over only when older than ``stale_after_minutes``, even if its owner
+        has already written the answer but has not finished yet.
+
+        The returned token identifies the owner of the claim. Only the owner
+        may write the answer or release the slot, so a late answer cannot
+        overwrite the report of a newer attempt. The token lives in a separate claim column and survives cache writes.
+        """
+        token = "claim:%s" % uuid.uuid4().hex
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_ai_reports
+                    (user_id, job_id, claim, answer, used_resume, created_at, updated_at)
+                VALUES (%s, %s, %s, '', %s, NOW(), NOW())
+                ON CONFLICT (user_id, job_id) DO UPDATE SET
+                    claim = EXCLUDED.claim,
+                    answer = '',
+                    used_resume = EXCLUDED.used_resume,
+                    updated_at = NOW()
+                WHERE growth_copilot_ai_reports.claim = ''
+                   OR growth_copilot_ai_reports.updated_at
+                      < NOW() - (%s * INTERVAL '1 minute')
+                RETURNING job_id
+                """,
+                (
+                    int(user_id),
+                    str(job_id),
+                    token,
+                    False,
+                    int(stale_after_minutes),
+                ),
+            )
+            row = cur.fetchone()
+        return token if row else None
+
+    def release_ai_report_claim(self, user_id: int, job_id: str, claim: str) -> bool:
+        """Release a claim that produced no answer.
+
+        Only this token is released. An empty placeholder is deleted; a
+        cached answer keeps its metadata and has its token cleared. Neither
+        branch can change the claim or report of a newer attempt.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                WITH empty_slot AS (
+                    DELETE FROM growth_copilot_ai_reports
+                    WHERE user_id = %s AND job_id = %s AND claim = %s AND answer = ''
+                    RETURNING job_id
+                ), unlocked AS (
+                    UPDATE growth_copilot_ai_reports SET claim = ''
+                    WHERE user_id = %s AND job_id = %s AND claim = %s AND answer <> ''
+                    RETURNING job_id
+                )
+                SELECT job_id FROM empty_slot UNION ALL SELECT job_id FROM unlocked
+                """,
+                (int(user_id), str(job_id), str(claim), int(user_id), str(job_id), str(claim)),
+            )
+            return bool(cur.fetchone())
+
     def save_ai_report(
         self,
         user_id: int,
         job_id: str,
         *,
+        claim: str,
         model: str = "",
         answer: str = "",
         used_resume: bool = False,
@@ -343,26 +498,34 @@ class CopilotStore:
         The answer text is only stored when it was produced without the resume:
         an answer that was built from a resume may echo personal data, and the
         privacy invariant forbids keeping resume content in the database.
+
+        Only the owner of the claim may write the answer: a late answer of an
+        attempt whose claim was taken over is refused, so it cannot overwrite
+        the report of the newer attempt. The write is an update of the claimed
+        row and never an insert, so an answer cannot recreate a slot that was
+        released in the meantime.
         """
         with self._cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO growth_copilot_ai_reports
-                    (user_id, job_id, model, answer, used_resume, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
-                ON CONFLICT (user_id, job_id) DO UPDATE SET
-                    model = EXCLUDED.model,
-                    answer = EXCLUDED.answer,
-                    used_resume = EXCLUDED.used_resume,
+                UPDATE growth_copilot_ai_reports
+                SET model = %s,
+                    answer = %s,
+                    used_resume = %s,
+                    created_at = NOW(),
                     updated_at = NOW()
+                WHERE user_id = %s
+                  AND job_id = %s
+                  AND claim = %s
                 RETURNING job_id
                 """,
                 (
+                    str(model or ""),
+                    "" if used_resume else str(answer or ""),
+                    bool(used_resume),
                     int(user_id),
                     str(job_id),
-                    str(model or ""),
-                    str(answer or ""),
-                    bool(used_resume),
+                    str(claim),
                 ),
             )
             return bool(cur.fetchone())
@@ -677,6 +840,93 @@ class CopilotStore:
             row = cur.fetchone()
         return int(row[0]) if row and row[0] is not None else None
 
+    def reserve_llm_attempt(
+        self, user_id: int, budget: int, reason: str, ref: str = ""
+    ) -> bool:
+        """Take one slot of the global daily model budget.
+
+        The budget is a counter in a row of its own, and the check and the
+        increment happen in one statement. The lock of that row serializes
+        parallel callers, so two requests that arrive at the same moment
+        cannot both take the last slot. A plain ``COUNT(*)`` of the journal
+        would be racy: a parallel transaction cannot see the event of the
+        other one yet, so both of them would count the same number of calls.
+
+        The attempt is written before the call, because a call that fails
+        still costs the operator.
+        """
+        limit = int(budget)
+        if limit <= 0:
+            return False
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                WITH slot AS (
+                    INSERT INTO growth_copilot_rate_limits
+                        (user_id, window_start, hits, updated_at)
+                    VALUES (%s, CURRENT_DATE, 1, NOW())
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        hits = CASE
+                            WHEN growth_copilot_rate_limits.window_start < CURRENT_DATE
+                            THEN 1
+                            ELSE growth_copilot_rate_limits.hits + 1
+                        END,
+                        window_start = CASE
+                            WHEN growth_copilot_rate_limits.window_start < CURRENT_DATE
+                            THEN CURRENT_DATE
+                            ELSE growth_copilot_rate_limits.window_start
+                        END,
+                        updated_at = NOW()
+                    WHERE growth_copilot_rate_limits.window_start < CURRENT_DATE
+                       OR growth_copilot_rate_limits.hits < %s
+                    RETURNING hits
+                )
+                INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                SELECT %s, 0, %s, %s, NOW() FROM slot
+                RETURNING id
+                """,
+                (
+                    LLM_BUDGET_SCOPE,
+                    limit,
+                    int(user_id),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def grant_credits_with_event(
+        self, user_id: int, amount: int, reason: str, ref: str = ""
+    ) -> bool:
+        """Credit the balance and log the credit in one statement.
+
+        The balance and the journal entry are written together, so a failed
+        write can no longer leave a credited balance without a journal entry.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                WITH credit AS (
+                    UPDATE growth_copilot_credits
+                    SET balance = balance + %s, updated_at = NOW()
+                    WHERE user_id = %s
+                    RETURNING balance
+                )
+                INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                SELECT %s, %s, %s, %s, NOW() FROM credit
+                RETURNING id
+                """,
+                (
+                    int(amount),
+                    int(user_id),
+                    int(user_id),
+                    int(amount),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
     def grant_credits(self, user_id: int, amount: int) -> Optional[int]:
         with self._cursor() as cur:
             cur.execute(
@@ -737,6 +987,497 @@ class CopilotStore:
         return int(row[0]) if row and row[0] is not None else 0
 
     # ------------------------------------------------------------------
+    # Costed operations
+    # ------------------------------------------------------------------
+    # The balance and the journal are always written by one statement, so they
+    # can never drift apart. A single statement is also the only shape the Edge
+    # growth bridge accepts: it forwards exactly one query per request, so a
+    # multi statement transaction is not available over the bridge.
+    @staticmethod
+    def _registry_failed(exc, *, probe=False):
+        global _CREDIT_OPS_TABLE_MISSING, _CREDIT_OPS_RETRY_AT
+        missing = _is_missing_relation(exc)
+        if probe or missing:
+            _CREDIT_OPS_TABLE_MISSING = True
+            _CREDIT_OPS_RETRY_AT = time.monotonic() + _CREDIT_OPS_RETRY_SECONDS
+        if missing:
+            logger.warning("Credit registry unavailable: migration P13 is not applied; paid operations closed")
+        else:
+            # Never log transport bodies: they may contain private query data.
+            cause = exc
+            while cause.__cause__ is not None:
+                cause = cause.__cause__
+            status = getattr(exc, "http_status", None) or getattr(cause, "code", None)
+            logger.warning("Credit registry not confirmed through bridge/backend: %s HTTP %s; %s",
+                           type(exc).__name__, status if isinstance(status, int) else "unknown",
+                           "paid operations closed" if probe else "request refused")
+
+    def _registry_available(self) -> bool:
+        """Confirm P13 with a query accepted by both Edge validators."""
+        global _CREDIT_OPS_TABLE_MISSING, _CREDIT_OPS_RETRY_AT
+        if not _CREDIT_OPS_TABLE_MISSING:
+            return True
+        with _CREDIT_OPS_PROBE_LOCK:
+            if not _CREDIT_OPS_TABLE_MISSING:
+                return True
+            if time.monotonic() < _CREDIT_OPS_RETRY_AT:
+                return False
+            try:
+                with self._cursor() as cur:
+                    cur.execute("SELECT 1 FROM public.growth_copilot_credit_ops LIMIT 1")
+                    cur.fetchone()
+            except Exception as exc:
+                self._registry_failed(exc, probe=True)
+                return False
+            _CREDIT_OPS_TABLE_MISSING = False
+            logger.warning("Credit operation registry confirmed; attempt protection enabled")
+            return True
+
+    @contextmanager
+    def _credit_cursor(self):
+        """Never substitute journal accounting for an unavailable registry."""
+        if not self._registry_available():
+            raise CopilotStoreUnavailable("Credit operation registry is not confirmed")
+        with ExitStack() as stack:
+            try:
+                cur = stack.enter_context(self._cursor())
+            except Exception as exc:
+                self._registry_failed(exc)
+                raise
+            # Only acquisition and cursor methods classify database failures.
+            # Exceptions in the caller's with block must pass through unchanged.
+            yield _CreditCursor(cur, self._registry_failed)
+
+    def owns_claim(self, user_id: int, ref: str, claim: str, kind: str) -> bool:
+        """Check the current build token without exposing document contents."""
+        table, column = self._claim_relation(kind)
+        with self._cursor() as cur:
+            cur.execute(
+                f"SELECT 1 FROM {table} WHERE user_id = %s AND job_id = %s AND {column} = %s",
+                (int(user_id), str(ref), str(claim)),
+            )
+            return bool(cur.fetchone())
+
+    @staticmethod
+    def _claim_relation(kind):
+        if kind == "spend":
+            return "growth_copilot_documents", "filename"
+        if kind == "llm_call":
+            return "growth_copilot_ai_reports", "claim"
+        raise ValueError("Unsupported claim kind")
+
+    def owns_credit_attempt(self, user_id, ref, kind, attempt) -> bool:
+        """An attempt token is valid only for its open reservation."""
+        if attempt is None:
+            return False
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM growth_copilot_credit_ops WHERE user_id = %s "
+                "AND ref = %s AND kind = %s AND attempt = %s AND state = 'reserved'",
+                (int(user_id), str(ref), str(kind), int(attempt)),
+            )
+            return bool(cur.fetchone())
+
+    def reserve_credit(
+        self, user_id: int, amount: int, reason: str, ref: str, *,
+        release_reason: str = "spend_release", claim: Optional[str] = None,
+    ) -> int | bool:
+        """Acquire a fresh or abandoned reservation; return its attempt."""
+        return self._reserve_credit_operation(user_id, amount, reason, ref, claim)
+
+    def _reserve_credit_operation(
+        self, user_id: int, amount: int, reason: str, ref: str, claim: Optional[str] = None
+    ) -> int | bool:
+        """Reserve or adopt atomically under the same balance lock.
+
+        Adoption refreshes only an old reserved row with the current build
+        claim. Fresh reservation alone feeds the debit and journal CTEs.
+        Concurrent adopters recheck the age after locking the operation row.
+        """
+        with self._credit_cursor() as cur:
+            cur.execute(
+                """
+                WITH locked AS (
+                    SELECT user_id, balance
+                    FROM growth_copilot_credits
+                    WHERE user_id = %s
+                    FOR UPDATE
+                ),
+                op_adopted AS (
+                    UPDATE growth_copilot_credit_ops
+                    SET updated_at = NOW()
+                    WHERE user_id = %s AND ref = %s AND kind = %s
+                      AND state = 'reserved'
+                      AND attempt = (SELECT attempt FROM growth_copilot_credit_ops
+                                     WHERE user_id = %s AND ref = %s AND kind = %s)
+                      AND updated_at < NOW() - (%s * INTERVAL '1 minute')
+                      AND EXISTS (SELECT 1 FROM locked)
+                      AND (%s::text IS NOT NULL AND EXISTS (
+                          SELECT 1 FROM growth_copilot_documents
+                          WHERE user_id = %s AND job_id = %s AND filename = %s AND %s = 'spend'
+                          UNION ALL SELECT 1 FROM growth_copilot_ai_reports
+                          WHERE user_id = %s AND job_id = %s AND claim = %s AND %s = 'llm_call'))
+                    RETURNING attempt
+                ),
+                op_reserved AS (
+                    INSERT INTO growth_copilot_credit_ops
+                        (user_id, ref, kind, state, amount, attempt, created_at, updated_at)
+                    SELECT %s, %s, %s, 'reserved', %s, 1, NOW(), NOW()
+                    FROM locked
+                    WHERE locked.balance >= %s
+                      AND NOT EXISTS (SELECT 1 FROM op_adopted)
+                      AND NOT EXISTS (SELECT 1 FROM growth_copilot_credit_ops
+                                      WHERE user_id = %s AND ref = %s AND kind = %s AND state = 'reserved')
+                    ON CONFLICT (user_id, ref, kind) DO UPDATE SET
+                        state = 'reserved',
+                        amount = EXCLUDED.amount,
+                        attempt = growth_copilot_credit_ops.attempt + 1,
+                        updated_at = NOW()
+                    WHERE growth_copilot_credit_ops.state = 'released'
+                    RETURNING attempt
+                ),
+                debit AS (
+                    UPDATE growth_copilot_credits
+                    SET balance = balance - %s, updated_at = NOW()
+                    WHERE user_id = %s
+                      AND balance >= %s
+                      AND EXISTS (SELECT 1 FROM op_reserved)
+                    RETURNING balance
+                ),
+                journal AS (
+                    INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                    SELECT %s, %s, %s, %s, NOW() FROM debit
+                    RETURNING id
+                )
+                SELECT attempt FROM op_adopted
+                UNION ALL SELECT attempt FROM op_reserved WHERE EXISTS (SELECT 1 FROM journal)
+                """,
+                (
+                    int(user_id),
+                    int(user_id), str(ref), str(reason),
+                    int(user_id), str(ref), str(reason), CLAIM_STALE_MINUTES,
+                    claim, int(user_id), str(ref), claim, str(reason),
+                    int(user_id), str(ref), claim, str(reason),
+                    int(user_id), str(ref), str(reason), int(amount), int(amount),
+                    int(user_id), str(ref), str(reason),
+                    int(amount), int(user_id), int(amount),
+                    int(user_id), -int(amount), str(reason), str(ref),
+                ),
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row else False
+
+    def release_credit(
+        self,
+        user_id: int,
+        amount: int,
+        reason: str,
+        ref: str,
+        *,
+        reserved_reason: str,
+        attempt: Optional[int] = None,
+        claim: Optional[str] = None,
+    ) -> bool:
+        """Give a reserved credit back and log the release in one statement.
+
+        The credit is only returned when a reservation of this operation is
+        unmatched, so a repeated release cannot credit the user twice.
+        """
+        return self._release_credit_operation(
+            user_id, amount, reason, ref, reserved_reason, attempt, claim
+        )
+
+    def _release_credit_operation(
+        self,
+        user_id: int,
+        amount: int,
+        reason: str,
+        ref: str,
+        reserved_reason: str,
+        attempt: Optional[int],
+        claim: Optional[str],
+    ) -> bool:
+        """Give a credit back with the operation registry as the gate.
+
+        The row of the operation is the gate: only the owner of an open
+        reservation can change its state, so two parallel releases cannot
+        credit the user twice. The row of the user is locked before the row of
+        the operation, exactly as the reservation does it, so the two
+        statements cannot lock each other.
+        """
+        with self._credit_cursor() as cur:
+            cur.execute(
+                """
+                WITH locked AS (
+                    SELECT user_id, balance
+                    FROM growth_copilot_credits
+                    WHERE user_id = %s
+                    FOR UPDATE
+                ),
+                op_released AS (
+                    UPDATE growth_copilot_credit_ops
+                    SET state = 'released', updated_at = NOW()
+                    WHERE user_id = %s
+                      AND ref = %s
+                      AND kind = %s
+                      AND attempt = %s
+                      AND (%s::text IS NULL OR EXISTS (
+                          SELECT 1 FROM growth_copilot_documents
+                          WHERE user_id = %s AND job_id = %s AND filename = %s
+                          AND %s = 'spend'
+                          UNION ALL SELECT 1 FROM growth_copilot_ai_reports
+                          WHERE user_id = %s AND job_id = %s AND claim = %s
+                          AND %s = 'llm_call'))
+                      AND state = 'reserved'
+                      AND EXISTS (SELECT 1 FROM locked)
+                    RETURNING attempt
+                ),
+                refund AS (
+                    UPDATE growth_copilot_credits
+                    SET balance = balance + %s, updated_at = NOW()
+                    WHERE user_id = %s
+                      AND EXISTS (SELECT 1 FROM op_released)
+                    RETURNING balance
+                )
+                INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                SELECT %s, %s, %s, %s, NOW() FROM refund
+                RETURNING id
+                """,
+                (
+                    int(user_id),
+                    int(user_id),
+                    str(ref or ""),
+                    str(reserved_reason or ""),
+                    attempt, claim, int(user_id), str(ref), claim, str(reserved_reason),
+                    int(user_id), str(ref), claim, str(reserved_reason),
+                    int(amount),
+                    int(user_id),
+                    int(user_id),
+                    int(amount),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def credit_operation_state(self, user_id: int, ref: str, kind: str) -> Optional[str]:
+        """Read registry state; a missing row is new, an unavailable registry raises."""
+        with self._credit_cursor() as cur:
+            cur.execute("SELECT state FROM growth_copilot_credit_ops WHERE user_id = %s AND ref = %s AND kind = %s",
+                        (int(user_id), str(ref), str(kind)))
+            row = cur.fetchone()
+        return str(row[0]) if row else None
+
+    def confirm_credit_operation(
+        self, user_id: int, ref: str, kind: str, reason: str, *,
+        attempt: Optional[int] = None, claim: Optional[str] = None
+    ) -> bool:
+        """Mark a costed operation as delivered and log it in one statement.
+
+        Only an open reservation can be confirmed, so a repeated confirmation
+        cannot write a second journal entry.
+        """
+        with self._credit_cursor() as cur:
+            cur.execute(
+                """
+                WITH op_delivered AS (
+                    UPDATE growth_copilot_credit_ops
+                    SET state = 'delivered', updated_at = NOW()
+                    WHERE user_id = %s
+                      AND ref = %s
+                      AND kind = %s
+                      AND attempt = %s
+                      AND (%s::text IS NULL OR EXISTS (
+                          SELECT 1 FROM growth_copilot_documents
+                          WHERE user_id = %s AND job_id = %s AND filename = %s
+                          AND %s = 'spend'
+                          UNION ALL SELECT 1 FROM growth_copilot_ai_reports
+                          WHERE user_id = %s AND job_id = %s AND claim = %s
+                          AND %s = 'llm_call'))
+                      AND state IN ('reserved', 'unknown')
+                    RETURNING attempt
+                )
+                INSERT INTO growth_copilot_credit_events
+                    (user_id, delta, reason, ref, created_at)
+                SELECT %s, 0, %s, %s, NOW() FROM op_delivered
+                RETURNING id
+                """,
+                (
+                    int(user_id),
+                    str(ref or ""),
+                    str(kind or ""),
+                    attempt, claim, int(user_id), str(ref), claim, str(kind),
+                    int(user_id), str(ref), claim, str(kind),
+                    int(user_id),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def mark_credit_operation_unknown(
+        self, user_id: int, ref: str, kind: str, reason: str, *,
+        attempt: Optional[int] = None, claim: Optional[str] = None
+    ) -> bool:
+        """Mark a costed operation as ambiguous and log it in one statement.
+
+        The credit stays spent: the answer may have reached the user anyway.
+        Only an open reservation can become ambiguous, so the state of a newer
+        attempt is never overwritten.
+        """
+        with self._credit_cursor() as cur:
+            cur.execute(
+                """
+                WITH op_unknown AS (
+                    UPDATE growth_copilot_credit_ops
+                    SET state = 'unknown', updated_at = NOW()
+                    WHERE user_id = %s
+                      AND ref = %s
+                      AND kind = %s
+                      AND attempt = %s
+                      AND (%s::text IS NULL OR EXISTS (
+                          SELECT 1 FROM growth_copilot_documents
+                          WHERE user_id = %s AND job_id = %s AND filename = %s
+                          AND %s = 'spend'
+                          UNION ALL SELECT 1 FROM growth_copilot_ai_reports
+                          WHERE user_id = %s AND job_id = %s AND claim = %s
+                          AND %s = 'llm_call'))
+                      AND state = 'reserved'
+                    RETURNING attempt
+                )
+                INSERT INTO growth_copilot_credit_events
+                    (user_id, delta, reason, ref, created_at)
+                SELECT %s, 0, %s, %s, NOW() FROM op_unknown
+                RETURNING id
+                """,
+                (
+                    int(user_id),
+                    str(ref or ""),
+                    str(kind or ""),
+                    attempt, claim, int(user_id), str(ref), claim, str(kind),
+                    int(user_id), str(ref), claim, str(kind),
+                    int(user_id),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def grant_daily_allowance_with_event(
+        self, user_id: int, amount: int, reason: str, ref: str
+    ) -> bool:
+        """Grant the daily allowance and log it in one statement.
+
+        The grant itself stays idempotent per calendar day, and the journal
+        entry appears exactly when the balance changed.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                WITH granted AS (
+                    UPDATE growth_copilot_credits
+                    SET balance = balance + %s,
+                        free_granted_on = CURRENT_DATE,
+                        updated_at = NOW()
+                    WHERE user_id = %s
+                      AND free_granted_on IS DISTINCT FROM CURRENT_DATE
+                    RETURNING balance
+                )
+                INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref, created_at)
+                SELECT %s, %s, %s, %s, NOW() FROM granted
+                RETURNING id
+                """,
+                (
+                    int(amount),
+                    int(user_id),
+                    int(user_id),
+                    int(amount),
+                    str(reason or ""),
+                    str(ref or ""),
+                ),
+            )
+            return bool(cur.fetchone())
+
+    def credit_event_counts(
+        self, user_id: int, reasons: Sequence[str], ref: str
+    ) -> Dict[str, int]:
+        """Count the journal entries of one operation reference."""
+        wanted = [str(item) for item in reasons if str(item)]
+        if not wanted:
+            return {}
+        placeholders = ", ".join(["%s"] * len(wanted))
+        statement = (
+            "SELECT reason, COUNT(*) FROM growth_copilot_credit_events "
+            "WHERE user_id = %s AND ref = %s AND reason IN ("
+            + placeholders
+            + ") GROUP BY reason"
+        )
+        with self._cursor() as cur:
+            cur.execute(statement, (int(user_id), str(ref or ""), *wanted))
+            rows = cur.fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def claim_document(
+        self, user_id: int, job_id: str, filename: str, *, stale_after_minutes: int = CLAIM_STALE_MINUTES
+    ) -> Optional[str]:
+        """Claim the document slot of one (user, job) pair.
+
+        The slot is the unique key of the document cache, so a second request
+        for the same vacancy cannot start a parallel build. A claim without a
+        file id that is older than ``stale_after_minutes`` is taken over, so a
+        build that died does not block the user forever.
+
+        The returned token identifies the owner of the claim. Only the owner
+        may release the slot or write the file: a build that took over a
+        stale claim keeps it, and a late build cannot overwrite a file that
+        was delivered in the meantime. The token lives in the file name of the
+        claim row, so no column has to be added to the table.
+        """
+        token = "claim:%s" % uuid.uuid4().hex
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_documents
+                    (user_id, job_id, telegram_file_id, filename, fit_score, created_at)
+                VALUES (%s, %s, '', %s, 0, NOW())
+                ON CONFLICT (user_id, job_id) DO UPDATE SET
+                    filename = %s,
+                    created_at = NOW()
+                WHERE growth_copilot_documents.telegram_file_id = ''
+                  AND growth_copilot_documents.created_at
+                      < NOW() - (%s * INTERVAL '1 minute')
+                RETURNING job_id
+                """,
+                (
+                    int(user_id),
+                    str(job_id),
+                    token,
+                    token,
+                    int(stale_after_minutes),
+                ),
+            )
+            row = cur.fetchone()
+        return token if row else None
+
+    def release_document_claim(self, user_id: int, job_id: str, claim: str) -> bool:
+        """Release a claim that produced no document.
+
+        Only the owner of the claim releases the slot: a build that took over
+        a stale claim keeps it, so a third request cannot start in parallel.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM growth_copilot_documents
+                WHERE user_id = %s AND job_id = %s
+                  AND telegram_file_id = '' AND filename = %s
+                RETURNING job_id
+                """,
+                (int(user_id), str(job_id), str(claim)),
+            )
+            return bool(cur.fetchone())
+
+    # ------------------------------------------------------------------
     # Retention
     # ------------------------------------------------------------------
     def prune_expired(self) -> Dict[str, int]:
@@ -777,6 +1518,14 @@ class CopilotStore:
                 APPLICATIONS_TABLE,
                 f"DELETE FROM {APPLICATIONS_TABLE} "
                 f"WHERE created_at < NOW() - INTERVAL '{APPLICATION_RETENTION_DAYS} days'",
+            ),
+            (
+                # An open reservation is never dropped: the state of the row is
+                # what keeps a paid operation from being paid for twice.
+                CREDIT_OPS_TABLE,
+                f"DELETE FROM {CREDIT_OPS_TABLE} "
+                f"WHERE state <> 'reserved' "
+                f"AND updated_at < NOW() - INTERVAL '{DOCUMENT_RETENTION_DAYS} days'",
             ),
         )
         for table, statement in statements:

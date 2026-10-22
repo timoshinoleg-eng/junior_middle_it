@@ -32,7 +32,16 @@ from copilot import forward as copilot_forward
 from copilot import pdf as copilot_pdf
 from copilot import webapp as copilot_webapp
 from copilot import webapp_auth
-from copilot.credits import REASON_SPEND, CreditManager
+from copilot import paid_operations_enabled
+from copilot.credit_operations import (
+    DELIVERY_DELIVERED,
+    DELIVERY_UNKNOWN,
+    CreditStoreUnavailable,
+    InsufficientCredits,
+    cv_operation,
+    settle_delivery_safely,
+)
+from copilot.credits import CreditManager
 from copilot.store import CopilotStore
 from interactive_webhook_runtime import build_runtime
 from resume_documents import ResumeDocumentError, extract_resume_document
@@ -165,6 +174,11 @@ class handler(BaseHTTPRequestHandler):
             payload = self._read_json()
             user = self._authenticate(payload)
             user_id = int(user["id"])
+            if path.endswith("/pdf") and not paid_operations_enabled(pdf=True):
+                raise copilot_webapp.WebappError(
+                    503, "maintenance",
+                    "Разбор резюме временно недоступен: технические работы. Попробуй позже.",
+                )
             db, job_bot, store = self._runtime()
             self._rate_limit(store, user_id)
             if path.endswith("/pdf"):
@@ -270,14 +284,80 @@ class handler(BaseHTTPRequestHandler):
             resume = {}
         content = self._resume_bytes(resume)
 
+        # One build of one vacancy at a time. The slot is the primary key of
+        # the document cache, so a parallel request cannot assemble the same
+        # document twice and cannot be charged for it either.
+        try:
+            claimed = store.claim_document(user_id, job_hash, CV_FILENAME)
+        except Exception as exc:
+            logger.warning("Copilot webapp document claim failed: %s", type(exc).__name__)
+            raise copilot_webapp.WebappError(
+                503, "store_unavailable", "Не удалось начать сборку. Попробуй позже."
+            ) from exc
+        if not claimed:
+            raise copilot_webapp.WebappError(
+                409, "cv_in_progress", "Сборка CV по этой вакансии уже идёт."
+            )
+
         manager = CreditManager(store)
+        operation = cv_operation(store, user_id, job_hash).bind_claim(claimed)
+        try:
+            return self._build_and_send(
+                db,
+                store,
+                user_id,
+                job_hash,
+                job,
+                title,
+                token,
+                content,
+                resume,
+                claimed,
+                operation,
+                manager,
+            )
+        except BaseException:
+            # The claim is given back on every path that does not deliver a
+            # document: a build that failed or that was interrupted must not
+            # block the next request for fifteen minutes. Only the owner of
+            # the claim releases it, so a build that took the slot over keeps
+            # it.
+            self._release_claim(store, user_id, job_hash, claimed)
+            raise
+
+    def _build_and_send(
+        self,
+        db,
+        store,
+        user_id,
+        job_hash,
+        job,
+        title,
+        token,
+        content,
+        resume,
+        claimed,
+        operation,
+        manager,
+    ):
+        """Assemble the CV of one vacancy and send it to the chat.
+
+        The caller owns the claim and releases it when this method raises, so
+        every step that can fail - the settings of the user, the analysis, the
+        PDF, its validation and the caption - cannot leak the claim.
+        """
         try:
             manager.ensure_daily_allowance(user_id)
             balance = manager.balance(user_id)
+            # An operation the user already paid for is not paid for again,
+            # so an empty balance must not block it.
+            already_paid = operation.paid
         except Exception as exc:
             logger.warning("Copilot webapp credits failed: %s", type(exc).__name__)
-            balance = 0
-        if balance < 1:
+            raise copilot_webapp.WebappError(
+                503, "store_unavailable", "Не удалось проверить кредиты. Попробуй позже."
+            ) from exc
+        if balance < 1 and not already_paid:
             raise copilot_webapp.WebappError(
                 402,
                 "no_credits",
@@ -318,24 +398,62 @@ class handler(BaseHTTPRequestHandler):
         ats = copilot_pdf.validate_pdf_bytes(pdf_bytes, job=job)
         caption = f"🧾 CV под вакансию «{title}».\n" + ats.summary()
 
+        # The credit is taken once the document exists and only for the attempt
+        # that delivers it. A repeated request of the same vacancy keeps the
+        # state the operation already has.
         try:
-            manager.spend(user_id, 1, REASON_SPEND, "pdf")
-        except Exception as exc:
-            logger.warning("Copilot webapp credit spend failed: %s", type(exc).__name__)
+            operation.reserve()
+        except InsufficientCredits as exc:
+            raise copilot_webapp.WebappError(
+                402,
+                "no_credits",
+                "Бесплатные сборки на сегодня закончились. Пригласи друга — получите бонус.",
+            ) from exc
+        except CreditStoreUnavailable as exc:
+            raise copilot_webapp.WebappError(
+                503, "store_unavailable", "Не удалось списать кредит. Попробуй позже."
+            ) from exc
 
-        sent = copilot_webapp.send_document_to_chat(
-            token, user_id, CV_FILENAME, pdf_bytes, caption=caption
-        )
+        if not operation.can_deliver():
+            raise copilot_webapp.WebappError(
+                503, "store_unavailable", "Не удалось проверить кредиты. Попробуй позже."
+            )
         try:
-            store.save_document(
+            sent = copilot_webapp.send_document_to_chat(
+                token, user_id, CV_FILENAME, pdf_bytes, caption=caption
+            )
+        except copilot_webapp.WebappError as exc:
+            # A rejected document is paid back, a lost answer keeps the credit
+            # spent: Telegram may have stored the file anyway.
+            settle_delivery_safely(operation, exc.delivery or DELIVERY_UNKNOWN)
+            raise
+        except Exception:
+            settle_delivery_safely(operation, DELIVERY_UNKNOWN)
+            raise
+
+        settle_delivery_safely(operation, DELIVERY_DELIVERED)
+        try:
+            saved = store.save_document(
                 user_id,
                 job_hash,
                 telegram_file_id=str(sent.get("file_id") or ""),
                 filename=CV_FILENAME,
                 fit_score=report.score,
+                claim=claimed,
             )
         except Exception as exc:
             logger.warning("Copilot webapp document cache write failed: %s", type(exc).__name__)
+            # The document was delivered, but the cache does not know it. The
+            # slot is released, so the next request builds it again and stays
+            # free: the operation is already paid for.
+            self._release_claim(store, user_id, job_hash, claimed)
+        else:
+            if not saved:
+                # The write was refused: the claim belongs to another build
+                # now, so this file is not cached. The delivery already
+                # happened and the operation is paid for.
+                logger.warning("Copilot webapp document cache write was refused")
+                self._release_claim(store, user_id, job_hash, claimed)
         db.log_event(user_id, "copilot_webapp_cv_sent", {"hash": job_hash, "score": report.score})
         return 200, {
             "ok": True,
@@ -351,6 +469,19 @@ class handler(BaseHTTPRequestHandler):
             },
             "message": "CV собран и отправлен в чат бота.",
         }
+
+    def _release_claim(self, store, user_id, job_hash, claim):
+        """Give the document slot back after a build that produced nothing.
+
+        Only the owner of the claim releases the slot: a build that took over
+        a stale claim keeps it.
+        """
+        if not claim:
+            return
+        try:
+            store.release_document_claim(user_id, job_hash, claim)
+        except Exception as exc:
+            logger.warning("Copilot webapp document claim release failed: %s", type(exc).__name__)
 
     def _resume_bytes(self, resume):
         raw = str(resume.get("content_base64") or "")

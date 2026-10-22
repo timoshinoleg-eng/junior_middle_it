@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 
-__all__ = ["__version__", "flag_enabled", "flag_int"]
+__all__ = ["__version__", "flag_enabled", "flag_int", "paid_operations_enabled"]
 
 __version__ = "0.1.0"
 
@@ -35,3 +35,8 @@ def flag_int(name: str, default: int, *, minimum: int = 0, maximum: int = 1_000_
     except ValueError:
         return int(default)
     return max(int(minimum), min(int(value), int(maximum)))
+
+
+def paid_operations_enabled(*, pdf: bool = False) -> bool:
+    """Read paid-surface gates on every request, with no process cache."""
+    return flag_enabled("COPILOT_ENABLED") and (not pdf or flag_enabled("COPILOT_PDF_ENABLED"))
