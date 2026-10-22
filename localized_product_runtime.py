@@ -211,6 +211,7 @@ class JobBot(p8.JobBot):
         settings, matched = self._select_first_value_jobs(user_id)
         lang = self._lang(user_id)
         fallback_note = ""
+        market_examples = False
         if not matched:
             # The quick button must not silently mean "only posts from the last
             # 36 hours". Show older profile matches, then clearly labelled
@@ -228,6 +229,7 @@ class JobBot(p8.JobBot):
                 )
             elif week_jobs:
                 matched = week_jobs[:3]
+                market_examples = True
                 fallback_note = (
                     "По твоим фильтрам новых вакансий нет. Ниже 3 примера из других направлений — "
                     "это НЕ персональные совпадения. Измени категории в настройках."
@@ -247,9 +249,28 @@ class JobBot(p8.JobBot):
         sent = 0
         for job in matched:
             try:
+                # A preceding generic disclaimer can scroll out of view on
+                # mobile. Repeat the distinction on EACH individual example.
+                # This is presentation metadata, not a change to the job record.
+                card_text = self._job_text(job, lang)
+                if market_examples:
+                    prefix = (
+                        "⚠️ ПРИМЕР ВНЕ ТВОИХ ФИЛЬТРОВ — не персональное совпадение.\\n"
+                        if lang == "ru" else
+                        "⚠️ EXAMPLE OUTSIDE YOUR FILTERS — not a personal match.\\n"
+                    )
+                    enabled = set(settings.get("enabled_categories") or [])
+                    category = str(job.get("category") or "other")
+                    if enabled and category not in enabled:
+                        prefix += (
+                            f"Категория: {category_name(category, lang)}.\\n"
+                            if lang == "ru" else
+                            f"Category: {category_name(category, lang)}.\\n"
+                        )
+                    card_text = prefix + card_text
                 await self.application.bot.send_message(
                     chat_id=user_id,
-                    text=self._job_text(job, lang),
+                    text=card_text,
                     reply_markup=self._job_keyboard(job, lang),
                     disable_web_page_preview=True,
                 )
