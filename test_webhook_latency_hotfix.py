@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
+import localized_product_runtime as localized_product
 import interactive_webhook_runtime as webhook_base
 import localized_webhook_runtime  # noqa: F401 - installs the optimized ledger claim
 import localized_product_runtime_v6 as runtime
@@ -181,6 +183,127 @@ class CallbackLatencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(order.index("ack"), order.index("language"))
         self.assertLess(order.index("ack"), order.index("settings"))
 
+
+
+class FastStartAndSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_user_start_replies_before_noncritical_db_writes(self):
+        sequence = []
+
+        class DB:
+            def get_user_language(self, _uid):
+                sequence.append("language")
+                return "ru"
+
+            def log_event(self, *_args):
+                sequence.append("event")
+
+            def maybe_unlock_premium(self, _uid):
+                sequence.append("premium")
+
+        bot = object.__new__(localized_product.JobBot)
+        bot.db = DB()
+
+        async def send_hub(_message, _uid):
+            sequence.append("reply")
+
+        bot._send_retention_hub = send_hub
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=77),
+            message=SimpleNamespace(),
+        )
+        await bot.cmd_start(update, SimpleNamespace(args=[]))
+        self.assertEqual(sequence, ["language", "reply", "event", "premium"])
+
+    async def test_start_reuses_language_hint_from_entrypoint(self):
+        sequence = []
+
+        class DB:
+            def get_user_language(self, _uid):
+                raise AssertionError("language already fetched by entrypoint")
+
+            def log_event(self, *_args):
+                sequence.append("event")
+
+            def maybe_unlock_premium(self, _uid):
+                sequence.append("premium")
+
+        bot = object.__new__(localized_product.JobBot)
+        bot.db = DB()
+        bot._start_language_hint = (77, "ru")
+
+        async def send_hub(_message, _uid):
+            sequence.append("reply")
+
+        bot._send_retention_hub = send_hub
+        await bot.cmd_start(
+            SimpleNamespace(effective_user=SimpleNamespace(id=77), message=SimpleNamespace()),
+            SimpleNamespace(args=[]),
+        )
+        self.assertEqual(sequence, ["reply", "event", "premium"])
+
+    async def test_no_recent_profile_matches_shows_explicitly_unmatched_examples(self):
+        examples = [
+            {"hash": str(i) * 40, "title": f"Job {i}", "category": "development"}
+            for i in range(1, 5)
+        ]
+        sent = AsyncMock()
+        events = []
+
+        class DB:
+            def recent_jobs_for_digest(self, *, hours, limit):
+                self_args.append((hours, limit))
+                return examples
+
+            def log_event(self, *args):
+                events.append(args)
+
+        self_args = []
+        bot = object.__new__(localized_product.JobBot)
+        bot.db = DB()
+        bot.application = SimpleNamespace(bot=SimpleNamespace(send_message=sent))
+        bot._select_first_value_jobs = lambda _uid: ({"enabled_categories": ["security"]}, [])
+        bot._lang = lambda _uid: "ru"
+        bot._job_text = lambda job, lang: job["title"]
+        bot._job_keyboard = lambda job, lang: None
+        with patch.object(localized_product.core, "GROWTH_UTILS_AVAILABLE", True), patch.object(
+            localized_product.core, "job_matches_profile", return_value=False
+        ):
+            count = await bot._send_first_value_preview(77, source="test")
+        self.assertEqual(count, 3)
+        self.assertEqual(self_args, [(168, 80)])
+        self.assertIn("НЕ персональные совпадения", sent.await_args_list[0].kwargs["text"])
+        self.assertEqual(len(sent.await_args_list), 4)
+        self.assertEqual(events[-1][1], "first_value_preview_sent")
+
+    async def test_week_long_strict_matches_precede_market_examples(self):
+        sent = AsyncMock()
+        jobs = [
+            {"hash": "a" * 40, "title": "Security", "category": "security"},
+            {"hash": "b" * 40, "title": "Development", "category": "development"},
+        ]
+
+        class DB:
+            def recent_jobs_for_digest(self, **_kwargs):
+                return jobs
+
+            def log_event(self, *_args):
+                pass
+
+        bot = object.__new__(localized_product.JobBot)
+        bot.db = DB()
+        bot.application = SimpleNamespace(bot=SimpleNamespace(send_message=sent))
+        bot._select_first_value_jobs = lambda _uid: ({"enabled_categories": ["security"]}, [])
+        bot._lang = lambda _uid: "ru"
+        bot._job_text = lambda job, lang: job["title"]
+        bot._job_keyboard = lambda job, lang: None
+        with patch.object(localized_product.core, "GROWTH_UTILS_AVAILABLE", True), patch.object(
+            localized_product.core, "job_matches_profile",
+            side_effect=lambda job, _profile: job["category"] == "security",
+        ):
+            count = await bot._send_first_value_preview(77, source="test")
+        self.assertEqual(count, 1)
+        self.assertIn("за неделю", sent.await_args_list[0].kwargs["text"])
+        self.assertEqual(sent.await_args_list[1].kwargs["text"], "Security")
 
 if __name__ == "__main__":
     unittest.main()
