@@ -160,6 +160,30 @@ def build_runtime():
         application.add_handler(CommandHandler(command, callback))
     application.add_handler(CallbackQueryHandler(job_bot.handle_callback))
 
+    # Telegram sends screenshots as PHOTO or as image/* documents. Both were
+    # previously ignored, so users got no acknowledgement at all. This handler
+    # runs before the normal PDF/DOCX/text workflow and never downloads files.
+    image_filter = (
+        filters.PHOTO
+        | filters.Document.IMAGE
+        | filters.Document.FileExtension("png")
+        | filters.Document.FileExtension("jpg")
+        | filters.Document.FileExtension("jpeg")
+        | filters.Document.FileExtension("webp")
+    )
+
+    async def image_guidance(update, context):
+        callback = getattr(job_bot, "handle_resume_image", None)
+        if callback is not None:
+            return await callback(update, context)
+        if update.message:
+            await update.message.reply_text(
+                "PNG/JPG пока не распознаю. Пришли резюме в PDF с текстом "
+                "или DOCX, либо вставь текст сообщением."
+            )
+
+    application.add_handler(MessageHandler(image_filter, image_guidance))
+
     document_filter = (
         filters.Document.PDF
         | filters.Document.DOCX
