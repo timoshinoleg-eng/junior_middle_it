@@ -13,6 +13,8 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+
+from durable_runtime_state import RuntimeStateMap
 from urllib.parse import quote
 
 import channel_bot as core
@@ -983,7 +985,9 @@ async def _handle_pdf(job_bot, update, job_hash: str) -> None:
         return
 
     requests = _pdf_requests(job_bot)
-    requests[user_id] = {"job_hash": job_hash, "job": job}
+    # A Vercel webhook creates a fresh runtime for EVERY Telegram update.
+    # Persist only the vacancy hash, never the resume or the file bytes.
+    requests[user_id] = {"job_hash": job_hash}
     await query.answer()
     await query.message.reply_text(
         "Пришли резюме файлом (PDF или DOCX) — соберу одностраничное CV под эту вакансию.\n\n"
@@ -991,11 +995,29 @@ async def _handle_pdf(job_bot, update, job_hash: str) -> None:
     )
 
 
-def _pdf_requests(job_bot) -> Dict:
-    """Per-request state of pending CV builds."""
+def _pdf_requests(job_bot):
+    """Restart-safe pending CV selection; store only the public vacancy hash."""
     requests = getattr(job_bot, "copilot_pdf_requests", None)
     if requests is None:
-        requests = {}
+        db = job_bot.db
+        if all(callable(getattr(db, method, None)) for method in
+               ("get_runtime_state", "set_runtime_state", "delete_runtime_state")):
+            def decode(state):
+                job_hash = str(state.get("job_hash") or "")
+                if len(job_hash) != MAX_HASH_CHARS or any(
+                    char not in "0123456789abcdef" for char in job_hash.lower()
+                ):
+                    return None
+                return {"job_hash": job_hash}
+
+            requests = RuntimeStateMap(
+                db, "copilot_cv_pending", ttl_seconds=60 * 60,
+                encode=lambda state: {"job_hash": str(state["job_hash"])[:MAX_HASH_CHARS]},
+                decode=decode,
+            )
+        else:
+            # Lightweight test/local fake databases keep the old dict shape.
+            requests = {}
         setattr(job_bot, "copilot_pdf_requests", requests)
     return requests
 
@@ -1043,7 +1065,7 @@ def _release_pdf_claim(store, user_id: int, job_hash: str, claim: str) -> None:
         logger.info("Copilot document claim release failed: %s", type(exc).__name__)
 
 
-async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> None:
+async def _build_cv_from_message(job_bot, update, context, pending: Dict, requests=None) -> None:
     """Build the tailored CV from the resume the user just sent."""
     if not paid_operations_enabled(pdf=True):
         logger.info("Copilot PDF refused: maintenance")
@@ -1085,6 +1107,11 @@ async def _build_cv_from_message(job_bot, update, context, pending: Dict) -> Non
             await message.reply_text("Пришли резюме файлом (PDF или DOCX) или текстом — соберу CV.")
             return
 
+    # Consume the pending selection only after a valid resume has been parsed.
+    # Unsupported or corrupt uploads can be replaced without pressing the
+    # vacancy button again; no image text or file data is ever saved.
+    if requests is not None:
+        requests.pop(user_id, None)
     job = pending["job"]
     job_hash = pending["job_hash"]
     settings = job_bot.db.get_user_settings(user_id)
@@ -1333,13 +1360,41 @@ async def _copilot_handle_setup_text(self, update, context):
     """Route a resume upload to the CV build and a forward to the Copilot."""
     user_id = update.effective_user.id if update.effective_user else None
     requests = _pdf_requests(self)
-    pending = requests.pop(user_id, None) if user_id else None
+    pending = requests.get(user_id) if user_id else None
     if pending:
-        await _build_cv_from_message(self, update, context, pending)
+        job = _load_job(self, str(pending["job_hash"]))
+        if not job:
+            requests.pop(user_id, None)
+            await update.message.reply_text(
+                "Вакансия больше недоступна. Открой её карточку и нажми «Собрать CV» заново."
+            )
+            return
+        await _build_cv_from_message(
+            self, update, context,
+            {"job_hash": pending["job_hash"], "job": job}, requests=requests,
+        )
         return
     if await _maybe_handle_forward(self, update):
         return
     return await _original_handle_setup_text(self, update, context)
+
+
+async def _resume_image_guidance(self, update, context):
+    """Always acknowledge an image sent during a resume workflow.
+
+    OCR is not implemented; never treat an image as empty resume text and
+    never download it or spend a credit. Both Telegram photos and image
+    documents reach this handler before generic text/document handlers.
+    """
+    message = update.message
+    if message is None:
+        return
+    await message.reply_text(
+        "Получил изображение, но PNG/JPG пока не умею распознавать. "
+        "Пришли резюме в DOCX или PDF с выделяемым текстом (не скан) "
+        "или вставь текст резюме сообщением. "
+        "Если выбрана вакансия, повторно выбирать её не нужно."
+    )
 
 
 async def _copilot_handle_callback(self, update, context):
@@ -1425,6 +1480,7 @@ durable.JobBot.cmd_upskill = _cmd_upskill
 durable.JobBot.cmd_stats_growth = _copilot_cmd_stats_growth
 durable.JobBot.handle_callback = _copilot_handle_callback
 durable.JobBot.handle_setup_text = _copilot_handle_setup_text
+durable.JobBot.handle_resume_image = _resume_image_guidance
 base.build_runtime = _copilot_build_runtime
 
 MAX_UPDATE_BYTES = base.MAX_UPDATE_BYTES
