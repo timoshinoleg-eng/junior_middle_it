@@ -34,10 +34,17 @@ CREATE TABLE IF NOT EXISTS public.growth_copilot_credit_ops (
     PRIMARY KEY (user_id, ref, kind)
 );
 
--- The rows of the operations that were paid for are dropped by the retention
--- of the store. The index keeps that cleanup cheap.
+-- The rows of the operations that were paid for can be dropped by a cleanup of
+-- the old rows. The index keeps that cleanup cheap.
 CREATE INDEX IF NOT EXISTS growth_copilot_credit_ops_updated_at_idx
     ON public.growth_copilot_credit_ops (updated_at);
+
+-- The counts of the journal of one operation are the second gate of the
+-- reservation and the rule of the adoption, so they are read for every
+-- request that touches an operation. Without the index they are a scan of
+-- the whole journal.
+CREATE INDEX IF NOT EXISTS growth_copilot_credit_events_user_ref_idx
+    ON public.growth_copilot_credit_events (user_id, ref);
 
 ALTER TABLE public.growth_copilot_credit_ops ENABLE ROW LEVEL SECURITY;
 
