@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import unittest
 from unittest.mock import patch
 
@@ -49,6 +50,23 @@ class PublicationAuthorityTests(unittest.TestCase):
         self.assertTrue(result["skipped"])
         self.assertEqual(result["posted"], 0)
         self.assertEqual(result["reason"], "vercel_publication_authority")
+
+    def test_render_persistent_loop_respects_publication_authority(self):
+        # Regression: Render's main() uses a DIFFERENT fetch loop from
+        # collect_and_post_once(). Both must honor the same authority gate.
+        with patch.dict(
+            "os.environ",
+            {"RENDER_SERVICE_ID": "srv-render", "VERCEL": "", "VERCEL_ENV": ""},
+        ):
+            self.assertTrue(core._render_crawl_blocked())
+        with patch.dict(
+            "os.environ",
+            {"RENDER_SERVICE_ID": "", "VERCEL": "1", "VERCEL_ENV": "production"},
+        ):
+            self.assertFalse(core._render_crawl_blocked())
+        source = inspect.getsource(core.main)
+        self.assertIn("if _render_crawl_blocked():", source)
+        self.assertIn('CYCLE_TELEMETRY["last_source"] = "disabled_noncanonical_render"', source)
 
     def test_non_vercel_public_channel_is_blocked_but_dm_is_allowed(self):
         env = {"CHANNEL_ID": "@junior_middle_it"}
