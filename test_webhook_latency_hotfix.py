@@ -6,6 +6,7 @@ import localized_product_runtime as localized_product
 import interactive_webhook_runtime as webhook_base
 import localized_webhook_runtime  # noqa: F401 - installs the optimized ledger claim
 import localized_product_runtime_v6 as runtime
+import localized_product_runtime_v8 as runtime_v8
 
 
 class FakeCursor:
@@ -22,7 +23,9 @@ class FakeCursor:
     def execute(self, query, params=()):
         text = " ".join(str(query).split())
         self.store.calls.append((text, tuple(params or ())))
-        if "SELECT state FROM growth_telegram_updates" in text:
+        if "FROM (SELECT %s::bigint AS user_id) incoming" in text:
+            self.current_row = ("ru", True, True, False, 3)
+        elif "SELECT state FROM growth_telegram_updates" in text:
             self.current_row = ("processed",)
         elif "RETURNING update_id" in text and "INSERT INTO growth_telegram_updates" in text:
             self.current_row = (int(params[0]),)
@@ -299,6 +302,10 @@ class FastStartAndSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self_args, [(168, 80)])
         self.assertIn("НЕ персональные совпадения", sent.await_args_list[0].kwargs["text"])
         self.assertEqual(len(sent.await_args_list), 4)
+        for call in sent.await_args_list[1:]:
+            self.assertIn("ПРИМЕР ВНЕ ТВОИХ ФИЛЬТРОВ", call.kwargs["text"])
+            self.assertIn("не персональное совпадение", call.kwargs["text"])
+            self.assertIn("Категория:", call.kwargs["text"])
         self.assertEqual(events[-1][1], "first_value_preview_sent")
 
     async def test_week_long_strict_matches_precede_market_examples(self):
@@ -330,6 +337,122 @@ class FastStartAndSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(count, 1)
         self.assertIn("за неделю", sent.await_args_list[0].kwargs["text"])
         self.assertEqual(sent.await_args_list[1].kwargs["text"], "Security")
+
+
+class SingleReadStartTests(unittest.TestCase):
+    def test_fast_start_snapshot_uses_one_read_only_round_trip(self):
+        db = object.__new__(runtime_v8.DatabaseConnection)
+        db._growth_store = FakeStore()
+        snapshot = db.fast_start_snapshot(77)
+        self.assertEqual(snapshot, {
+            "language": "ru",
+            "onboarding_done": True,
+            "alerts_enabled": True,
+            "digest_enabled": False,
+            "search_count": 3,
+        })
+        self.assertEqual(len(db._growth_store.calls), 1)
+        sql, params = db._growth_store.calls[0]
+        self.assertIn("FROM growth_events", sql)
+        self.assertIn("FROM growth_saved_searches", sql)
+        self.assertIn("JOIN growth_user_settings", sql)
+        self.assertEqual(params, (77, 77, 77))
+        self.assertNotIn("INSERT", sql)
+        self.assertNotIn("UPDATE", sql)
+        # The Edge SQL bridge serializes rows by column name; duplicate
+        # unaliased COALESCE columns overwrite one another before returning.
+        for alias in ("language", "onboarding_done", "alerts_enabled", "digest_enabled", "search_count"):
+            self.assertIn("AS " + alias, sql)
+        self.assertEqual(len(set((
+            "language", "onboarding_done", "alerts_enabled",
+            "digest_enabled", "search_count",
+        ))), 5)
+
+    def test_fast_start_does_not_mutate_profile(self):
+        db = object.__new__(runtime_v8.DatabaseConnection)
+        db._growth_store = FakeStore()
+        db.fast_start_snapshot(77)
+        self.assertEqual(len(db._growth_store.calls), 1)
+        self.assertEqual(
+            db._growth_store.calls[0][0].split()[0], "SELECT"
+        )
+
+
+class OneRoundTripStartUiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_user_one_read_then_reply_before_analytics(self):
+        sequence = []
+
+        class DB:
+            def fast_start_snapshot(self, uid):
+                sequence.append("snapshot")
+                return {
+                    "language": "ru", "onboarding_done": True,
+                    "alerts_enabled": True, "digest_enabled": False,
+                    "search_count": 3,
+                }
+
+            def log_event(self, *_args):
+                sequence.append("analytics")
+
+            def maybe_unlock_premium(self, uid):
+                sequence.append("premium")
+
+            def get_user_language(self, _uid):
+                raise AssertionError("duplicate language query")
+
+            def get_user_settings(self, _uid):
+                raise AssertionError("duplicate settings query")
+
+            def list_saved_searches(self, _uid):
+                raise AssertionError("duplicate saved search query")
+
+        bot = object.__new__(runtime_v8.JobBot)
+        bot.db = DB()
+        bot._language_cache = {}
+        bot._retention_keyboard_from_state = lambda *_a: None
+
+        async def reply(*_args, **_kwargs):
+            sequence.append("reply")
+
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=77),
+            message=SimpleNamespace(reply_text=AsyncMock(side_effect=reply)),
+        )
+        await bot.cmd_start(update, SimpleNamespace(args=[]))
+        self.assertEqual(sequence, ["snapshot", "reply", "analytics", "analytics", "premium"])
+        self.assertEqual(bot._language_cache[77], "ru")
+
+    async def test_new_user_receives_language_selector_before_event(self):
+        sequence = []
+
+        class DB:
+            def fast_start_snapshot(self, uid):
+                sequence.append("snapshot")
+                return {"language": "", "search_count": 0}
+
+            def log_event(self, *_args):
+                sequence.append("analytics")
+
+        bot = object.__new__(runtime_v8.JobBot)
+        bot.db = DB()
+
+        async def reply(*_args, **_kwargs):
+            sequence.append("reply")
+
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=77),
+            message=SimpleNamespace(reply_text=AsyncMock(side_effect=reply)),
+        )
+        await bot.cmd_start(update, SimpleNamespace(args=[]))
+        self.assertEqual(sequence, ["snapshot", "reply", "analytics"])
+
+    async def test_referral_deeplink_delegates_unchanged(self):
+        bot = object.__new__(runtime_v8.JobBot)
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=77))
+        context = SimpleNamespace(args=["ref_123"])
+        with patch.object(runtime_v8.base.JobBot, "cmd_start", new_callable=AsyncMock) as parent:
+            await bot.cmd_start(update, context)
+        parent.assert_awaited_once_with(update, context)
 
 if __name__ == "__main__":
     unittest.main()
