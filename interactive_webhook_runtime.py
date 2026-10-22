@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
+import time
 from typing import Any, Dict
 from urllib.parse import urlsplit, urlunsplit
 
 from secure_http_logging import configure_sensitive_http_logging
 
 configure_sensitive_http_logging()
+logger = logging.getLogger(__name__)
 
 MAX_UPDATE_BYTES = 1_000_000
 UPDATE_LEASE_MINUTES = 10
@@ -279,9 +282,12 @@ async def process_update_payload(payload: Dict[str, Any]) -> str:
     if not isinstance(payload, dict):
         raise ValueError("Telegram update must be an object")
     update_id = _parse_update_id(payload)
+    started_at = time.perf_counter()
     application, db, _job_bot = build_runtime()
+    runtime_at = time.perf_counter()
     ledger = TelegramUpdateLedger(db)
     claim_state = ledger.claim(update_id)
+    claimed_at = time.perf_counter()
     if claim_state == "processed":
         db.close()
         return "duplicate"
@@ -306,7 +312,18 @@ async def process_update_payload(payload: Dict[str, Any]) -> str:
             await application.process_update(update)
         if handler_errors:
             raise RuntimeError("Telegram update handler failed") from handler_errors[0]
+        handled_at = time.perf_counter()
         ledger.complete(update_id)
+        committed_at = time.perf_counter()
+        # Never log Telegram content, user IDs, update IDs, resume text, or
+        # signatures. This exposes the cold start / SQL bridge / handler cost.
+        logger.info(
+            "telegram_stage_latency runtime_ms=%d claim_ms=%d handler_ms=%d complete_ms=%d",
+            round(1000 * (runtime_at - started_at)),
+            round(1000 * (claimed_at - runtime_at)),
+            round(1000 * (handled_at - claimed_at)),
+            round(1000 * (committed_at - handled_at)),
+        )
         return "processed"
     finally:
         db.close()
