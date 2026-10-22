@@ -1313,8 +1313,11 @@ async def _maybe_handle_forward(job_bot, update) -> bool:
         return False
     if copilot_forward.looks_like_resume(text):
         await message.reply_text(
-            "Это похоже на резюме, а не на вакансию. "
-            "Пришли файл (PDF или DOCX) — проверю его как резюме."
+            "Получил текст резюме. Чтобы проверить его, сначала открой "
+            "конкретную вакансию и нажми «📄 Проверить резюме» или «Собрать CV». "
+            "Затем пришли текст ещё раз либо PDF/DOCX. "
+            "Без выбранной вакансии я не могу сделать корректное сравнение. "
+            "Текст этого сообщения не сохранял."
         )
         return True
 
@@ -1356,6 +1359,50 @@ async def _maybe_handle_forward(job_bot, update) -> bool:
     return True
 
 
+def _unmatched_resume_text(self, update) -> bool:
+    """Detect a resume pasted without an active vacancy-specific workflow.
+
+    Examine text in memory only. Never store it, forward it as a vacancy or
+    start a paid operation. Do not intercept ongoing setup or Resume Match.
+    """
+    message = getattr(update, "message", None)
+    if not message or getattr(message, "document", None) is not None:
+        return False
+    text = str(getattr(message, "text", "") or "").strip()
+    if len(text) < 80 or text.startswith("/"):
+        return False
+    user_id = update.effective_user.id if update.effective_user else None
+    if not user_id:
+        return False
+    if user_id in (getattr(self, "setup_steps", None) or {}):
+        return False
+    if user_id in (getattr(self, "resume_sessions", None) or {}):
+        return False
+    if copilot_forward.looks_like_resume(text):
+        return True
+    sample = text.casefold()
+    signals = (
+        "опыт работы", "мои навыки", "образование", "контактная информация",
+        "профессиональный опыт", "work experience", "my skills",
+        "education", "employment history",
+    )
+    return sum(signal in sample for signal in signals) >= 2
+
+
+async def _reply_choose_vacancy_for_resume(message):
+    await message.reply_text(
+        "Текст резюме получил, но вакансия не выбрана. "
+        "Сначала открой вакансию и нажми «📄 Проверить резюме» "
+        "или «Собрать CV», затем отправь текст заново. "
+        "Сейчас не списывал кредиты и не сохранял резюме.",
+        reply_markup=core.InlineKeyboardMarkup([[
+            core.InlineKeyboardButton(
+                "Найти вакансии", callback_data="growth_quick_fresh"
+            )
+        ]]),
+    )
+
+
 async def _copilot_handle_setup_text(self, update, context):
     """Route a resume upload to the CV build and a forward to the Copilot."""
     user_id = update.effective_user.id if update.effective_user else None
@@ -1373,6 +1420,9 @@ async def _copilot_handle_setup_text(self, update, context):
             self, update, context,
             {"job_hash": pending["job_hash"], "job": job}, requests=requests,
         )
+        return
+    if _unmatched_resume_text(self, update):
+        await _reply_choose_vacancy_for_resume(update.message)
         return
     if await _maybe_handle_forward(self, update):
         return
