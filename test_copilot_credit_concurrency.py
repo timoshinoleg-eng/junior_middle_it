@@ -27,7 +27,10 @@ What the module proves:
   without a claim in front of them, and the same holds for the releases;
 * a reservation without balance changes nothing, so an operation is never
   paid for without a debit;
-* a build whose slot was released cannot write its file or its answer.
+* a build whose slot was released cannot write its file or its answer;
+* a settlement of an older attempt cannot touch a newer attempt;
+* an operation that the previous code left in the journal is adopted into
+  the registry, is not charged a second time and can be given back.
 """
 import os
 import threading
@@ -178,6 +181,29 @@ def _store(dsn: str) -> CopilotStore:
     return CopilotStore(PsycopgGrowthStore(dsn))
 
 
+def _journal_spend(dsn: str, user_id: int, reason: str, ref: str, amount: int = 1) -> None:
+    """Write a reservation the way the previous code wrote it.
+
+    The previous code had no operation registry and wrote its reservation
+    into the journal only, so a production that runs the new code after the
+    migration has operations the registry does not know.
+    """
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE growth_copilot_credits SET balance = balance - %s "
+                "WHERE user_id = %s",
+                (int(amount), int(user_id)),
+            )
+            cur.execute(
+                "INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref) "
+                "VALUES (%s, %s, %s, %s)",
+                (int(user_id), -int(amount), str(reason), str(ref)),
+            )
+
+
 def _balance_set(dsn: str, balance: int, user_id: int = USER_ID) -> int:
     import psycopg
 
@@ -302,7 +328,7 @@ def scenario_parallel_same_operation(dsn: str) -> dict:
         reserved = store.reserve_credit(
             USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
         )
-        return {"claim": claim, "reserved": bool(reserved)}
+        return {"claim": claim, "reserved": reserved is not None}
 
     results = _parallel(dsn, [build, build])
     journal = _journal(dsn)
@@ -331,7 +357,7 @@ def scenario_parallel_llm_path(dsn: str) -> dict:
         reserved = store.reserve_credit(
             USER_ID, 1, REASON_LLM_SPEND, REF, release_reason="llm_call_release"
         )
-        return {"claim": claim, "reserved": bool(reserved)}
+        return {"claim": claim, "reserved": reserved is not None}
 
     results = _parallel(dsn, [analyze, analyze])
     journal = _journal(dsn)
@@ -363,7 +389,7 @@ def scenario_parallel_different_operations(dsn: str) -> dict:
     )
     return {
         "results": results,
-        "granted": sum(1 for item in results if item is True),
+        "granted": sum(1 for item in results if item is not None),
         "balance": _balance(dsn),
     }
 
@@ -371,6 +397,13 @@ def scenario_parallel_different_operations(dsn: str) -> dict:
 def scenario_parallel_reserve_and_release(dsn: str) -> dict:
     """One connection reserves while another gives a credit back."""
     _reset(dsn)
+    store = _store(dsn)
+    try:
+        attempt = store.reserve_credit(
+            USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
+        )
+    finally:
+        store._store.close()
 
     def reserve(store):
         return store.reserve_credit(
@@ -379,7 +412,12 @@ def scenario_parallel_reserve_and_release(dsn: str) -> dict:
 
     def release(store):
         return store.release_credit(
-            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND
+            USER_ID,
+            1,
+            REASON_RELEASE,
+            REF,
+            reserved_reason=REASON_SPEND,
+            attempt=attempt,
         )
 
     results = _parallel(dsn, [reserve, release])
@@ -497,9 +535,16 @@ def scenario_balance_matches_journal(dsn: str) -> dict:
     _reset(dsn)
     store = _store(dsn)
     try:
-        store.reserve_credit(USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE)
+        first = store.reserve_credit(
+            USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
+        )
         store.release_credit(
-            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND
+            USER_ID,
+            1,
+            REASON_RELEASE,
+            REF,
+            reserved_reason=REASON_SPEND,
+            attempt=first,
         )
         store.reserve_credit(USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE)
     finally:
@@ -529,7 +574,7 @@ def scenario_reservation_without_claim(dsn: str) -> dict:
     journal = _journal(dsn)
     return {
         "results": results,
-        "granted": sum(1 for item in results if item is True),
+        "granted": sum(1 for item in results if item is not None),
         "spends": sum(1 for r, _d, _r2 in journal if r == REASON_SPEND),
         "balance": _balance(dsn),
     }
@@ -547,7 +592,7 @@ def scenario_many_parallel_reservations(dsn: str, calls: int = 8) -> dict:
     results = _parallel(dsn, [reserve] * calls)
     journal = _journal(dsn)
     return {
-        "granted": sum(1 for item in results if item is True),
+        "granted": sum(1 for item in results if item is not None),
         "spends": sum(1 for r, _d, _r2 in journal if r == REASON_SPEND),
         "balance": _balance(dsn),
     }
@@ -562,13 +607,20 @@ def scenario_parallel_releases(dsn: str, calls: int = 4) -> dict:
     _reset(dsn)
     store = _store(dsn)
     try:
-        store.reserve_credit(USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE)
+        attempt = store.reserve_credit(
+            USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
+        )
     finally:
         store._store.close()
 
     def release(store):
         return store.release_credit(
-            USER_ID, 1, REASON_RELEASE, REF, reserved_reason=REASON_SPEND
+            USER_ID,
+            1,
+            REASON_RELEASE,
+            REF,
+            reserved_reason=REASON_SPEND,
+            attempt=attempt,
         )
 
     results = _parallel(dsn, [release] * calls)
@@ -623,7 +675,11 @@ def scenario_expired_claim_two_reservations(dsn: str) -> dict:
         reserved = store.reserve_credit(
             USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
         )
-        return {"claim": claim, "second": second, "reserved": bool(reserved)}
+        return {
+            "claim": claim,
+            "second": second,
+            "reserved": reserved is not None,
+        }
 
     results = _parallel(dsn, [first_build, first_build])
     journal = _journal(dsn)
@@ -694,6 +750,144 @@ def scenario_late_report_after_release(dsn: str) -> dict:
     }
 
 
+def scenario_late_attempt_cannot_settle(dsn: str) -> dict:
+    """A settlement of an older attempt cannot touch a newer one.
+
+    The first attempt is reserved and given back, the second attempt is
+    reserved, and the late settlement of the first one arrives. The
+    reservation of the second attempt has to stay untouched.
+    """
+    _reset(dsn)
+    store = _store(dsn)
+    try:
+        first = store.reserve_credit(
+            USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
+        )
+        released = store.release_credit(
+            USER_ID,
+            1,
+            REASON_RELEASE,
+            REF,
+            reserved_reason=REASON_SPEND,
+            attempt=first,
+        )
+        second = store.reserve_credit(
+            USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
+        )
+        # The late settlement of the owner of the first attempt.
+        late_release = store.release_credit(
+            USER_ID,
+            1,
+            REASON_RELEASE,
+            REF,
+            reserved_reason=REASON_SPEND,
+            attempt=first,
+        )
+        late_confirm = store.confirm_credit_operation(
+            USER_ID, REF, REASON_SPEND, "cv_delivered", attempt=first
+        )
+        late_unknown = store.mark_credit_operation_unknown(
+            USER_ID, REF, REASON_SPEND, "cv_delivery_unknown", attempt=first
+        )
+        # The owner of the second attempt settles it.
+        good_release = store.release_credit(
+            USER_ID,
+            1,
+            REASON_RELEASE,
+            REF,
+            reserved_reason=REASON_SPEND,
+            attempt=second,
+        )
+    finally:
+        store._store.close()
+    journal = _journal(dsn)
+    return {
+        "first": first,
+        "released": released,
+        "second": second,
+        "late_release": late_release,
+        "late_confirm": late_confirm,
+        "late_unknown": late_unknown,
+        "good_release": good_release,
+        "spends": sum(1 for r, _d, _r2 in journal if r == REASON_SPEND),
+        "releases": sum(1 for r, _d, _r2 in journal if r == REASON_RELEASE),
+        "balance": _balance(dsn),
+        "operations": _operations(dsn),
+    }
+
+
+def scenario_journal_only_operation(dsn: str) -> dict:
+    """An operation of the previous code is adopted into the registry.
+
+    The previous code wrote its reservation into the journal only. The new
+    code reads the state of the operation, adopts it and refuses to charge
+    the user again, and the credit of the operation can be given back when
+    the delivery fails.
+    """
+    _reset(dsn)
+    _journal_spend(dsn, USER_ID, REASON_SPEND, REF)
+    balance_before = _balance(dsn)
+    store = _store(dsn)
+    try:
+        state = store.credit_operation_state(
+            USER_ID,
+            REF,
+            REASON_SPEND,
+            spend_reason=REASON_SPEND,
+            release_reason=REASON_RELEASE,
+            delivered_reason="cv_delivered",
+            unknown_reason="cv_delivery_unknown",
+        )
+        reserved = store.reserve_credit(
+            USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
+        )
+        released = store.release_credit(
+            USER_ID,
+            1,
+            REASON_RELEASE,
+            REF,
+            reserved_reason=REASON_SPEND,
+            attempt=int(state[1]) if state else None,
+        )
+    finally:
+        store._store.close()
+    journal = _journal(dsn)
+    return {
+        "state": state,
+        "reserved": reserved,
+        "released": released,
+        "balance_before": balance_before,
+        "balance": _balance(dsn),
+        "spends": sum(1 for r, _d, _r2 in journal if r == REASON_SPEND),
+        "releases": sum(1 for r, _d, _r2 in journal if r == REASON_RELEASE),
+        "operations": _operations(dsn),
+    }
+
+
+def scenario_journal_only_operation_is_not_charged_twice(dsn: str) -> dict:
+    """Two parallel requests of an operation of the previous code charge once.
+
+    The operation is adopted by the first request. The second request finds it
+    in the registry and is refused, so the user is charged once.
+    """
+    _reset(dsn)
+    _journal_spend(dsn, USER_ID, REASON_SPEND, REF)
+
+    def reserve(store):
+        return store.reserve_credit(
+            USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
+        )
+
+    results = _parallel(dsn, [reserve, reserve])
+    journal = _journal(dsn)
+    return {
+        "results": results,
+        "granted": sum(1 for item in results if item is not None),
+        "spends": sum(1 for r, _d, _r2 in journal if r == REASON_SPEND),
+        "balance": _balance(dsn),
+    }
+
+
 SCENARIOS = {
     "sequential": scenario_sequential,
     "parallel_same_operation": scenario_parallel_same_operation,
@@ -711,6 +905,11 @@ SCENARIOS = {
     "expired_claim_two_reservations": scenario_expired_claim_two_reservations,
     "late_write_after_release": scenario_late_write_after_release,
     "late_report_after_release": scenario_late_report_after_release,
+    "late_attempt_cannot_settle": scenario_late_attempt_cannot_settle,
+    "journal_only_operation": scenario_journal_only_operation,
+    "journal_only_operation_is_not_charged_twice": (
+        scenario_journal_only_operation_is_not_charged_twice
+    ),
 }
 
 
@@ -754,9 +953,17 @@ class CreditConcurrencyTests(unittest.TestCase):
         self.assertEqual(result["balance"], BALANCE - 2, result)
 
     def test_a_parallel_reserve_and_release_keep_the_journal_consistent(self):
+        """A release that runs at the same time as a reservation.
+
+        The reservation of the released attempt is refused: the credit of the
+        attempt was already given back, and the journal of the attempt stays
+        balanced. The user is charged at most once.
+        """
         result = scenario_parallel_reserve_and_release(self.dsn)
-        self.assertEqual(result["spends"] - result["releases"], 1, result)
-        self.assertEqual(result["balance"], BALANCE - 1, result)
+        self.assertLessEqual(result["spends"] - result["releases"], 1, result)
+        self.assertGreaterEqual(result["spends"] - result["releases"], 0, result)
+        self.assertEqual(result["balance"], BALANCE - 1 + result["releases"], result)
+        self.assertEqual(result["spends"], 1, result)
 
     def test_the_budget_slot_is_atomic(self):
         """Parallel calls cannot take more slots than the budget allows."""
@@ -869,6 +1076,83 @@ class CreditConcurrencyTests(unittest.TestCase):
         self.assertTrue(result["released"])
         self.assertFalse(result["late_write"], result)
         self.assertIsNone(result["row"], result)
+
+    # ------------------------------------------------------------------
+    # A settlement belongs to one attempt.
+    # ------------------------------------------------------------------
+    def test_a_late_attempt_cannot_settle_a_newer_attempt(self):
+        """The owner of the first attempt cannot give back the second one.
+
+        The first attempt is reserved and given back, the second attempt is
+        reserved, and the late settlement of the first one arrives. The
+        reservation of the second attempt has to stay untouched, and the
+        credit may only be given back by the owner of the second attempt.
+        """
+        result = scenario_late_attempt_cannot_settle(self.dsn)
+        self.assertEqual(result["first"], 1, result)
+        self.assertTrue(result["released"], result)
+        self.assertEqual(result["second"], 2, result)
+        self.assertFalse(result["late_release"], result)
+        self.assertFalse(result["late_confirm"], result)
+        self.assertFalse(result["late_unknown"], result)
+        self.assertTrue(result["good_release"], result)
+        # The journal holds a spend and a release per attempt, and the late
+        # settlements of the first attempt wrote nothing.
+        self.assertEqual(result["spends"], 2, result)
+        self.assertEqual(result["releases"], 2, result)
+        self.assertEqual(result["balance"], BALANCE, result)
+
+    def test_an_operation_of_the_previous_code_is_adopted(self):
+        """A reservation of the previous code is not charged a second time.
+
+        The previous code wrote its reservation into the journal only. The
+        new code adopts the operation into the registry, refuses to charge
+        the user again, and the credit of the operation can be given back
+        when the delivery fails.
+        """
+        result = scenario_journal_only_operation(self.dsn)
+        self.assertEqual(result["state"], ("reserved", 1), result)
+        self.assertIsNone(result["reserved"], result)
+        self.assertTrue(result["released"], result)
+        self.assertEqual(result["balance"], BALANCE, result)
+        self.assertEqual(result["spends"], 1, result)
+        self.assertEqual(result["releases"], 1, result)
+        self.assertEqual(result["operations"], [(REF, REASON_SPEND, "released", 1)], result)
+
+    def test_two_parallel_requests_of_a_previous_operation_charge_once(self):
+        result = scenario_journal_only_operation_is_not_charged_twice(self.dsn)
+        self.assertEqual(result["granted"], 0, result)
+        self.assertEqual(result["spends"], 1, result)
+        self.assertEqual(result["balance"], BALANCE - 1, result)
+
+    def test_a_missing_registry_stops_the_credit_system(self):
+        """A missing table stops the credit system, it does not charge.
+
+        The code of the round 3 watched for the SQLSTATE of the missing table
+        and fell back to the statements of the journal. Over a direct
+        connection that fallback works, and it charges the user without the
+        protection against parallel requests. The fallback is gone: the
+        missing table stops the credit system, and no credit is taken.
+        """
+        import psycopg
+
+        _reset(self.dsn)
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS growth_copilot_credit_ops")
+        store = _store(self.dsn)
+        try:
+            with self.assertRaises(Exception):
+                store.reserve_credit(
+                    USER_ID, 1, REASON_SPEND, REF, release_reason=REASON_RELEASE
+                )
+        finally:
+            store._store.close()
+        # No credit was taken and nothing was written.
+        self.assertEqual(_balance(self.dsn), BALANCE)
+        self.assertEqual(_journal(self.dsn), [])
+        # The table comes back for the other tests.
+        _reset(self.dsn)
 
 
 if __name__ == "__main__":

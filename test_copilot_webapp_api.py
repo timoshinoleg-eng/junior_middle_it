@@ -165,16 +165,16 @@ class FakeStore:
                 counts[reason] = counts.get(reason, 0) + 1
         return counts
 
-    def credit_operation_state(self, user_id, ref, kind):
-        # This store has no operation registry, so the state of a costed
-        # operation is read from the journal.
+    def credit_operation_state(self, user_id, ref, kind, **reasons):
+        # This store has no operation registry, so the operation does not
+        # exist yet.
         return None
 
-    def confirm_credit_operation(self, user_id, ref, kind, reason):
+    def confirm_credit_operation(self, user_id, ref, kind, reason, *, attempt=None):
         self.events.append((int(user_id), 0, reason, ref))
         return True
 
-    def mark_credit_operation_unknown(self, user_id, ref, kind, reason):
+    def mark_credit_operation_unknown(self, user_id, ref, kind, reason, *, attempt=None):
         self.events.append((int(user_id), 0, reason, ref))
         return True
 

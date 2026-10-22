@@ -180,20 +180,14 @@ class FakeGrowthStore:
         elif "op_unknown AS" in sql:
             self._guard("journal")
             self._rows = self._settle_operation(values, "unknown")
-        elif "SELECT state FROM growth_copilot_credit_ops" in sql:
+        elif "adopted AS" in sql:
             self._rows = self._operation_state(values)
-        elif "WITH debit AS" in sql:
-            self._guard("debit")
-            self._rows = self._reserve(values)
         elif "WITH credit AS" in sql:
             self._guard("grant_with_event")
             self._rows = self._grant_with_event(values)
         elif "WITH slot AS" in sql:
             self._guard("budget")
             self._rows = self._reserve_llm_attempt(values)
-        elif "WITH refund AS" in sql:
-            self._guard("refund")
-            self._rows = self._refund(values)
         elif "WITH granted AS" in sql:
             self._guard("grant")
             self._rows = self._grant(values)
@@ -259,32 +253,44 @@ class FakeGrowthStore:
         self.events.append((user_id, amount, reason, ref))
         return [(1,)]
 
-    def _reserve(self, values):
-        amount = int(values[0])
-        user_id = int(values[1])
-        ref = str(values[4])
-        reason = str(values[5])
-        release_reason = str(values[8])
-        spends = self._count_events(user_id, reason, ref)
-        releases = self._count_events(user_id, release_reason, ref)
-        if spends > releases:
-            return []
-        if self._balance(user_id) < amount:
-            return []
-        self.credits[user_id] = self._balance(user_id) - amount
-        self.events.append((user_id, -amount, reason, ref))
-        return [(1,)]
-
-    # -- the registry of the operations ---------------------------
     def _operation_key(self, user_id, ref, kind):
         return (int(user_id), str(ref), str(kind))
 
     def _operation_state(self, values):
-        key = self._operation_key(values[0], values[1], values[2])
+        """The state of an operation, with the adoption of the journal.
+
+        An operation that the previous code left in the journal is adopted
+        into the registry here, so a user who paid for it before the
+        migration is not charged for it again and the credit of such an
+        operation can be given back.
+        """
+        spend_reason = str(values[0])
+        release_reason = str(values[1])
+        delivered_reason = str(values[2])
+        unknown_reason = str(values[3])
+        user_id = int(values[4])
+        ref = str(values[5])
+        kind = str(values[6])
+        key = self._operation_key(user_id, ref, kind)
         row = self.ops.get(key)
-        if not row:
-            return []
-        return [(row["state"],)]
+        if row is None:
+            spends = self._count_events(user_id, spend_reason, ref)
+            if not spends:
+                return []
+            releases = self._count_events(user_id, release_reason, ref)
+            delivered = self._count_events(user_id, delivered_reason, ref)
+            ambiguous = self._count_events(user_id, unknown_reason, ref)
+            if delivered:
+                state = "delivered"
+            elif ambiguous:
+                state = "unknown"
+            elif spends > releases:
+                state = "reserved"
+            else:
+                state = "released"
+            row = {"state": state, "amount": 1, "attempt": spends}
+            self.ops[key] = row
+        return [(row["state"], row["attempt"])]
 
     def _reserve_operation(self, values):
         """The reservation of the registry.
@@ -307,7 +313,7 @@ class FakeGrowthStore:
         self.ops[key] = {"state": "reserved", "amount": amount, "attempt": attempt}
         self.credits[user_id] = self._balance(user_id) - amount
         self.events.append((user_id, -amount, kind, ref))
-        return [(len(self.events),)]
+        return [(attempt,)]
 
     def _release_operation(self, values):
         """The release of the registry.
@@ -318,26 +324,28 @@ class FakeGrowthStore:
         user_id = int(values[0])
         ref = str(values[2])
         kind = str(values[3])
-        amount = int(values[4])
-        reason = str(values[8])
+        attempt = int(values[4])
+        amount = int(values[5])
+        reason = str(values[9])
         key = self._operation_key(user_id, ref, kind)
         row = self.ops.get(key)
-        if not row or row["state"] != "reserved":
+        if not row or row["state"] != "reserved" or row["attempt"] != attempt:
             return []
         row["state"] = "released"
         self.credits[user_id] = self._balance(user_id) + amount
         self.events.append((user_id, amount, reason, ref))
-        return [(len(self.events),)]
+        return [(attempt,)]
 
     def _settle_operation(self, values, state):
         """The end of an operation: delivered or of an unknown outcome."""
         user_id = int(values[0])
         ref = str(values[1])
         kind = str(values[2])
-        reason = str(values[4])
+        attempt = int(values[3])
+        reason = str(values[5])
         key = self._operation_key(user_id, ref, kind)
         row = self.ops.get(key)
-        if not row:
+        if not row or row["attempt"] != attempt:
             return []
         if state == "delivered":
             if row["state"] not in ("reserved", "unknown"):
@@ -346,21 +354,7 @@ class FakeGrowthStore:
             return []
         row["state"] = state
         self.events.append((user_id, 0, reason, ref))
-        return [(len(self.events),)]
-
-    def _refund(self, values):
-        amount = int(values[0])
-        user_id = int(values[1])
-        ref = str(values[3])
-        reserved_reason = str(values[4])
-        reason = str(values[7])
-        spends = self._count_events(user_id, reserved_reason, ref)
-        releases = self._count_events(user_id, reason, ref)
-        if spends <= releases:
-            return []
-        self.credits[user_id] = self._balance(user_id) + amount
-        self.events.append((user_id, amount, reason, ref))
-        return [(1,)]
+        return [(attempt,)]
 
     def _log_event(self, values):
         user_id = int(values[0])

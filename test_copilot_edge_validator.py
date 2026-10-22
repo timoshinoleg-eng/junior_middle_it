@@ -156,12 +156,14 @@ def _statements():
         credit_cases.JOB["hash"],
         credit_ops.REASON_SPEND,
         credit_ops.REASON_DELIVERED,
+        attempt=1,
     )
     store.mark_credit_operation_unknown(
         42,
         credit_cases.JOB["hash"],
         credit_ops.REASON_SPEND,
         credit_ops.REASON_UNKNOWN,
+        attempt=1,
     )
     manager = copilot_credits.CreditManager(store)
     manager.reserve_llm_call(42, credit_cases.JOB["hash"])
