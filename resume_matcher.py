@@ -248,35 +248,86 @@ def analyze_resume_match(resume_text: str, job: Dict) -> ResumeMatchReport:
 
 
 def format_resume_match_report(report: ResumeMatchReport, job: Dict) -> str:
-    title = str(job.get("title") or "вакансия")
-    company = str(job.get("company") or "").strip()
+    """Actionable, evidence-based Russian report for TEXT and DOCUMENT paths.
+
+    Never invent experience, seniority, results or a job requirement. All
+    statements are grounded in detected skill names and public vacancy fields.
+    Telegram messages must remain below the 4096-character limit.
+    """
+    title = str(job.get("title") or "вакансия").strip()[:110]
+    company = str(job.get("company") or "").strip()[:70]
     heading = f"{title} · {company}" if company else title
+    found_count = len(report.matched_skills)
+    required_count = len(report.required_skills)
+    confidence_low = required_count < 3 or report.keyword_overlap_pct < 10
+    if confidence_low:
+        confidence = "низкая — в вакансии мало извлечённых требований или нет достаточного совпадения текста"
+    elif report.keyword_overlap_pct < 35 or required_count < 5:
+        confidence = "средняя — учитываются только явные навыки и слова из текстов"
+    else:
+        confidence = "умеренная — сопоставлены явно названные навыки и обязанности"
 
     lines = [
         f"📄 Resume Match: {report.score}%",
         heading,
         "",
-        "Это эвристическая оценка по тексту вакансии, не официальный ATS-score.",
+        "Это ориентир для адаптации резюме, не официальный ATS-score и не вероятность найма.",
+        f"🔎 Уверенность: {confidence}.",
+        "",
+        "1. Что удалось проверить",
+        f"• Навыки вакансии: {required_count}; найдены в резюме: {found_count}.",
+        f"• Пересечение ключевых слов: {report.keyword_overlap_pct}%.",
+        "• Совпадение целевой роли: " + ("обнаружено." if report.role_overlap else "не удалось подтвердить."),
     ]
     if report.matched_skills:
-        lines.append("✅ Совпадает: " + ", ".join(report.matched_skills[:8]))
+        lines.append("• Подтверждено текстом: " + ", ".join(report.matched_skills[:8]) + ".")
+    else:
+        lines.append("• Явных совпадающих технологий не найдено.")
     if report.missing_skills:
-        lines.append("⚠️ Не нашёл в резюме: " + ", ".join(report.missing_skills[:8]))
-    if len(report.required_skills) < 3 or report.keyword_overlap_pct < 10:
+        lines.append("• В вакансии есть, но в резюме не найдено: " + ", ".join(report.missing_skills[:8]) + ".")
+    elif required_count:
+        lines.append("• Все распознанные технологии вакансии упомянуты в резюме.")
+    else:
+        lines.append("• Из вакансии не удалось надёжно выделить технологии: оценка неполная.")
+
+    lines.extend(["", "2. Что мешает отклику"])
+    if report.missing_skills:
         lines.append(
-            "⚠️ Низкая уверенность оценки: мало подтверждённых требований "
-            "или почти нет совпадения текста. Не используйте процент "
-            "как вероятность найма."
+            "• Требуют проверки реальные примеры работы с: "
+            + ", ".join(report.missing_skills[:3])
+            + ". Упоминай эти навыки только если действительно применял их."
+        )
+    if report.keyword_overlap_pct < 35:
+        lines.append("• Описание опыта использует мало терминов из вакансии: работодателю сложнее увидеть релевантность.")
+    if not report.role_overlap:
+        lines.append("• Из текста не очевидно, что ты претендуешь именно на указанную роль.")
+    if not report.missing_skills and report.keyword_overlap_pct >= 35 and report.role_overlap:
+        lines.append("• Явных текстовых пробелов немного; убедись, что навыки подтверждены проектами, а не только перечислены.")
+
+    lines.extend(["", "3. Как улучшить резюме перед отправкой"])
+    if not report.role_overlap:
+        lines.append(f"• Заголовок: укажи роль «{title}», только если она соответствует твоему опыту.")
+    if report.matched_skills:
+        names = ", ".join(report.matched_skills[:3])
+        lines.append(
+            "• Подними выше проект с подтверждёнными технологиями: " + names + "."
         )
         lines.append(
-            f"Найдено требований: {len(report.required_skills)}, "
-            f"совпало навыков: {len(report.matched_skills)}."
+            f"• Шаблон достижения: «В [проекте] использовал {names} "
+            "для [реальной задачи]; результат — [твой измеримый эффект]»."
         )
-    lines.append(f"🔎 Пересечение ключевых слов: {report.keyword_overlap_pct}%")
-    lines.append("")
-    lines.append("Что улучшить перед откликом:")
-    for item in report.recommendations:
-        lines.append("• " + item)
-    lines.append("")
-    lines.append("Текст резюме не сохранялся.")
+    else:
+        lines.append("• Добавь 1–2 релевантных проекта: конкретная задача → личные действия → применённый инструмент → результат.")
+    if report.missing_skills:
+        lines.append(
+            "• Для пробелов покажи смежный опыт или план изучения, "
+            "но не заявляй неподтверждённые компетенции."
+        )
+    lines.extend([
+        "• Проверь, что первые 5–7 строк содержат релевантную роль, стек и сильнейшее достижение.",
+        "",
+        "4. Что важно понимать",
+        "Алгоритм не проверяет правдивость опыта, глубину владения навыками, требования по стажу и условия работы.",
+        "Текст резюме не сохранялся.",
+    ])
     return "\n".join(lines)[:3900]
