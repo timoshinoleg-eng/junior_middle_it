@@ -191,10 +191,10 @@ class JobBot(referral.JobBot):
 
         def encode_resume(session):
             # Never serialize the vacancy payload or any resume content here.
-            return {
-                "job_hash": str((session or {}).get("job_hash") or "")[:100],
-                "market_example": bool((session or {}).get("market_example")),
-            }
+            encoded = {"job_hash": str((session or {}).get("job_hash") or "")[:100]}
+            if (session or {}).get("market_example"):
+                encoded["market_example"] = True
+            return encoded
 
         def decode_resume(state):
             job_hash = str(state.get("job_hash") or "")[:100]
