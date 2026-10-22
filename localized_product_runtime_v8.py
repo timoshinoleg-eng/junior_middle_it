@@ -336,9 +336,9 @@ class JobBot(base.JobBot):
             daily=t(language, "on" if settings["digest_enabled"] else "off"),
             searches=search_count,
         )
-        explanation = t(language, "alerts_explain") + "\\n\\n" + t(language, "daily_explain")
+        explanation = t(language, "alerts_explain") + "\n\n" + t(language, "daily_explain")
         await update.message.reply_text(
-            f"{title}\\n\\n{status}\\n\\n{explanation}",
+            f"{title}\n\n{status}\n\n{explanation}",
             reply_markup=self._retention_keyboard_from_state(
                 language, settings, _SearchCount(search_count)
             ),
