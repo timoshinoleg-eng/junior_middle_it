@@ -1380,6 +1380,16 @@ def _unmatched_resume_text(self, update) -> bool:
         return False
     if copilot_forward.looks_like_resume(text):
         return True
+    # A pasted resume without literal #resume, CV or section markers
+    # is still a user text that deserves an actionable reply. Preserve
+    # vacancy-forward handling for messages that are actually forwarded
+    # or contain a link; do not persist or analyze their content as a CV.
+    if not copilot_forward.is_forward_candidate(
+        text,
+        forwarded=bool(getattr(message, "forward_date", None)),
+        has_document=False,
+    ):
+        return True
     sample = text.casefold()
     signals = (
         "опыт работы", "мои навыки", "образование", "контактная информация",
