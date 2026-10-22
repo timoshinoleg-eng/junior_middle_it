@@ -46,9 +46,9 @@ _durable_finalize_failures: ContextVar[int] = ContextVar("durable_finalize_failu
 _durable_probe_probes: ContextVar[int] = ContextVar("durable_probe_probes", default=0)
 _durable_probe_unavailable: ContextVar[int] = ContextVar("durable_probe_unavailable", default=0)
 _TRUE_VALUES = {"1", "true", "yes", "on"}
-# Bounded probe budget: the ledger call is remote, so the cycle never turns into
-# a full candidate sweep. The publication cap keeps the tail short in practice.
-_PROBE_MAX_CANDIDATES = 24
+# Bounded ledger-probe budget: cover the full expected candidate batch, not
+# just the first 24 encountered sources. Keep concurrency bounded.
+_PROBE_MAX_CANDIDATES = 48
 _PROBE_CONCURRENCY = 6
 _PROBE_TIMEOUT = 8.0
 
@@ -281,11 +281,12 @@ async def filter_candidates_by_durable_state(candidates):
     if not pending or not _durable_probe_available():
         return pending
 
-    # Only the highest ranked candidates can consume a slot, so the remote
-    # budget is spent there. Everything past the budget stays publishable and
-    # keeps its historical behaviour.
-    budget = pending[:_PROBE_MAX_CANDIDATES]
-    ranked = sorted(budget, key=core.job_quality_score, reverse=True)
+    # Selection later ranks by quality across ALL sources, not input order.
+    # Probe the highest-ranked candidates (up to the bounded budget) before
+    # consuming a publication slot; late-source duplicates must not displace
+    # genuinely new jobs. The ledger at send time remains authoritative.
+    ranked = sorted(pending, key=core.job_quality_score, reverse=True)[:_PROBE_MAX_CANDIDATES]
+    budget = ranked
     semaphore = asyncio.Semaphore(_PROBE_CONCURRENCY)
 
     async def probe(job):
