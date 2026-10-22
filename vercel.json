@@ -20,6 +20,10 @@
       "destination": "/api/webhook_admin"
     },
     {
+      "source": "/api/copilot/pdf",
+      "destination": "/api/copilot?__copilot_route=pdf"
+    },
+    {
       "source": "/copilot",
       "destination": "/miniapp/index.html"
     }
