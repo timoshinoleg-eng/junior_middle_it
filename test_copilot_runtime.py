@@ -432,6 +432,71 @@ class CopilotForwardRuntimeTests(unittest.TestCase):
         self.assertEqual(message.replies, [])
         original.assert_awaited_once()
 
+    def test_plain_resume_without_selected_vacancy_explains_next_step(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        resume_text = (
+            "Резюме: Python разработчик. Опыт работы 3 года, "
+            "образование техническое, мои навыки Python и PostgreSQL. "
+            "Оптимизировал обработку заказов в команде разработки."
+        )
+        message = FakeMessage(text=resume_text)
+        bot = FakeBot(FakeDb(JOB))
+        update = FakeUpdate(message=message)
+        original = AsyncMock()
+        with patch.dict(os.environ, {"COPILOT_ENABLED": "true"}, clear=False), patch.object(
+            copilot_runtime, "_original_handle_setup_text", new=original
+        ):
+            asyncio.run(copilot_runtime._copilot_handle_setup_text(
+                bot, update, SimpleNamespace()
+            ))
+        self.assertEqual(len(message.replies), 1)
+        self.assertIn("вакансия не выбрана", message.replies[0][0])
+        self.assertEqual(
+            message.replies[0][1]["reply_markup"].inline_keyboard[0][0].callback_data,
+            "growth_quick_fresh",
+        )
+        original.assert_not_awaited()
+        self.assertFalse(bot.db.events)
+
+    def test_resume_match_session_keeps_own_text_handler(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        message = FakeMessage(
+            text="Опыт работы 3 года. Образование, Python, FastAPI и PostgreSQL. "
+                 "Резюме, опыт работы над проектами, мои навыки в тестировании."
+        )
+        bot = FakeBot(FakeDb(JOB))
+        bot.resume_sessions = {4242: {"job_hash": JOB["hash"], "job": JOB}}
+        update = FakeUpdate(message=message)
+        original = AsyncMock()
+        with patch.dict(os.environ, {"COPILOT_ENABLED": "true"}, clear=False), patch.object(
+            copilot_runtime, "_original_handle_setup_text", new=original
+        ):
+            asyncio.run(copilot_runtime._copilot_handle_setup_text(
+                bot, update, SimpleNamespace()
+            ))
+        original.assert_awaited_once()
+        self.assertEqual(message.replies, [])
+
+    def test_setup_wizard_keeps_own_text_handler(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        message = FakeMessage(text="Резюме и опыт работы и обучение, профессиональный опыт.")
+        bot = FakeBot(FakeDb(JOB))
+        bot.setup_steps = {4242: "skills"}
+        original = AsyncMock()
+        with patch.dict(os.environ, {"COPILOT_ENABLED": "true"}, clear=False), patch.object(
+            copilot_runtime, "_original_handle_setup_text", new=original
+        ):
+            asyncio.run(copilot_runtime._copilot_handle_setup_text(
+                bot, FakeUpdate(message=message), SimpleNamespace()
+            ))
+        original.assert_awaited_once()
+
     def test_resume_forward_is_refused(self):
         from datetime import datetime, timezone
 
