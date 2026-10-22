@@ -760,6 +760,50 @@ class CreditConcurrencyTests(unittest.TestCase):
             self.assertEqual(conn.execute(HISTORICAL_CREDIT_REFS_QUERY).fetchall(), [])
             self.assertEqual(conn.execute(EMPTY_CREDIT_REFS_QUERY).fetchall(), [])
 
+    def test_audit_covers_paid_operations_only(self):
+        """Free grants carry no reference on purpose and must not block the release."""
+        import psycopg
+        from tools.verify_release_v7 import HISTORICAL_CREDIT_REFS_QUERY, EMPTY_CREDIT_REFS_QUERY
+        _reset(self.dsn)
+        valid_ref = "b" * 40
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            # A daily grant, a referral bonus and an attempt of the model are
+            # not paid operations: they have no vacancy and need no mapping.
+            conn.execute(
+                "INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref) "
+                "VALUES (%s, 3, 'daily_grant', '')", (USER_ID,))
+            conn.execute(
+                "INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref) "
+                "VALUES (%s, 5, 'referral', '')", (USER_ID,))
+            conn.execute(
+                "INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref) "
+                "VALUES (%s, 0, 'llm_attempt', '')", (USER_ID,))
+            # A paid operation with a job hash is mapped and stays silent.
+            conn.execute(
+                "INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref) "
+                "VALUES (%s, -1, 'spend', %s)", (USER_ID, valid_ref))
+            self.assertEqual(conn.execute(HISTORICAL_CREDIT_REFS_QUERY).fetchall(), [])
+            self.assertEqual(conn.execute(EMPTY_CREDIT_REFS_QUERY).fetchall(), [])
+
+            # A paid operation with a legacy reference blocks the release.
+            conn.execute(
+                "INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref) "
+                "VALUES (%s, -1, 'spend', 'cv')", (USER_ID,))
+            legacy = conn.execute(HISTORICAL_CREDIT_REFS_QUERY).fetchall()
+            self.assertEqual([(row[0], row[1], row[2]) for row in legacy], [("cv", "spend", 1)])
+            # The free grants stay invisible in the same journal.
+            self.assertEqual(conn.execute(EMPTY_CREDIT_REFS_QUERY).fetchall(), [])
+
+            # A paid operation without any reference blocks the release too.
+            conn.execute(
+                "INSERT INTO growth_copilot_credit_events (user_id, delta, reason, ref) "
+                "VALUES (%s, -1, 'llm_call', '')", (USER_ID,))
+            empty = conn.execute(EMPTY_CREDIT_REFS_QUERY).fetchall()
+            self.assertEqual([(row[0], row[1], row[2]) for row in empty], [("", "llm_call", 1)])
+            # Only the paid entries are reported, the free ones never are.
+            reasons = {row[1] for row in legacy} | {row[1] for row in empty}
+            self.assertEqual(reasons, {"spend", "llm_call"})
+
     def _abandoned(self, kind, *, stale=True):
         import psycopg
         _reset(self.dsn)

@@ -56,20 +56,39 @@ EXPECTED_TABLES = (
     "growth_copilot_rate_limits",
 )
 
+# The audit below maps the paid operations of the journal to a job hash. The
+# free grants and the budget of the model are not paid operations: a daily
+# grant and a referral bonus carry an empty reference on purpose, and an
+# attempt of the model costs the operator, not the user. Auditing those rows
+# would block the release over a reference that needs no mapping at all.
+PAID_OPERATION_REASONS = (
+    "spend",
+    "spend_release",
+    "cv_delivered",
+    "cv_delivery_unknown",
+    "llm_call",
+    "llm_call_release",
+    "llm_delivered",
+    "llm_delivery_unknown",
+)
+PAID_OPERATION_REASON_LIST = ", ".join("'%s'" % reason for reason in PAID_OPERATION_REASONS)
+
 HISTORICAL_CREDIT_REFS_QUERY = """SELECT ref, reason, count(*) AS events,
        min(created_at) AS first_seen, max(created_at) AS last_seen
 FROM public.growth_copilot_credit_events
-WHERE ref IS DISTINCT FROM ''
+WHERE reason IN (%s)
+  AND ref IS DISTINCT FROM ''
   AND ref !~ '^[0-9a-f]{40}$'
 GROUP BY ref, reason
-ORDER BY events DESC;"""
+ORDER BY events DESC;""" % PAID_OPERATION_REASON_LIST
 
 EMPTY_CREDIT_REFS_QUERY = """SELECT ref, reason, count(*) AS events,
        min(created_at) AS first_seen, max(created_at) AS last_seen
 FROM public.growth_copilot_credit_events
-WHERE ref = '' OR ref IS NULL
+WHERE reason IN (%s)
+  AND (ref = '' OR ref IS NULL)
 GROUP BY ref, reason
-ORDER BY events DESC;"""
+ORDER BY events DESC;""" % PAID_OPERATION_REASON_LIST
 
 
 def check_historical_credit_refs(results, url, headers):
@@ -90,7 +109,7 @@ def check_historical_credit_refs(results, url, headers):
                 # Do not print arbitrary historical refs: they may contain private data.
                 label = repr(ref) if ref in ("cv", "pdf", "", None) else "<unmapped reference>"
                 findings.append("%s: %d events" % (label, events))
-            detail = ("Pre-P13 release blocked; owner-approved mapping required: " + "; ".join(findings)) if findings else "Pre-P13 reference audit passed"
+            detail = ("Pre-P13 release blocked; owner-approved mapping required: " + "; ".join(findings)) if findings else "Pre-P13 paid-operation reference audit passed"
             result = FAIL if findings else PASS
         except (ValueError, TypeError, KeyError, OverflowError):
             detail = "Pre-P13 reference audit not confirmed (HTTP %s); release blocked" % status

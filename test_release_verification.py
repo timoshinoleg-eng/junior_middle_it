@@ -331,6 +331,69 @@ class HistoricalCreditReferenceTests(unittest.TestCase):
         self.assertEqual(statuses["supabase.copilot_empty_refs"], verify.FAIL)
 
 
+class PaidOperationAuditScopeTests(unittest.TestCase):
+    """The audit maps paid operations to a job hash and nothing else."""
+
+    def test_paid_operation_reasons_match_the_code(self):
+        from copilot import credit_operations, credits as copilot_credits
+        expected = {
+            credit_operations.REASON_SPEND,
+            credit_operations.REASON_RELEASE,
+            credit_operations.REASON_DELIVERED,
+            credit_operations.REASON_UNKNOWN,
+            credit_operations.REASON_LLM_SPEND,
+            credit_operations.REASON_LLM_RELEASE,
+            credit_operations.REASON_LLM_DELIVERED,
+            credit_operations.REASON_LLM_UNKNOWN,
+        }
+        self.assertEqual(set(verify.PAID_OPERATION_REASONS), expected)
+
+    def test_free_reasons_stay_out_of_the_audit(self):
+        from copilot import credits as copilot_credits
+        for free in (copilot_credits.REASON_DAILY_GRANT,
+                     copilot_credits.REASON_REFERRAL,
+                     copilot_credits.REASON_LLM_ATTEMPT):
+            self.assertNotIn(free, verify.PAID_OPERATION_REASONS)
+
+    def test_audit_queries_filter_paid_operations_only(self):
+        for query in (verify.HISTORICAL_CREDIT_REFS_QUERY, verify.EMPTY_CREDIT_REFS_QUERY):
+            self.assertIn("reason IN (", query)
+            for reason in verify.PAID_OPERATION_REASONS:
+                self.assertIn("'%s'" % reason, query)
+            for free in ("daily_grant", "referral", "llm_attempt"):
+                self.assertNotIn("'%s'" % free, query)
+
+    def test_empty_reference_predicate_has_explicit_parentheses(self):
+        self.assertIn("(ref = '' OR ref IS NULL)", verify.EMPTY_CREDIT_REFS_QUERY)
+        self.assertIn("ref IS DISTINCT FROM ''", verify.HISTORICAL_CREDIT_REFS_QUERY)
+
+
+class CutoverAuditSqlTests(unittest.TestCase):
+    """The procedure and the runbook must run the very same audit."""
+
+    DOCS = Path(__file__).resolve().parent / "docs"
+
+    def _sql_blocks(self, name):
+        text = (self.DOCS / name).read_text(encoding="utf-8")
+        return [" ".join(block.split()) for block in re.findall(r"```sql\n(.*?)```", text, re.DOTALL)]
+
+    def _assert_contains_the_verifier_queries(self, name):
+        blocks = self._sql_blocks(name)
+        self.assertTrue(blocks, "%s must contain the audit queries" % name)
+        for query in (verify.HISTORICAL_CREDIT_REFS_QUERY, verify.EMPTY_CREDIT_REFS_QUERY):
+            wanted = " ".join(query.split())
+            self.assertTrue(
+                any(wanted in block for block in blocks),
+                "%s must contain the audit query of the release verifier" % name,
+            )
+
+    def test_cutover_document_uses_the_verifier_queries(self):
+        self._assert_contains_the_verifier_queries("P13_CUTOVER.md")
+
+    def test_runbook_uses_the_verifier_queries(self):
+        self._assert_contains_the_verifier_queries("RELEASE_RUNBOOK_v7.0.md")
+
+
 class HistoricalReferenceIntegrationTests(unittest.TestCase):
     def test_reference_audit_is_a_required_release_check(self):
         for ref in ("cv", "pdf", "", None):
@@ -339,7 +402,7 @@ class HistoricalReferenceIntegrationTests(unittest.TestCase):
                     query = json.loads(kwargs["body"])["query"]
                     if "ref IS DISTINCT FROM ''" in query:
                         rows = [{"ref": ref, "events": 1}] if ref in ("cv", "pdf") else []
-                    elif "WHERE ref = '' OR ref IS NULL" in query:
+                    elif "(ref = '' OR ref IS NULL)" in query:
                         rows = [{"ref": "", "events": 1}] if ref == "" else []
                     elif "information_schema.columns" in query:
                         rows = [dict(verify.EXPECTED_P14_CLAIM_COLUMN)]
