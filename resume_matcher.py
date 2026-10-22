@@ -272,7 +272,7 @@ def format_resume_match_report(report: ResumeMatchReport, job: Dict) -> str:
         heading,
         "",
         "Это ориентир для адаптации резюме, не официальный ATS-score и не вероятность найма.",
-        f"🔎 Уверенность: {confidence}.",
+        ("⚠️ Низкая уверенность: " + confidence + "." if confidence_low else f"🔎 Уверенность: {confidence}."),
         "",
         "1. Что удалось проверить",
         f"• Навыки вакансии: {required_count}; найдены в резюме: {found_count}.",
