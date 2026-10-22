@@ -210,9 +210,40 @@ class JobMessageFormatter(_BaseJobMessageFormatter):
             return ""
         return f"ℹ️ _{self._escape_markdown_v2(' · '.join(hints))}_"
 
+    def _job_skill_tags(self, job: dict) -> list[str]:
+        """Show only supplied tags, without inferring qualifications from a title."""
+        raw = job.get("tags")
+        if not isinstance(raw, (list, tuple)):
+            return []
+        tags = []
+        seen = set()
+        for value in raw:
+            if not isinstance(value, str):
+                continue
+            tag = re.sub(r"\\s+", " ", value).strip()[:35]
+            if len(tag) < 2 or tag.casefold() in seen:
+                continue
+            tags.append(tag)
+            seen.add(tag.casefold())
+            if len(tags) == 4:
+                break
+        return tags
+
+    def _source_credit(self, job: dict, *, include_source: bool) -> str:
+        """The public message itself identifies where data came from."""
+        source = str(job.get("source") or "").strip()
+        if source == "Remote Landers":
+            # Provider attribution and source URL are part of their API terms.
+            return "[Job data provided by Remote Landers](https://remotelanders.com)"
+        if source in {"", "Test", "internal", "Unknown"}:
+            return ""
+        # Real provenance belongs on *compact* channel cards too.
+        return "_Источник: " + self._escape_markdown_v2(source[:90]) + "_"
+
     def _format_channel_card(self, job: dict, *, summary_chars: int, include_source: bool) -> str:
-        title = str(job.get("title") or "IT-вакансия").strip()
-        company = str(job.get("company") or "Компания не указана").strip()
+        """Fact-only mobile editorial card; public actions stay in inline keyboard."""
+        title = str(job.get("title") or "IT-вакансия").strip()[:220]
+        company = str(job.get("company") or "Компания не указана").strip()[:130]
         summary = self._clean_summary(job, summary_chars)
 
         lines = [
@@ -225,34 +256,25 @@ class JobMessageFormatter(_BaseJobMessageFormatter):
             self._format_channel_salary(job),
         ]
 
+        job_type = str(job.get("employment_type") or "").strip()[:70]
+        if job_type:
+            lines.append("💼 " + self._escape_markdown_v2(job_type))
         freshness = self._format_freshness(job)
         if freshness:
             lines.append(freshness)
+        skills = self._job_skill_tags(job)
+        if skills:
+            lines.append("🧰 " + self._escape_markdown_v2(" · ".join(skills)))
         hint = self._quality_hint(job)
         if hint:
             lines.append(hint)
         if summary:
-            lines.extend(["", f"📌 {self._escape_markdown_v2(summary)}"])
-        skills = [
-            str(value).strip()[:30]
-            for value in (job.get("tags") or [])
-            if isinstance(value, str) and value.strip()
-        ]
-        if skills:
-            lines.append("🧰 " + self._escape_markdown_v2(" · ".join(dict.fromkeys(skills[:4]))))
-        job_type = str(job.get("employment_type") or "").strip()
-        if job_type:
-            lines.append("🕒 " + self._escape_markdown_v2(job_type[:70]))
-        source_key = str(job.get("source") or "").strip()
-        credited = {"RemoteJobs.org", "Remote Landers", "Himalayas", "Remotive", "RemoteOK", "Jobicy"}
-        if source_key == "Remote Landers":
-            lines.extend(["", "[Job data provided by Remote Landers](https://remotelanders.com)"])
-        elif source_key in credited:
-            lines.extend(["", "_Источник: " + self._escape_markdown_v2(source_key) + "_"])
-        elif include_source:
-            source = source_key
-            if source:
-                lines.extend(["", f"_Источник: {self._escape_markdown_v2(source)}_"])
+            # The extract comes directly from the source. Never invent duties.
+            lines.extend(["", "*О вакансии*", self._escape_markdown_v2(summary)])
+
+        source = self._source_credit(job, include_source=include_source)
+        if source:
+            lines.extend(["", source])
         return "\n".join(lines)
 
     def _format_compact(self, job: dict) -> str:
