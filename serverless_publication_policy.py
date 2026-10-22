@@ -22,7 +22,8 @@ from growth_utils import SOURCE_DATE_FIELDS
 _ORIGINAL_IS_SUITABLE_JOB = core.is_suitable_job
 _ORIGINAL_EMERGENCY_MAX_POSTS = core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE
 _DEFAULT_MAX_AGE_DAYS = 7
-_DEFAULT_MAX_POSTS_PER_CYCLE = 8
+_DEFAULT_MAX_POSTS_PER_CYCLE = 7
+_SCHEDULED_CYCLES_PER_DAY = 4  # .github/workflows/vercel-cron.yml
 _MAX_REASONABLE_FUTURE_SKEW = timedelta(hours=6)
 
 _stats = {
@@ -67,6 +68,17 @@ def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     except ValueError:
         value = default
     return max(minimum, min(value, maximum))
+
+
+def _cycle_max_posts() -> int:
+    # Four GitHub Actions scheduled windows x seven jobs = at most 28 scheduled
+    # posts/day. This is NOT a cross-invocation quota for manual triggers.
+    return _env_int(
+        "SERVERLESS_MAX_POSTS_PER_CYCLE",
+        _DEFAULT_MAX_POSTS_PER_CYCLE,
+        minimum=1,
+        maximum=7,
+    )
 
 
 def _bounded_days(value: object, default: int) -> int:
@@ -218,12 +230,8 @@ def publication_policy_snapshot() -> dict:
     return {
         **_stats,
         "max_job_age_days": _default_max_age_days(),
-        "max_posts_per_cycle": _env_int(
-            "SERVERLESS_MAX_POSTS_PER_CYCLE",
-            _DEFAULT_MAX_POSTS_PER_CYCLE,
-            minimum=1,
-            maximum=20,
-        ),
+        "max_posts_per_cycle": _cycle_max_posts(),
+        "scheduled_daily_ceiling": _SCHEDULED_CYCLES_PER_DAY * _cycle_max_posts(),
         "source_max_age_days_json": os.getenv("SERVERLESS_SOURCE_MAX_AGE_DAYS_JSON", ""),
         "by_source": by_source,
         "unknown_dates_allowed": False,
@@ -238,10 +246,5 @@ def install_serverless_publication_policy() -> bool:
         return False
 
     core.is_suitable_job = _serverless_is_suitable_job
-    core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE = _env_int(
-        "SERVERLESS_MAX_POSTS_PER_CYCLE",
-        _DEFAULT_MAX_POSTS_PER_CYCLE,
-        minimum=1,
-        maximum=20,
-    )
+    core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE = _cycle_max_posts()
     return True

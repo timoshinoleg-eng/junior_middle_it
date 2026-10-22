@@ -1,5 +1,6 @@
 import os
 import unittest
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -139,11 +140,33 @@ class ServerlessPublicationPolicyTests(unittest.TestCase):
         try:
             with patch.dict(os.environ, {"VERCEL": "1", "SERVERLESS_MAX_POSTS_PER_CYCLE": ""}, clear=False):
                 self.assertTrue(policy.install_serverless_publication_policy())
-                self.assertEqual(policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE, 8)
-                self.assertEqual(policy.publication_policy_snapshot()["max_posts_per_cycle"], 8)
+                self.assertEqual(policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE, 7)
+                self.assertEqual(policy.publication_policy_snapshot()["max_posts_per_cycle"], 7)
+                self.assertEqual(policy.publication_policy_snapshot()["scheduled_daily_ceiling"], 28)
         finally:
             policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE = original
             policy.core.is_suitable_job = policy._ORIGINAL_IS_SUITABLE_JOB
+
+    def test_explicit_old_eight_job_override_is_clamped_to_seven(self):
+        original = policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE
+        try:
+            with patch.dict(os.environ, {
+                "VERCEL": "1", "SERVERLESS_MAX_POSTS_PER_CYCLE": "8"
+            }, clear=False):
+                self.assertTrue(policy.install_serverless_publication_policy())
+                self.assertEqual(policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE, 7)
+                snapshot = policy.publication_policy_snapshot()
+                self.assertEqual(snapshot["scheduled_daily_ceiling"], 28)
+        finally:
+            policy.core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE = original
+            policy.core.is_suitable_job = policy._ORIGINAL_IS_SUITABLE_JOB
+
+    def test_scheduled_four_waves_never_exceed_thirty_posts(self):
+        schedule = (Path(__file__).resolve().parent / '.github' / 'workflows' / 'vercel-cron.yml').read_text(encoding='utf-8')
+        cron_lines = [line.strip() for line in schedule.splitlines() if line.strip().startswith('- cron:')]
+        self.assertEqual(len(cron_lines), policy._SCHEDULED_CYCLES_PER_DAY)
+        self.assertEqual(len(set(cron_lines)), 4)
+        self.assertLessEqual(policy.publication_policy_snapshot()['scheduled_daily_ceiling'], 30)
 
     def test_non_vercel_does_not_apply_serverless_policy(self):
         with patch.dict(os.environ, {"VERCEL": ""}, clear=False):
