@@ -15,6 +15,57 @@ from telegram.error import BadRequest
 class DatabaseConnection(base.DatabaseConnection):
     """Single-round-trip setup actions for the request-driven production bot."""
 
+    def fast_start_snapshot(self, user_id: int) -> Dict[str, Any]:
+        """Retrieve /start language, menu switches and saved-search count in one query.
+
+        No writes occur before the first visible reply. In the HTTP-backed
+        webhook the query costs one Edge round-trip instead of three or more.
+        """
+        store = getattr(self, "_growth_store", None)
+        if store is None:
+            settings = self.get_user_settings(user_id)
+            return {
+                "language": self.get_user_language(user_id),
+                "onboarding_done": bool(settings.get("onboarding_done")),
+                "alerts_enabled": bool(settings.get("alerts_enabled")),
+                "digest_enabled": bool(settings.get("digest_enabled")),
+                "search_count": len(self.list_saved_searches(user_id)),
+            }
+
+        with store._ensure_conn().cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE((
+                        SELECT props->>'language'
+                        FROM growth_events
+                        WHERE user_id=%s AND name='language_selected'
+                        ORDER BY ts DESC LIMIT 1
+                    ), '') AS language,
+                    COALESCE(s.onboarding_done, FALSE),
+                    COALESCE(s.alerts_enabled, FALSE),
+                    COALESCE(s.digest_enabled, FALSE),
+                    (
+                        SELECT COUNT(*) FROM growth_saved_searches
+                        WHERE user_id=%s AND enabled=TRUE
+                    )
+                FROM (SELECT %s::bigint AS user_id) incoming
+                LEFT JOIN growth_user_settings s ON s.user_id=incoming.user_id
+                """,
+                (int(user_id), int(user_id), int(user_id)),
+            )
+            row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("start snapshot returned no row")
+        return {
+            "language": str(row[0] or ""),
+            "onboarding_done": bool(row[1]),
+            "alerts_enabled": bool(row[2]),
+            "digest_enabled": bool(row[3]),
+            "search_count": int(row[4] or 0),
+        }
+
+
     def fast_toggle_category(self, user_id: int, category: str) -> tuple[str, list[str]]:
         store = getattr(self, "_growth_store", None)
         all_categories = list(getattr(store, "all_categories", []) or CATEGORY_NAMES["ru"].keys())
@@ -245,6 +296,63 @@ class _SearchCount:
 
 
 class JobBot(base.JobBot):
+    async def cmd_start(self, update, context):
+        """One durable read to render the ordinary start menu.
+
+        Deep-links/referrals retain their existing first-touch implementation.
+        This fast path never changes persistent settings or skips credit rules.
+        """
+        user = getattr(update, "effective_user", None)
+        user_id = getattr(user, "id", None)
+        if not user_id or getattr(context, "args", None):
+            return await super().cmd_start(update, context)
+
+        snapshot = self.db.fast_start_snapshot(user_id)
+        language = str(snapshot.get("language") or "")
+        if not language:
+            await update.message.reply_text(
+                t("ru", "choose_language"),
+                reply_markup=self._language_keyboard(),
+            )
+            try:
+                self.db.log_event(user_id, "start", {"payload": None, "language_pending": True})
+            except Exception as exc:
+                core.logger.warning("Start analytics failed after reply: %s", type(exc).__name__)
+            return
+
+        self._set_cached_language(user_id, language)
+        search_count = int(snapshot.get("search_count") or 0)
+        settings = {
+            "onboarding_done": bool(snapshot.get("onboarding_done")),
+            "alerts_enabled": bool(snapshot.get("alerts_enabled")),
+            "digest_enabled": bool(snapshot.get("digest_enabled")),
+        }
+        title = t(language, "welcome_ready" if settings["onboarding_done"] else "welcome_new")
+        status = t(
+            language,
+            "status",
+            profile=t(language, "ready" if settings["onboarding_done"] else "not_ready"),
+            alerts=t(language, "on" if settings["alerts_enabled"] else "off"),
+            daily=t(language, "on" if settings["digest_enabled"] else "off"),
+            searches=search_count,
+        )
+        explanation = t(language, "alerts_explain") + "\\n\\n" + t(language, "daily_explain")
+        await update.message.reply_text(
+            f"{title}\\n\\n{status}\\n\\n{explanation}",
+            reply_markup=self._retention_keyboard_from_state(
+                language, settings, _SearchCount(search_count)
+            ),
+            disable_web_page_preview=True,
+        )
+        # The visible reply must not wait for optional telemetry or premium
+        # bookkeeping; the latter keeps the existing error-handling contract.
+        try:
+            self.db.log_event(user_id, "p10_hub_view", {"language": language, "searches": search_count})
+            self.db.log_event(user_id, "start", {"payload": None})
+            self.db.maybe_unlock_premium(user_id)
+        except Exception as exc:
+            core.logger.warning("Start bookkeeping failed after reply: %s", type(exc).__name__)
+
     @staticmethod
     def _delivery_prompt(lang: str) -> str:
         if lang == "en":
