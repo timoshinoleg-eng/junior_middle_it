@@ -241,6 +241,32 @@ class FastStartAndSearchTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(sequence, ["reply", "event", "premium"])
 
+    async def test_failed_start_analytics_does_not_replay_delivered_welcome(self):
+        replies = []
+
+        class DB:
+            def get_user_language(self, _uid):
+                return "ru"
+
+            def log_event(self, *_args):
+                raise ConnectionError("analytics backend unavailable")
+
+            def maybe_unlock_premium(self, _uid):
+                raise AssertionError("should not run after event failed")
+
+        bot = object.__new__(localized_product.JobBot)
+        bot.db = DB()
+
+        async def send_hub(_message, _uid):
+            replies.append("sent")
+
+        bot._send_retention_hub = send_hub
+        await bot.cmd_start(
+            SimpleNamespace(effective_user=SimpleNamespace(id=77), message=SimpleNamespace()),
+            SimpleNamespace(args=[]),
+        )
+        self.assertEqual(replies, ["sent"])
+
     async def test_no_recent_profile_matches_shows_explicitly_unmatched_examples(self):
         examples = [
             {"hash": str(i) * 40, "title": f"Job {i}", "category": "development"}
