@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
+import channel_bot as core
 from publication_authority import (
     PublicChannelPublicationDenied,
     install_telegram_channel_publish_guard,
@@ -35,6 +36,19 @@ class PublicationAuthorityTests(unittest.TestCase):
             protected_channel_ids(env),
             {"@junior_middle_it", "@junior_qa", "@junior_dev", "-100123456"},
         )
+
+    def test_render_collector_skips_blocked_channel_posts_before_fetching(self):
+        with patch.dict(
+            "os.environ",
+            {"RENDER_SERVICE_ID": "srv-test", "VERCEL": "", "VERCEL_ENV": ""},
+        ), patch.object(core.Config, "validate", return_value=True), patch.object(
+            core, "configure_webshare_proxy", side_effect=AssertionError("must not crawl")
+        ):
+            result = asyncio.run(core.collect_and_post_once(use_sqlite=False))
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["posted"], 0)
+        self.assertEqual(result["reason"], "vercel_publication_authority")
 
     def test_non_vercel_public_channel_is_blocked_but_dm_is_allowed(self):
         env = {"CHANNEL_ID": "@junior_middle_it"}
