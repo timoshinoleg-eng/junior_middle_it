@@ -67,6 +67,7 @@ jobs:
             test_publication_authority \
             test_stage0_post_fixes \
             test_message_formatter_growth \
+            test_editorial_channel_cards \
             test_growth_p1 \
             test_resume_matcher \
             test_resume_detail_latency \
