@@ -405,6 +405,33 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 claim.assert_not_called()
         self.assertEqual(spr._durable_probe_probes.get(), 0)
 
+    async def test_pre_selection_probes_late_high_ranked_duplicates_before_cap(self):
+        # The previous 24-item prefix missed late-source published jobs;
+        # two duplicate Greenhouse slots were wasted in production.
+        jobs = [{"hash": f"h{index}", "score": index} for index in range(29)]
+        duplicates = {"h25", "h27"}
+
+        def claim(job_hash, _job):
+            return SimpleNamespace(
+                claimed=job_hash not in duplicates,
+                claim_token=CLAIM_TOKEN,
+                publication_state="published" if job_hash in duplicates else "pending",
+            )
+
+        with patch.dict(os.environ, self._durable_probe_env(), clear=False), patch.object(
+            spr, "edge_writer_configured", return_value=True
+        ), patch.object(spr.core, "job_quality_score", side_effect=lambda j: j["score"]), patch.object(
+            spr, "claim_job_payload_edge", side_effect=claim
+        ) as claim_mock, patch.object(spr, "release_job_payload_edge", return_value=True) as release:
+            kept = await spr.filter_candidates_by_durable_state(jobs)
+
+        self.assertEqual([job["hash"] for job in kept],
+                         [job["hash"] for job in jobs if job["hash"] not in duplicates])
+        self.assertEqual(claim_mock.call_count, len(jobs))
+        self.assertEqual(release.call_count, len(jobs) - len(duplicates))
+        self.assertEqual(spr._durable_probe_probes.get(), len(jobs))
+        self.assertEqual(spr._durable_probe_unavailable.get(), 0)
+
     async def test_pre_selection_probe_budget_never_drops_uncandidates(self):
         total = spr._PROBE_MAX_CANDIDATES + 6
         jobs = [{"hash": f"h{index}"} for index in range(total)]
@@ -419,7 +446,7 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
             kept = await spr.filter_candidates_by_durable_state(jobs)
 
         self.assertEqual(claim.call_count, spr._PROBE_MAX_CANDIDATES)
-        self.assertEqual([job["hash"] for job in kept], [f"h{index}" for index in range(24, total)])
+        self.assertEqual([job["hash"] for job in kept], [f"h{index}" for index in range(spr._PROBE_MAX_CANDIDATES, total)])
         self.assertEqual(spr._durable_probe_probes.get(), spr._PROBE_MAX_CANDIDATES)
 
     async def test_collect_reports_probe_counters_and_pre_selection_stage(self):
