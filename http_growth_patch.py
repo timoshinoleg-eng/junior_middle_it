@@ -39,6 +39,8 @@ MAX_RESPONSE_BYTES = 2_000_000
 MAX_PARAMS = 80
 _RENDER_MODE = "render"
 _TELEGRAM_MODE = "telegram"
+# Keep request-local SQL close to the primary project DB (eu-central-1).
+_TELEGRAM_SQL_REGION = "eu-central-1"
 
 
 def _safe_proxy_url(value: str, expected_suffix: str) -> str:
@@ -152,6 +154,9 @@ class RemoteGrowthCursor:
                 "Accept": "application/json",
                 "User-Agent": "junior-middle-it-growth/3.0",
                 self.connection.auth_header: self.connection.credential,
+                # Supabase defaults to US East for this endpoint, even though
+                # the database and Vercel webhook are in Frankfurt.
+                **({"X-Region": _TELEGRAM_SQL_REGION} if self.connection.auth_mode == _TELEGRAM_MODE else {}),
             },
         )
         started_at = time.perf_counter()

@@ -47,6 +47,7 @@ class HttpGrowthPatchTests(unittest.TestCase):
             captured["body"] = json.loads(request.data.decode("utf-8"))
             captured["key"] = request.headers.get("X-growth-key") or request.headers.get("X-Growth-Key")
             captured["timeout"] = timeout
+            captured["region"] = request.headers.get("X-region") or request.headers.get("X-Region")
             return response
 
         with patch.object(bridge, "urlopen", side_effect=fake_urlopen):
@@ -59,6 +60,7 @@ class HttpGrowthPatchTests(unittest.TestCase):
         self.assertEqual(captured["body"]["params"], [77])
         self.assertEqual(captured["key"], "secret")
         self.assertEqual(captured["timeout"], 15.0)
+        self.assertIsNone(captured["region"], "Render SQL must retain its existing routing")
 
     def test_telegram_mode_uses_separate_exact_endpoint_and_header(self):
         endpoint = "https://x.supabase.co/functions/v1/interactive-growth-proxy"
@@ -68,6 +70,7 @@ class HttpGrowthPatchTests(unittest.TestCase):
         def fake_urlopen(request, timeout):
             captured["token"] = request.headers.get("X-telegram-bot-token") or request.headers.get("X-Telegram-Bot-Token")
             captured["growth_key"] = request.headers.get("X-growth-key") or request.headers.get("X-Growth-Key")
+            captured["region"] = request.headers.get("X-region") or request.headers.get("X-Region")
             return FakeResponse({"rows": [], "columns": [], "rowcount": 0})
 
         with patch.object(bridge, "urlopen", side_effect=fake_urlopen):
@@ -75,6 +78,7 @@ class HttpGrowthPatchTests(unittest.TestCase):
                 cur.execute("SELECT user_id FROM growth_user_settings WHERE user_id=%s", (77,))
         self.assertEqual(captured["token"], "123:bot-token")
         self.assertIsNone(captured["growth_key"])
+        self.assertEqual(captured["region"], "eu-central-1")
 
     def test_telegram_sql_timing_contains_no_user_data(self):
         conn = bridge.RemoteGrowthConnection(
