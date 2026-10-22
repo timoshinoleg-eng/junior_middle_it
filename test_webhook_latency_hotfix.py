@@ -293,7 +293,7 @@ class FastStartAndSearchTests(unittest.IsolatedAsyncioTestCase):
         bot._select_first_value_jobs = lambda _uid: ({"enabled_categories": ["security"]}, [])
         bot._lang = lambda _uid: "ru"
         bot._job_text = lambda job, lang: job["title"]
-        bot._job_keyboard = lambda job, lang: None
+        bot._job_keyboard = lambda job, lang, **_kwargs: None
         with patch.object(localized_product.core, "GROWTH_UTILS_AVAILABLE", True), patch.object(
             localized_product.core, "job_matches_profile", return_value=False
         ):
@@ -328,7 +328,7 @@ class FastStartAndSearchTests(unittest.IsolatedAsyncioTestCase):
         bot._select_first_value_jobs = lambda _uid: ({"enabled_categories": ["security"]}, [])
         bot._lang = lambda _uid: "ru"
         bot._job_text = lambda job, lang: job["title"]
-        bot._job_keyboard = lambda job, lang: None
+        bot._job_keyboard = lambda job, lang, **_kwargs: None
         with patch.object(localized_product.core, "GROWTH_UTILS_AVAILABLE", True), patch.object(
             localized_product.core, "job_matches_profile",
             side_effect=lambda job, _profile: job["category"] == "security",

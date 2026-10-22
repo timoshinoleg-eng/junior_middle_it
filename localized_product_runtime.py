@@ -156,7 +156,7 @@ class JobBot(p8.JobBot):
         rows.append([core.InlineKeyboardButton(t(lang, "back"), callback_data="p8_retention_hub")])
         await message.reply_text("\n".join(lines), reply_markup=core.InlineKeyboardMarkup(rows))
 
-    def _job_keyboard(self, job: Dict, lang: str, *, full: bool = False):
+    def _job_keyboard(self, job: Dict, lang: str, *, full: bool = False, market_example: bool = False):
         job_hash = str(job.get("hash") or job.get("content_hash") or "")[:40]
         rows = []
         first = []
@@ -164,7 +164,8 @@ class JobBot(p8.JobBot):
         if url.startswith(("http://", "https://")):
             first.append(core.InlineKeyboardButton(t(lang, "apply"), url=url))
         if job_hash:
-            first.append(core.InlineKeyboardButton(t(lang, "check_resume"), callback_data=f"resume_match:{job_hash}"))
+            callback_prefix = "resume_market" if market_example else "resume_match"
+            first.append(core.InlineKeyboardButton(t(lang, "check_resume"), callback_data=f"{callback_prefix}:{job_hash}"))
         if first:
             rows.append(first)
         second = []
@@ -181,6 +182,11 @@ class JobBot(p8.JobBot):
             t(lang, "hide", category=category_name(category, lang)),
             callback_data=f"hide_cat:{category}",
         )])
+        if market_example:
+            rows.append([core.InlineKeyboardButton(
+                "⚙️ Поменять категории" if lang == "ru" else "⚙️ Change categories",
+                callback_data="growth_quick_setup",
+            )])
         return core.InlineKeyboardMarkup(rows)
 
     def _job_text(self, job: Dict, lang: str, *, full: bool = False) -> str:
@@ -271,7 +277,7 @@ class JobBot(p8.JobBot):
                 await self.application.bot.send_message(
                     chat_id=user_id,
                     text=card_text,
-                    reply_markup=self._job_keyboard(job, lang),
+                    reply_markup=self._job_keyboard(job, lang, market_example=market_examples),
                     disable_web_page_preview=True,
                 )
                 sent += 1
@@ -459,8 +465,16 @@ class JobBot(p8.JobBot):
         lang = self._lang(user_id)
         # The user must see the analysis before a non-critical telemetry write
         # waits on the remote SQL bridge.
+        report_text = self._format_resume_report(user_id, report, job)
+        if session.get("market_example"):
+            caveat = (
+                "⚠️ Это пример вне твоих фильтров, не персональная рекомендация.\n\n"
+                if lang == "ru" else
+                "⚠️ This is an example outside your filters, not a personal recommendation.\n\n"
+            )
+            report_text = (caveat + report_text)[:4096]
         await update.message.reply_text(
-            self._format_resume_report(user_id, report, job),
+            report_text,
             reply_markup=core.InlineKeyboardMarkup([
                 [core.InlineKeyboardButton(
                     "🔔 Сохранить похожие вакансии" if lang == "ru" else "🔔 Save similar jobs",
@@ -643,7 +657,8 @@ class JobBot(p8.JobBot):
             if not n:
                 await query.message.reply_text(t(lang, "no_matches"), reply_markup=core.InlineKeyboardMarkup([[core.InlineKeyboardButton(t(lang, "preferences"), callback_data="growth_quick_setup")]]))
             return
-        if data.startswith("resume_match:"):
+        if data.startswith(("resume_match:", "resume_market:")):
+            market_example = data.startswith("resume_market:")
             job_hash = data.split(":", 1)[1]
             job = self.db.get_job_payload(job_hash)
             if not job:
@@ -652,10 +667,20 @@ class JobBot(p8.JobBot):
                 else:
                     await query.answer(t(lang, "stale"), show_alert=True)
                 return
-            self.resume_sessions[user_id] = {"job_hash": job_hash, "job": job}
+            self.resume_sessions[user_id] = {
+                "job_hash": job_hash, "job": job, "market_example": market_example,
+            }
             if not getattr(self, "_resume_callback_acked", False):
                 await query.answer()
-            await query.message.reply_text(self._resume_prompt_for_user(user_id, job))
+            prompt = self._resume_prompt_for_user(user_id, job)
+            if market_example:
+                caveat = (
+                    "⚠️ Это пример вакансии вне твоих фильтров, не персональное совпадение.\n\n"
+                    if lang == "ru" else
+                    "⚠️ This job is an example outside your filters, not a personal match.\n\n"
+                )
+                prompt = caveat + prompt
+            await query.message.reply_text(prompt)
             try:
                 self.db.log_event(user_id, "resume_match_started", {"hash": job_hash, "source": "button", "language": lang})
             except Exception as exc:

@@ -39,7 +39,7 @@ class JobBot(base.JobBot):
 
         # Clear Telegram's button spinner BEFORE remote language/job SQL reads.
         # The inherited handler knows not to acknowledge the same query twice.
-        if data.startswith("resume_match:"):
+        if data.startswith(("resume_match:", "resume_market:")):
             await query.answer()
             self._resume_callback_acked = True
         elif data == "growth_quick_fresh":
