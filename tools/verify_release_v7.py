@@ -541,6 +541,109 @@ def check_tables(results: List[Dict[str, str]]) -> None:
     )
 
 
+def check_credit_registry_ready(results: List[Dict[str, str]]) -> None:
+    """Check that the registry of the credit operations is ready.
+
+    The check needs the access token of the management API of Supabase. It
+    reads the whole journal of the credits, so it is a check for the moment
+    of the rollout and not something that runs on every request.
+    """
+    token = str(os.getenv("SUPABASE_ACCESS_TOKEN") or "").strip()
+    if not token:
+        results.append(
+            {
+                "name": "supabase.credit_registry_ready",
+                "status": SKIP,
+                "detail": "SUPABASE_ACCESS_TOKEN is not set",
+            }
+        )
+        return
+    url = "https://api.supabase.com/v1/projects/%s/database/query" % SUPABASE_PROJECT_REF
+    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+    query = (
+        "WITH spends AS (\n"
+        "    SELECT user_id, ref, reason AS kind, COUNT(*) AS spends\n"
+        "    FROM public.growth_copilot_credit_events\n"
+        "    WHERE reason IN ('spend', 'llm_call')\n"
+        "    GROUP BY user_id, ref, reason\n"
+        "),\n"
+        "registry AS (\n"
+        "    SELECT user_id, ref, kind, attempt FROM public.growth_copilot_credit_ops\n"
+        ")\n"
+        "SELECT\n"
+        "    (SELECT COUNT(*) FROM registry) AS operations,\n"
+        "    (SELECT COUNT(*) FROM spends s WHERE NOT EXISTS (\n"
+        "        SELECT 1 FROM registry r\n"
+        "        WHERE r.user_id = s.user_id AND r.ref = s.ref AND r.kind = s.kind\n"
+        "    )) AS missing,\n"
+        "    (SELECT COUNT(*) FROM spends s JOIN registry r\n"
+        "        ON r.user_id = s.user_id AND r.ref = s.ref AND r.kind = s.kind\n"
+        "        WHERE r.attempt < s.spends) AS behind\n"
+    )
+    status, body = http(url, method="POST", headers=headers, body=json_body({"query": query}))
+    if status != 200:
+        results.append(
+            {
+                "name": "supabase.credit_registry_ready",
+                "status": FAIL,
+                "detail": "query failed with HTTP %s" % status,
+            }
+        )
+        return
+    try:
+        rows = json.loads(body)
+    except ValueError:
+        results.append(
+            {
+                "name": "supabase.credit_registry_ready",
+                "status": FAIL,
+                "detail": "response is not JSON",
+            }
+        )
+        return
+    if not rows:
+        results.append(
+            {
+                "name": "supabase.credit_registry_ready",
+                "status": FAIL,
+                "detail": "the registry of the credit operations is missing",
+            }
+        )
+        return
+    row = rows[0] if isinstance(rows[0], dict) else {}
+    try:
+        operations = int(row.get("operations", 0))
+        missing = int(row.get("missing", 0))
+        behind = int(row.get("behind", 0))
+    except (TypeError, ValueError):
+        results.append(
+            {
+                "name": "supabase.credit_registry_ready",
+                "status": FAIL,
+                "detail": "the answer of the database cannot be read",
+            }
+        )
+        return
+    problems = []
+    if missing:
+        problems.append(
+            "%d operations of the journal have no row in the registry: run "
+            "tools/reconcile_credit_operations.sql" % missing
+        )
+    if behind:
+        problems.append("%d rows of the registry are behind the journal" % behind)
+    results.append(
+        {
+            "name": "supabase.credit_registry_ready",
+            "status": FAIL if problems else PASS,
+            "detail": "; ".join(problems)
+            if problems
+            else "%d operations, every operation of the journal is in the registry"
+            % operations,
+        }
+    )
+
+
 def _vercel_team_id(token: str) -> str:
     status, body = http("https://api.vercel.com/v2/teams", headers={"Authorization": "Bearer " + token})
     if status != 200:
@@ -658,6 +761,7 @@ def run_checks() -> List[Dict[str, str]]:
     check_interactive_bridge(results)
     check_validator_fix(results)
     check_tables(results)
+    check_credit_registry_ready(results)
     check_vercel_flags(results)
     return results
 
