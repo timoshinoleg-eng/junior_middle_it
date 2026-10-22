@@ -40,7 +40,7 @@ state records that the operation was already paid for.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,11 @@ class CostedOperation:
         self._delivered_reason = str(delivered_reason or REASON_DELIVERED)
         self._unknown_reason = str(unknown_reason or REASON_UNKNOWN)
         self._state: Optional[str] = None
+        # The number of the attempt of the operation. A settlement of the
+        # operation is only allowed for the attempt that is open, so a late
+        # settlement of an older attempt cannot take away the reservation of a
+        # newer one.
+        self._attempt: Optional[int] = None
 
     @property
     def ref(self) -> str:
@@ -140,53 +145,41 @@ class CostedOperation:
             self._state = self._read_state()
         return self._state
 
-    def _event_counts(self) -> Dict[str, int]:
-        try:
-            return self._store.credit_event_counts(
-                self._user_id,
-                (
-                    self._spend_reason,
-                    self._release_reason,
-                    self._delivered_reason,
-                    self._unknown_reason,
-                ),
-                self._ref,
-            )
-        except Exception as exc:
-            raise CreditStoreUnavailable(
-                "credit journal is unavailable: %s" % type(exc).__name__
-            ) from exc
-
     def _read_state(self) -> str:
-        """The state of the operation.
+        """The state of the operation and the attempt it belongs to.
 
         The state is the row of the operation registry of the store, because
         that row is the gate of the reservation: the state that is read here
-        is the state that the database used to refuse a second charge. A
-        production without the registry falls back to the journal.
+        is the state that the database used to refuse a second charge. An
+        operation that the previous code left in the journal is adopted into
+        the registry by the store, so a user who paid for it before the
+        migration is not charged for it again.
         """
         try:
             registered = self._store.credit_operation_state(
-                self._user_id, self._ref, self._spend_reason
+                self._user_id,
+                self._ref,
+                self._spend_reason,
+                spend_reason=self._spend_reason,
+                release_reason=self._release_reason,
+                delivered_reason=self._delivered_reason,
+                unknown_reason=self._unknown_reason,
             )
         except Exception as exc:
             raise CreditStoreUnavailable(
                 "credit operation is unavailable: %s" % type(exc).__name__
             ) from exc
-        if registered:
-            return _OP_STATES.get(str(registered), STATE_NEW)
-        counts = self._event_counts()
-        spends = int(counts.get(self._spend_reason, 0))
-        releases = int(counts.get(self._release_reason, 0))
-        if counts.get(self._delivered_reason):
-            return STATE_DELIVERED
-        if counts.get(self._unknown_reason):
-            return STATE_UNKNOWN
-        if spends > releases:
-            return STATE_RESERVED
-        if spends:
-            return STATE_RELEASED
-        return STATE_NEW
+        if not registered:
+            self._attempt = None
+            return STATE_NEW
+        state, attempt = registered
+        self._attempt = int(attempt)
+        return _OP_STATES.get(str(state), STATE_NEW)
+
+    @property
+    def attempt(self) -> Optional[int]:
+        """The attempt of the operation, when it is known."""
+        return self._attempt
 
     def reserve(self) -> str:
         """Reserve the credit of this operation.
@@ -202,8 +195,39 @@ class CostedOperation:
         state = self.state()
         if state in (STATE_RESERVED, STATE_DELIVERED, STATE_UNKNOWN):
             return state
+        attempt = self._reserve_once()
+        if attempt is not None:
+            self._attempt = int(attempt)
+            self._state = STATE_RESERVED
+            return self._state
+        # The store refused. Either the balance was too low or the operation
+        # is already paid for; the registry tells the two apart.
+        self._state = self._read_state()
+        if self._state in (STATE_RESERVED, STATE_DELIVERED, STATE_UNKNOWN):
+            return self._state
+        if self._state == STATE_RELEASED:
+            # The reservation of this attempt was given back at the same
+            # moment, so the user may start a new attempt. The retry happens
+            # once, and the registry decides again.
+            attempt = self._reserve_once()
+            if attempt is not None:
+                self._attempt = int(attempt)
+                self._state = STATE_RESERVED
+                return self._state
+            self._state = self._read_state()
+            if self._state in (STATE_RESERVED, STATE_DELIVERED, STATE_UNKNOWN):
+                return self._state
+        raise InsufficientCredits("no credits for %s" % self._ref)
+
+    def _reserve_once(self) -> Optional[int]:
+        """One attempt to reserve the credit, without a second try.
+
+        The answer of the store is the number of the attempt that the
+        reservation belongs to. ``None`` means that the store refused the
+        reservation.
+        """
         try:
-            reserved = self._store.reserve_credit(
+            return self._store.reserve_credit(
                 self._user_id,
                 self._amount,
                 self._spend_reason,
@@ -214,15 +238,6 @@ class CostedOperation:
             raise CreditStoreUnavailable(
                 "credit reservation failed: %s" % type(exc).__name__
             ) from exc
-        if reserved:
-            self._state = STATE_RESERVED
-            return self._state
-        # The store refused. Either the balance was too low or the operation
-        # is already paid for; the journal tells the two apart.
-        self._state = self._read_state()
-        if self._state in (STATE_RESERVED, STATE_DELIVERED, STATE_UNKNOWN):
-            return self._state
-        raise InsufficientCredits("no credits for %s" % self._ref)
 
     def release(self) -> str:
         """Give the reservation back.
@@ -241,6 +256,7 @@ class CostedOperation:
                 self._release_reason,
                 self._ref,
                 reserved_reason=self._spend_reason,
+                attempt=self._attempt,
             )
         except Exception as exc:
             logger.warning("Credit release failed: %s", type(exc).__name__)
@@ -258,7 +274,11 @@ class CostedOperation:
             return state
         try:
             confirmed = self._store.confirm_credit_operation(
-                self._user_id, self._ref, self._spend_reason, self._delivered_reason
+                self._user_id,
+                self._ref,
+                self._spend_reason,
+                self._delivered_reason,
+                attempt=self._attempt,
             )
         except Exception as exc:
             logger.warning("Credit confirmation failed: %s", type(exc).__name__)
@@ -281,7 +301,11 @@ class CostedOperation:
             return state
         try:
             marked = self._store.mark_credit_operation_unknown(
-                self._user_id, self._ref, self._spend_reason, self._unknown_reason
+                self._user_id,
+                self._ref,
+                self._spend_reason,
+                self._unknown_reason,
+                attempt=self._attempt,
             )
         except Exception as exc:
             logger.warning("Credit state update failed: %s" % type(exc).__name__)
