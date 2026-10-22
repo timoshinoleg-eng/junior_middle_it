@@ -615,7 +615,8 @@ class JobBot(p8.JobBot):
             await self._send_saved_searches(query.message, user_id)
             return
         if data == "growth_quick_fresh":
-            await query.answer(t(lang, "looking3"))
+            if not getattr(self, "_fresh_callback_acked", False):
+                await query.answer(t(lang, "looking3"))
             n = await self._send_first_value_preview(user_id, source="localized_hub")
             self.db.log_event(user_id, "fresh_preview", {"count": n, "source": "localized_hub", "language": lang})
             if not n:
