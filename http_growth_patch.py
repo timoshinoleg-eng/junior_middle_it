@@ -8,9 +8,12 @@ remote endpoint only accepts data/query operations on ``growth_*`` relations.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import re
+import time
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Iterable
@@ -22,6 +25,7 @@ import growth_store
 from growth_store import GrowthStoreUnavailable, PostgresGrowthStore
 
 
+logger = logging.getLogger(__name__)
 _PLACEHOLDER_RE = re.compile(r"%s")
 _SCHEMA_BOOTSTRAP_RE = re.compile(
     r"^\s*(?:"
@@ -150,6 +154,7 @@ class RemoteGrowthCursor:
                 self.connection.auth_header: self.connection.credential,
             },
         )
+        started_at = time.perf_counter()
         try:
             with urlopen(request, timeout=self.connection.timeout) as response:
                 body = response.read(MAX_RESPONSE_BYTES + 1)
@@ -169,6 +174,17 @@ class RemoteGrowthCursor:
             raise GrowthStoreUnavailable(
                 f"Growth proxy unavailable: {type(exc).__name__}"
             ) from exc
+        finally:
+            if self.connection.auth_mode == _TELEGRAM_MODE:
+                elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+                relation_match = re.search(r"\bgrowth_[A-Za-z0-9_]+\b", converted, re.I)
+                relation = relation_match.group(0).lower() if relation_match else "growth_unknown"
+                fingerprint = hashlib.sha256(converted.encode("utf-8")).hexdigest()[:12]
+                self.connection.sql_metrics.append((relation, elapsed_ms))
+                logger.info(
+                    "growth_sql_latency call=%d relation=%s template=%s duration_ms=%d",
+                    len(self.connection.sql_metrics), relation, fingerprint, elapsed_ms,
+                )
 
         if len(body) > MAX_RESPONSE_BYTES:
             raise GrowthStoreUnavailable("Growth proxy response is too large")
@@ -228,6 +244,9 @@ class RemoteGrowthConnection:
         self.key = secret  # backward-compatible alias for Render callers/tests
         self.timeout = float(timeout)
         self.auth_mode = mode
+        # Request-local totals: one RemoteGrowthConnection per webhook invocation.
+        # No SQL, parameters, user identifiers or credentials are retained.
+        self.sql_metrics: list[tuple[str, int]] = []
         self.auth_header = (
             "X-Telegram-Bot-Token" if mode == _TELEGRAM_MODE else "X-Growth-Key"
         )
