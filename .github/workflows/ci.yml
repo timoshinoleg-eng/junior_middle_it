@@ -68,6 +68,7 @@ jobs:
             test_message_formatter_growth \
             test_growth_p1 \
             test_resume_matcher \
+            test_resume_detail_latency \
             test_qa_issues_76_78 \
             test_resume_flow \
             test_saved_searches \

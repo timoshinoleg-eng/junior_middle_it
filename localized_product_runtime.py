@@ -9,7 +9,7 @@ import channel_bot as core
 import durable_product_state as p8
 from product_i18n import CATEGORY_NAMES, category_name, normalize_language, t
 from resume_documents import MAX_FILE_BYTES, ResumeDocumentError, extract_resume_document
-from resume_matcher import analyze_resume_match
+from resume_matcher import analyze_resume_match, format_resume_match_report
 from saved_searches import suggested_search_from_resume
 
 
@@ -411,17 +411,7 @@ class JobBot(p8.JobBot):
         company = str(job.get("company") or "").strip()
         heading = f"{title} · {company}" if company else title
         if lang == "ru":
-            lines = [f"📄 Совпадение резюме: {report.score}%", heading, "", "Оценка ориентировочная и не является официальным ATS-результатом."]
-            if report.matched_skills:
-                lines.append("✅ Уже подходит: " + ", ".join(report.matched_skills[:8]))
-            if report.missing_skills:
-                lines.append("⚠️ Не нашёл в резюме: " + ", ".join(report.missing_skills[:8]))
-            lines.append(f"🔎 Совпадение ключевых слов: {report.keyword_overlap_pct}%")
-            lines.extend(["", "Что улучшить перед откликом:"])
-            for item in report.recommendations[:5]:
-                lines.append("• " + item)
-            lines.extend(["", "Текст резюме не сохранялся."])
-            return "\n".join(lines)[:3900]
+            return format_resume_match_report(report, job)
         lines = [f"📄 Resume fit: {report.score}%", heading, "", "This is a practical text-based estimate, not an official ATS score."]
         if report.matched_skills:
             lines.append("✅ Skills found in your resume: " + ", ".join(report.matched_skills[:8]))
@@ -445,12 +435,9 @@ class JobBot(p8.JobBot):
         job = session["job"]
         report = analyze_resume_match(text, job)
         self.pending_saved_searches[user_id] = suggested_search_from_resume(job, report.matched_skills)
-        self.db.log_event(user_id, "resume_match_completed", {
-            "hash": session["job_hash"], "score": report.score,
-            "required_skills": len(report.required_skills), "matched_skills": len(report.matched_skills),
-            "input_type": kind, "language": self._lang(user_id),
-        })
         lang = self._lang(user_id)
+        # The user must see the analysis before a non-critical telemetry write
+        # waits on the remote SQL bridge.
         await update.message.reply_text(
             self._format_resume_report(user_id, report, job),
             reply_markup=core.InlineKeyboardMarkup([
@@ -461,6 +448,14 @@ class JobBot(p8.JobBot):
                 [core.InlineKeyboardButton(t(lang, "preferences"), callback_data="growth_quick_setup")],
             ]),
         )
+        try:
+            self.db.log_event(user_id, "resume_match_completed", {
+                "hash": session["job_hash"], "score": report.score,
+                "required_skills": len(report.required_skills), "matched_skills": len(report.matched_skills),
+                "input_type": kind, "language": lang,
+            })
+        except Exception as exc:
+            core.logger.warning("Resume Match telemetry failed after reply: %s", type(exc).__name__)
 
     async def handle_setup_text(self, update, context):
         user_id = update.effective_user.id if update.effective_user else None
@@ -620,7 +615,8 @@ class JobBot(p8.JobBot):
             await self._send_saved_searches(query.message, user_id)
             return
         if data == "growth_quick_fresh":
-            await query.answer(t(lang, "looking3"))
+            if not getattr(self, "_fresh_callback_acked", False):
+                await query.answer(t(lang, "looking3"))
             n = await self._send_first_value_preview(user_id, source="localized_hub")
             self.db.log_event(user_id, "fresh_preview", {"count": n, "source": "localized_hub", "language": lang})
             if not n:
@@ -630,12 +626,19 @@ class JobBot(p8.JobBot):
             job_hash = data.split(":", 1)[1]
             job = self.db.get_job_payload(job_hash)
             if not job:
-                await query.answer(t(lang, "stale"), show_alert=True)
+                if getattr(self, "_resume_callback_acked", False):
+                    await query.message.reply_text(t(lang, "stale"))
+                else:
+                    await query.answer(t(lang, "stale"), show_alert=True)
                 return
             self.resume_sessions[user_id] = {"job_hash": job_hash, "job": job}
-            self.db.log_event(user_id, "resume_match_started", {"hash": job_hash, "source": "button", "language": lang})
-            await query.answer()
+            if not getattr(self, "_resume_callback_acked", False):
+                await query.answer()
             await query.message.reply_text(self._resume_prompt_for_user(user_id, job))
+            try:
+                self.db.log_event(user_id, "resume_match_started", {"hash": job_hash, "source": "button", "language": lang})
+            except Exception as exc:
+                core.logger.warning("Resume Match start telemetry failed after reply: %s", type(exc).__name__)
             return
         if data.startswith("expand:") or data.startswith("compact:"):
             full = data.startswith("expand:")

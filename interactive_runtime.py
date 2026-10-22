@@ -198,12 +198,8 @@ class JobBot(runtime.JobBot):
             "matched_skills": len(report.matched_skills),
             "input_type": kind,
         }
-        self.db.log_event(user_id, "resume_match_completed", event_props)
-        self.db.log_event(
-            user_id,
-            "resume_match_document_completed",
-            {"hash": session["job_hash"], "input_type": kind},
-        )
+        # Show the result first. These two independent remote analytics writes
+        # otherwise add seconds of user-visible delay to a completed analysis.
         await update.message.reply_text(
             format_resume_match_report(report, job),
             reply_markup=core.InlineKeyboardMarkup([
@@ -212,6 +208,15 @@ class JobBot(runtime.JobBot):
             ]),
             disable_web_page_preview=True,
         )
+        try:
+            self.db.log_event(user_id, "resume_match_completed", event_props)
+            self.db.log_event(
+                user_id,
+                "resume_match_document_completed",
+                {"hash": session["job_hash"], "input_type": kind},
+            )
+        except Exception as exc:
+            logger.warning("Resume Match document telemetry failed after reply: %s", type(exc).__name__)
 
     async def handle_setup_text(self, update, context):
         message = update.message
