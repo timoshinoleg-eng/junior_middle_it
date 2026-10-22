@@ -19,6 +19,9 @@ class JobBot(base.JobBot):
             return await super().cmd_start(update, context)
         payload = str(context.args[0] if context.args else "")[:52]
         language = self.db.get_user_language(user_id)
+        # The base /start handler is reached after this language lookup.
+        # Pass it through instead of repeating an expensive remote SQL call.
+        self._start_language_hint = (user_id, language)
 
         if not language and payload.startswith("ref_"):
             kind, referrer_id = core.parse_start_payload([payload]) if core.GROWTH_UTILS_AVAILABLE else (None, None)
