@@ -42,13 +42,13 @@ class DatabaseConnection(base.DatabaseConnection):
                         WHERE user_id=%s AND name='language_selected'
                         ORDER BY ts DESC LIMIT 1
                     ), '') AS language,
-                    COALESCE(s.onboarding_done, FALSE),
-                    COALESCE(s.alerts_enabled, FALSE),
-                    COALESCE(s.digest_enabled, FALSE),
+                    COALESCE(s.onboarding_done, FALSE) AS onboarding_done,
+                    COALESCE(s.alerts_enabled, FALSE) AS alerts_enabled,
+                    COALESCE(s.digest_enabled, FALSE) AS digest_enabled,
                     (
                         SELECT COUNT(*) FROM growth_saved_searches
                         WHERE user_id=%s AND enabled=TRUE
-                    )
+                    ) AS search_count
                 FROM (SELECT %s::bigint AS user_id) incoming
                 LEFT JOIN growth_user_settings s ON s.user_id=incoming.user_id
                 """,
