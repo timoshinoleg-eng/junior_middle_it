@@ -233,8 +233,24 @@ class JobMessageFormatter(_BaseJobMessageFormatter):
             lines.append(hint)
         if summary:
             lines.extend(["", f"📌 {self._escape_markdown_v2(summary)}"])
-        if include_source:
-            source = str(job.get("source") or "").strip()
+        skills = [
+            str(value).strip()[:30]
+            for value in (job.get("tags") or [])
+            if isinstance(value, str) and value.strip()
+        ]
+        if skills:
+            lines.append("🧰 " + self._escape_markdown_v2(" · ".join(dict.fromkeys(skills[:4]))))
+        job_type = str(job.get("employment_type") or "").strip()
+        if job_type:
+            lines.append("🕒 " + self._escape_markdown_v2(job_type[:70]))
+        source_key = str(job.get("source") or "").strip()
+        credited = {"RemoteJobs.org", "Remote Landers", "Himalayas", "Remotive", "RemoteOK", "Jobicy"}
+        if source_key == "Remote Landers":
+            lines.extend(["", "[Job data provided by Remote Landers](https://remotelanders.com)"])
+        elif source_key in credited:
+            lines.extend(["", "_Источник: " + self._escape_markdown_v2(source_key) + "_"])
+        elif include_source:
+            source = source_key
             if source:
                 lines.extend(["", f"_Источник: {self._escape_markdown_v2(source)}_"])
         return "\n".join(lines)

@@ -2111,8 +2111,8 @@ def fetch_himalayas() -> List[Dict]:
     try:
         all_jobs = []
         offset = 0
-        limit = 50
-        for _ in range(3):
+        limit = 20
+        for _ in range(5):
             url = "https://himalayas.app/jobs/api"
             params = {'limit': limit, 'offset': offset}
             response = requests.get(url, params=params, headers=get_headers(), timeout=15)
@@ -2127,7 +2127,8 @@ def fetch_himalayas() -> List[Dict]:
                 salary = 'Не указана'
                 if job.get('minSalary') and job.get('maxSalary'):
                     currency = job.get('currency', 'USD')
-                    salary = f"{job['minSalary']:,}-{job['maxSalary']:,} {currency}"
+                    period = job.get("salaryPeriod") or "annual"
+                    salary = f"{job['minSalary']:,}-{job['maxSalary']:,} {currency}/{period}"
 
                 all_jobs.append({
                     'title': job.get('title', ''),
@@ -2139,7 +2140,7 @@ def fetch_himalayas() -> List[Dict]:
                     'published': job.get('pubDate', ''),
                     'employment_type': job.get('employmentType', ''),
                     'source': 'Himalayas',
-                    'tags': job.get('categories', []) + job.get('parentCategories', [])
+                    'tags': (job.get('categories') or []) + (job.get('parentCategories') or [])
                 })
 
             offset += limit
@@ -2188,7 +2189,7 @@ def fetch_weworkremotely() -> List[Dict]:
 def fetch_jobicy() -> List[Dict]:
     """Jobicy API"""
     try:
-        url = "https://jobicy.com/api/v2/remote-jobs?count=50"
+        url = "https://jobicy.com/api/v2/remote-jobs?count=200"
         response = requests.get(url, headers=get_headers(), timeout=15)
         response.raise_for_status()
         data = response.json()
@@ -2890,6 +2891,8 @@ def fetch_wellfound() -> List[Dict]:
 
 def get_api_fetch_functions():
     """Configured API fetchers in execution order."""
+    from job_sources_additional import get_additional_fetchers
+
     fetchers = [
         (fetch_remotive, "Remotive"),
         (fetch_remoteok, "RemoteOK"),
@@ -2901,6 +2904,8 @@ def get_api_fetch_functions():
         (fetch_hackernews, "HN Who is Hiring"),
         (fetch_headhunter, "HeadHunter"),
     ]
+    # Fresh remote-job APIs with public attribution and no API keys.
+    fetchers.extend(get_additional_fetchers())
     # v6.5 free public extras (4dayweek, Muse, RemoteOK Dev, RSS)
     if Config.ENABLE_EXTRA_SOURCES and EXTRA_SOURCES_AVAILABLE:
         for fn, name in get_extra_fetchers():

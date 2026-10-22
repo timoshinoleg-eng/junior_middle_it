@@ -62,6 +62,7 @@ jobs:
           python -m unittest -v \
             test_growth_utils \
             test_job_sources_extra \
+            test_job_sources_additional \
             test_publication_policy \
             test_publication_authority \
             test_stage0_post_fixes \
