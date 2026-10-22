@@ -208,14 +208,39 @@ class JobBot(p8.JobBot):
         return "\n".join(lines)[:3500]
 
     async def _send_first_value_preview(self, user_id: int, *, source: str) -> int:
-        _settings, matched = self._select_first_value_jobs(user_id)
+        settings, matched = self._select_first_value_jobs(user_id)
+        lang = self._lang(user_id)
+        fallback_note = ""
+        if not matched:
+            # The quick button must not silently mean "only posts from the last
+            # 36 hours". Show older profile matches, then clearly labelled
+            # market examples when the saved filters exclude every recent post.
+            week_jobs = self.db.recent_jobs_for_digest(hours=7 * 24, limit=80)
+            matched = [
+                job for job in week_jobs
+                if not core.GROWTH_UTILS_AVAILABLE or core.job_matches_profile(job, settings)
+            ][:3]
+            if matched:
+                fallback_note = (
+                    "За последние 36 часов совпадений нет. Вот подходящие вакансии за неделю."
+                    if lang == "ru" else
+                    "No matches in the last 36 hours. Here are matches from the last week."
+                )
+            elif week_jobs:
+                matched = week_jobs[:3]
+                fallback_note = (
+                    "По твоим фильтрам новых вакансий нет. Ниже 3 примера из других направлений — "
+                    "это НЕ персональные совпадения. Измени категории в настройках."
+                    if lang == "ru" else
+                    "No jobs match your filters. These 3 market examples are NOT personal matches. "
+                    "Adjust your categories to see more relevant jobs."
+                )
         if not matched:
             return 0
-        lang = self._lang(user_id)
         try:
             await self.application.bot.send_message(
                 chat_id=user_id,
-                text=t(lang, "preview_header", count=len(matched)),
+                text=fallback_note or t(lang, "preview_header", count=len(matched)),
             )
         except Exception:
             return 0
@@ -240,14 +265,18 @@ class JobBot(p8.JobBot):
         if not user_id:
             return await super().cmd_start(update, context)
         payload = str(context.args[0] if context.args else "")[:52]
-        if not self.db.get_user_language(user_id):
-            self.db.log_event(user_id, "start", {"payload": payload, "language_pending": True})
+        hint = getattr(self, "_start_language_hint", None)
+        language = hint[1] if isinstance(hint, tuple) and hint[0] == user_id else self.db.get_user_language(user_id)
+        if not language:
             await update.message.reply_text(t("ru", "choose_language"), reply_markup=self._language_keyboard(payload))
+            self.db.log_event(user_id, "start", {"payload": payload, "language_pending": True})
             return
         if not payload:
+            # Send the visible response before non-critical bookkeeping. The
+            # synchronous Edge round-trips used to delay /start by seconds.
+            await self._send_retention_hub(update.message, user_id)
             self.db.log_event(user_id, "start", {"payload": None})
             self.db.maybe_unlock_premium(user_id)
-            await self._send_retention_hub(update.message, user_id)
             return
         if payload == "web_home":
             self.db.log_event(user_id, "start", {"payload": payload})
