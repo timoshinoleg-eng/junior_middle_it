@@ -73,6 +73,15 @@ class VercelWebhookSurfaceTests(unittest.TestCase):
         self.assertNotIn("sendMessage", endpoint)
         self.assertNotIn("pinChatMessage", endpoint)
 
+    def test_navigator_workflow_is_manual_and_posts_only_via_own_endpoint(self):
+        workflow = Path(".github/workflows/telegram-navigator-once.yml").read_text(encoding="utf-8")
+        endpoint = Path("api/telegram_navigator_admin.py").read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("workflow_run:", workflow)
+        self.assertIn("telegram_navigator_admin", workflow)
+        self.assertIn("sendMessage", endpoint)
+        self.assertIn("pinChatMessage", endpoint)
+
     def test_webhook_runtime_never_starts_background_runtime(self):
         text = Path("interactive_webhook_runtime.py").read_text(encoding="utf-8")
         self.assertNotIn("run_polling(", text)
