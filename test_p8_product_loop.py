@@ -94,8 +94,8 @@ class P8VacancyCardTests(unittest.TestCase):
         flat = [button for row in keyboard for button in row]
         flat_labels = [button["text"] for button in flat]
 
-        self.assertEqual(labels[0], ["🚀 Откликнуться", "📄 Проверить резюме"])
-        self.assertEqual(labels[1], ["🎯 Мой поиск вакансий", "📤 Поделиться"])
+        self.assertEqual(labels[0], ["🚀 Откликнуться", "📄 Проверить резюме", "⭐ В избранное"])
+        self.assertEqual(labels[1], ["🎯 Мой поиск вакансий", "🎁 Гайд + кредиты", "📤 Поделиться"])
         self.assertNotIn("💾 Сохранить", flat_labels)
         self.assertNotIn("⬇️ Подробнее", flat_labels)
         self.assertNotIn("🎁 Пригласить друзей", flat_labels)
