@@ -119,6 +119,7 @@ jobs:
              test_copilot_edge_validator \
              test_copilot_runtime \
             test_onboarding_flow \
+            test_channel_navigator \
              test_resume_image_webhook \
              test_copilot_pdf \
              test_copilot_security \
