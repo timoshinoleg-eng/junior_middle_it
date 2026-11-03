@@ -90,6 +90,23 @@ def build_bot_home_url(bot_username: str = "") -> str:
     return f"https://t.me/{username}?start=web_home"
 
 
+def build_favorite_url(job: dict, bot_username: str = "") -> str:
+    """Save the channel vacancy to the user's favorites from the bot chat."""
+    username = str(bot_username or "").strip().lstrip("@")
+    job_id = str(job.get("hash") or job.get("content_hash") or "")[:40]
+    if not username or not job_id:
+        return ""
+    return f"https://t.me/{username}?start=fav_{job_id}"
+
+
+def build_magnet_url(bot_username: str = "") -> str:
+    """Open the lead magnet (subscription check + bonus credits) in the bot chat."""
+    username = str(bot_username or "").strip().lstrip("@")
+    if not username:
+        return ""
+    return f"https://t.me/{username}?start=magnet"
+
+
 class JobMessageFormatter(_BaseJobMessageFormatter):
     """Mobile-first public channel cards with URL-only actions."""
 
@@ -303,6 +320,9 @@ class JobMessageFormatter(_BaseJobMessageFormatter):
         copilot_url = build_copilot_url(job, bot_username=bot_username) if job_id else ""
         if copilot_url and copilot_enabled():
             primary.append({"text": "✨ Разбор вакансии", "url": copilot_url})
+        favorite_url = build_favorite_url(job, bot_username=bot_username) if job_id else ""
+        if favorite_url:
+            primary.append({"text": "⭐ В избранное", "url": favorite_url})
         if primary:
             rows.append(primary)
 
@@ -310,6 +330,9 @@ class JobMessageFormatter(_BaseJobMessageFormatter):
         bot_home = build_bot_home_url(bot_username)
         if bot_home:
             secondary.append({"text": "🎯 Мой поиск вакансий", "url": bot_home})
+        magnet_url = build_magnet_url(bot_username)
+        if magnet_url:
+            secondary.append({"text": "🎁 Гайд + кредиты", "url": magnet_url})
         share_url = build_telegram_share_url(job, bot_username=bot_username)
         if share_url:
             secondary.append({"text": "📤 Поделиться", "url": share_url})
