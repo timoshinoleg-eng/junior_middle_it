@@ -301,6 +301,10 @@ def register_handlers(application, job_bot) -> None:
     """Register /stars, pre-checkout and successful-payment handlers."""
     from telegram.ext import CommandHandler, MessageHandler, PreCheckoutQueryHandler, filters
 
+    async def _on_successful_payment(update, context):
+        # PTB invokes callbacks as (update, context); job_bot is bound here.
+        await successful_payment_handler(job_bot, update, context)
+
     application.add_handler(CommandHandler("stars", job_bot.cmd_stars))
     application.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, _on_successful_payment))

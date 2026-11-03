@@ -272,6 +272,30 @@ class StarsPaymentTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(len(bot.invoices), 1)
 
+    def test_registered_payment_handlers_use_ptb_calling_convention(self):
+        """PTB invokes callbacks as (update, context) — job_bot must be bound."""
+        db = FakeDb(JOB)
+        store = FakeStore()
+        registered = {}
+
+        class FakeApplication:
+            def add_handler(self, handler):
+                callback = getattr(handler, "callback", None)
+                registered[callback.__name__ if callback else str(handler)] = callback
+
+        onboarding_flow.register_handlers(FakeApplication(), SimpleNamespace(db=db, cmd_stars=lambda *a: None))
+
+        payment = SimpleNamespace(telegram_payment_charge_id="chg_ptb")
+        update = make_update(payment=payment)
+        context = make_context()
+        with patch.object(onboarding_flow.CopilotStore, "from_database", return_value=store):
+            run(registered["_on_successful_payment"](update, context))
+        self.assertTrue(any(row[0] == "grant" and row[2] == 10 for row in store.rows))
+
+        good = FakePrecheckoutQuery(f"stars_topup_{USER_ID}")
+        run(registered["precheckout_handler"](make_update(pre_checkout=good), context))
+        self.assertEqual(good.answers, [{"ok": True, "error_message": None}])
+
     def test_foreign_callback_is_not_intercepted(self):
         db = FakeDb(JOB)
         query = SimpleNamespace(data="copilot_hr:abc", message=FakeMessage())
