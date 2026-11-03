@@ -4,6 +4,8 @@ from urllib.parse import parse_qs, urlparse
 from message_formatter import (
     JobMessageFormatter,
     build_bot_home_url,
+    build_favorite_url,
+    build_magnet_url,
     build_resume_match_url,
     build_telegram_share_url,
 )
@@ -68,6 +70,52 @@ class TelegramShareGrowthTests(unittest.TestCase):
             build_resume_match_url(self.job, "@junior_middle_bot"),
             "https://t.me/junior_middle_bot?start=resume_abc123def4567890",
         )
+
+    def test_favorite_button_uses_new_onboarding_deeplink(self):
+        formatter = JobMessageFormatter()
+        keyboard = formatter.create_inline_keyboard(self.job, bot_username="junior_middle_bot")
+        favorite = next(
+            button
+            for row in keyboard["inline_keyboard"]
+            for button in row
+            if button.get("text") == "⭐ В избранное"
+        )
+        self.assertEqual(
+            favorite["url"],
+            "https://t.me/junior_middle_bot?start=fav_abc123def4567890",
+        )
+        self.assertNotIn("callback_data", favorite)
+        self.assertEqual(
+            build_favorite_url(self.job, "@junior_middle_bot"),
+            "https://t.me/junior_middle_bot?start=fav_abc123def4567890",
+        )
+
+    def test_magnet_guide_button_uses_subscription_deeplink(self):
+        formatter = JobMessageFormatter()
+        keyboard = formatter.create_inline_keyboard(self.job, bot_username="junior_middle_bot")
+        magnet = next(
+            button
+            for row in keyboard["inline_keyboard"]
+            for button in row
+            if button.get("text") == "🎁 Гайд + кредиты"
+        )
+        self.assertEqual(
+            magnet["url"],
+            "https://t.me/junior_middle_bot?start=magnet",
+        )
+        self.assertNotIn("callback_data", magnet)
+        self.assertEqual(
+            build_magnet_url("@junior_middle_bot"),
+            "https://t.me/junior_middle_bot?start=magnet",
+        )
+
+    def test_favorite_and_magnet_buttons_require_bot_username(self):
+        formatter = JobMessageFormatter()
+        keyboard = formatter.create_inline_keyboard(self.job, bot_username="")
+        buttons = [button for row in keyboard["inline_keyboard"] for button in row]
+        labels = [button["text"] for button in buttons]
+        self.assertNotIn("⭐ В избранное", labels)
+        self.assertNotIn("🎁 Гайд + кредиты", labels)
 
     def test_public_channel_keyboard_is_url_only(self):
         formatter = JobMessageFormatter()
