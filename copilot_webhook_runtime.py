@@ -48,6 +48,7 @@ from copilot.credit_operations import (
 )
 from copilot.credits import CreditManager
 from copilot.store import CopilotStore, CopilotStoreUnavailable
+import onboarding_flow as onboarding
 from resume_documents import MAX_FILE_BYTES, ResumeDocumentError, extract_resume_document
 
 logger = logging.getLogger(__name__)
@@ -422,6 +423,11 @@ async def _copilot_cmd_start(self, update, context):
                 {"campaign": "upskill"},
             )
             await _cmd_upskill(self, update, context)
+            return
+    if payload is not None:
+        # Onboarding extras: fav_<hash>, magnet, stars. Unknown payloads
+        # (ref_, resume_, share_, web_home, ...) return False and fall through.
+        if await onboarding.handle_start_extras(self, update, context):
             return
     return await _original_cmd_start(self, update, context)
 
@@ -1461,6 +1467,10 @@ async def _copilot_handle_callback(self, update, context):
     """Route Copilot callbacks, everything else keeps the existing behaviour."""
     query = update.callback_query
     data = (query.data or "") if query else ""
+    # Onboarding extras (obn: prefix) before the copilot namespace; unknown
+    # callback_data returns False and keeps the existing behaviour.
+    if await onboarding.handle_callback_extras(self, update, context):
+        return
     if not data.startswith(CALLBACK_PREFIX):
         return await _original_handle_callback(self, update, context)
 
@@ -1502,7 +1512,13 @@ def _copilot_build_runtime():
     application, db, job_bot = _localized_build_runtime()
     application.add_handler(CommandHandler("copilot", job_bot.cmd_copilot))
     application.add_handler(CommandHandler("upskill", job_bot.cmd_upskill))
+    onboarding.register_handlers(application, job_bot)
     return application, db, job_bot
+
+
+async def _cmd_stars(self, update, context):
+    """``/stars`` — Telegram Stars invoice for the AI-credit pack."""
+    await onboarding.cmd_stars(self, update, context)
 
 
 async def _copilot_cmd_stats_growth(self, update, context):
@@ -1537,6 +1553,7 @@ async def _copilot_cmd_stats_growth(self, update, context):
 durable.JobBot.cmd_start = _copilot_cmd_start
 durable.JobBot.cmd_copilot = _cmd_copilot
 durable.JobBot.cmd_upskill = _cmd_upskill
+durable.JobBot.cmd_stars = _cmd_stars
 durable.JobBot.cmd_stats_growth = _copilot_cmd_stats_growth
 durable.JobBot.handle_callback = _copilot_handle_callback
 durable.JobBot.handle_setup_text = _copilot_handle_setup_text
