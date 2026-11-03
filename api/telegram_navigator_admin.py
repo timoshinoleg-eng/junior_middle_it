@@ -14,7 +14,9 @@ import requests
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from channel_navigator import DEFAULT_CHANNEL, NAVIGATOR_TITLE, build_navigator_post
+# Imported lazily inside the handlers: the Vercel bundler once lost a
+# root-level dependency of this chain, and a lazy import turns that opaque
+# FUNCTION_INVOCATION_FAILED into a readable error payload.
 from serverless_health import cron_authorized
 
 
@@ -46,6 +48,8 @@ def _try_call(token: str, method: str, payload: dict | None = None):
 
 
 def _apply_navigator() -> dict:
+    from channel_navigator import DEFAULT_CHANNEL, NAVIGATOR_TITLE, build_navigator_post
+
     if (os.getenv("VERCEL_ENV") or "").strip().lower() != "production":
         raise RuntimeError("not_production")
 
@@ -132,6 +136,30 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        from urllib.parse import parse_qs, urlparse
+
+        if "selftest" in parse_qs(urlparse(self.path).query):
+            # Import the builder lazily so a bundling problem is visible here
+            # instead of an opaque FUNCTION_INVOCATION_FAILED at module load.
+            try:
+                from channel_navigator import (
+                    DEFAULT_CHANNEL,
+                    NAVIGATOR_TITLE,
+                    build_navigator_post,
+                )
+
+                _text, markup = build_navigator_post("selftest_bot")
+                self._send_json(200, {
+                    "ok": True,
+                    "title": NAVIGATOR_TITLE,
+                    "buttons": sum(len(row) for row in markup["inline_keyboard"]),
+                    "default_channel": DEFAULT_CHANNEL,
+                })
+            except Exception:
+                import traceback
+
+                self._send_json(500, {"ok": False, "error": traceback.format_exc()[-1500:]})
+            return
         self._send_json(405, {"ok": False, "error": "method_not_allowed"})
 
     def do_POST(self):
