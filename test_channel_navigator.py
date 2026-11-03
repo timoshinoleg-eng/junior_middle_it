@@ -39,6 +39,14 @@ class NavigatorPostTests(unittest.TestCase):
         self.assertIn(NAVIGATOR_TITLE, text)
         self.assertEqual(len(markup["inline_keyboard"]), 2)
 
+    def test_builder_never_imports_message_formatter_chain(self):
+        """Vercel's bundler loses the star-import chain at deploy time."""
+        from pathlib import Path
+
+        source = Path("channel_navigator.py").read_text(encoding="utf-8")
+        self.assertNotIn("import message_formatter", source)
+        self.assertNotIn("from message_formatter", source)
+
 
 class NavigatorAdminTests(unittest.TestCase):
     def _run_apply(self, calls, chat_with_navigator=False, bot_username="test_bot"):

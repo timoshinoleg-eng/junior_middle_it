@@ -3,13 +3,17 @@
 The builder is pure (no Telegram I/O) so the contract is unit-testable; the
 publisher lives in ``api/telegram_navigator_admin.py``. All buttons are URL
 deep links into the bot chat — Telegram forbids callback buttons in channels.
+
+The module deliberately avoids importing the vacancy formatter: its
+star-import base-module chain breaks the Vercel Python bundler's static
+dependency tracing, and the deployed admin endpoint crashed at import
+(FUNCTION_INVOCATION_FAILED). The two tiny URL builders are inlined
+instead — the deep-link contract is pinned by tests.
 """
 from __future__ import annotations
 
 from typing import Dict, Tuple
 from urllib.parse import quote
-
-from message_formatter import build_bot_home_url, build_magnet_url
 
 NAVIGATOR_TITLE = "🧭 Junior & Middle IT: канал + AI-копилот"
 
@@ -19,6 +23,11 @@ _BUTTONS_DISABLED_NOTE = (
     "Кнопки действий появятся ниже, как только в переменных окружения "
     "задан юзернейм бота (BOT_USERNAME)."
 )
+
+
+def _bot_link(username: str, payload: str) -> str:
+    """Deep link into the bot's private chat (?start=<payload>)."""
+    return f"https://t.me/{username}?start={payload}"
 
 
 def navigator_text(bot_username: str = "", channel: str = DEFAULT_CHANNEL) -> str:
@@ -57,8 +66,8 @@ def navigator_reply_markup(bot_username: str = "", channel: str = DEFAULT_CHANNE
     share_text = quote("Junior & Middle IT-вакансии и AI-копилот для поиска работы", safe="")
     rows = [
         [
-            {"text": "🎯 Мой поиск вакансий", "url": build_bot_home_url(username)},
-            {"text": "🎁 Гайд + 3 кредита", "url": build_magnet_url(username)},
+            {"text": "🎯 Мой поиск вакансий", "url": _bot_link(username, "web_home")},
+            {"text": "🎁 Гайд + 3 кредита", "url": _bot_link(username, "magnet")},
         ],
         [
             {"text": "💎 Купить AI-кредиты", "url": f"https://t.me/{username}?start=stars"},
