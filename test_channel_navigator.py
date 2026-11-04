@@ -100,8 +100,8 @@ class NavigatorAdminTests(unittest.TestCase):
             "BOT_USERNAME": bot_username,
             "GROWTH_DATABASE_URL": "postgresql://test",
         }
-        with patch.dict(os.environ, env, clear=False), patch(
-            "growth_store.PostgresGrowthStore", return_value=store
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            admin, "_build_growth_store", return_value=store
         ), patch.object(admin, "_telegram_call", side_effect=fake_call):
             return admin._apply_navigator()
 

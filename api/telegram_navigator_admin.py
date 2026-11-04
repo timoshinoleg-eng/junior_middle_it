@@ -46,17 +46,29 @@ def _try_call(token: str, method: str, payload: dict | None = None):
         return False, None, str(exc)[:220]
 
 
-def _load_navigator_state(channel_id: str) -> tuple:
-    """Return (store, state, error). ``store`` is ``None`` when Postgres is out."""
-    from growth_store import GrowthStoreUnavailable, PostgresGrowthStore
+def _build_growth_store():
+    """Build a growth store over the authenticated Edge transport (Vercel)."""
+    from interactive_webhook_runtime import configure_growth_transport
+
+    configure_growth_transport()
+    import http_growth_patch
+
+    if not http_growth_patch.install():
+        raise RuntimeError("growth_transport_refused")
+    from growth_store import PostgresGrowthStore
 
     dsn = (os.getenv("GROWTH_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
     if not dsn:
-        return None, {}, "growth_dsn_missing"
+        raise RuntimeError("growth_dsn_missing")
+    return PostgresGrowthStore(dsn, all_categories=[])
+
+
+def _load_navigator_state(channel_id: str) -> tuple:
+    """Return (store, state, error). ``store`` is ``None`` when Postgres is out."""
     try:
-        store = PostgresGrowthStore(dsn, all_categories=[])
-    except GrowthStoreUnavailable as exc:
-        return None, {}, f"growth_store_unavailable: {exc}"[:200]
+        store = _build_growth_store()
+    except Exception as exc:
+        return None, {}, f"growth_store_unavailable: {type(exc).__name__}: {exc}"[:200]
     key = f"navigator:{channel_id}"
     try:
         return store, store.get_channel_state(key), ""

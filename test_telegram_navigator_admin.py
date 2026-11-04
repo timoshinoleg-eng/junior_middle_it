@@ -26,7 +26,7 @@ class _FakeStore:
 
 
 def _patch_store(store):
-    return patch("growth_store.PostgresGrowthStore", return_value=store)
+    return patch.object(navigator, "_build_growth_store", return_value=store)
 
 
 def _ok_call(script):
@@ -193,14 +193,13 @@ class TelegramNavigatorAdminTests(unittest.TestCase):
             calls.append(method)
             return _ok_call(script)(token, method, payload)
 
-        env = dict(_ENV)
-        env.pop("GROWTH_DATABASE_URL")
-        with patch.dict(os.environ, env, clear=False), patch.dict(
-            os.environ, {"DATABASE_URL": ""}, clear=False
+        with patch.dict(os.environ, _ENV, clear=False), patch.object(
+            navigator, "_build_growth_store", side_effect=RuntimeError("growth_dsn_missing")
         ), patch.object(navigator, "_try_call", side_effect=fake_call):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(RuntimeError) as ctx:
                 navigator._apply_navigator()
 
+        self.assertIn("navigator_state_unavailable", str(ctx.exception))
         self.assertNotIn("sendMessage", calls)
         self.assertNotIn("pinChatMessage", calls)
 
