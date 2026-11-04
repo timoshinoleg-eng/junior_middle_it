@@ -435,7 +435,11 @@ JUNIOR_SIGNALS = [
     "0-1 year", "0-2 years", "1 year", "1+ year", "1-2 years",
     "no experience", "без опыта", "beginner",
     "new grad", "new graduate", "campus hire", "associate engineer",
-    "intern", "стажер", "стажёр"
+    "intern", "стажер", "стажёр",
+    # Typographic en-dash variants of the numeric ranges above; boards paste
+    # job texts from Word/Notion where hyphens become –, and a missed range
+    # silently drops a real junior posting into the no-level bucket.
+    "0–1 year", "0–2 years", "1–2 years",
 ]
 
 MIDDLE_SIGNALS = [
@@ -444,7 +448,9 @@ MIDDLE_SIGNALS = [
     # analytics roles from the phrase "regular working hours". Measured on live
     # sources it was the sole level evidence for 5 of 41 classified vacancies.
     "middle", "mid-level", "mid level", "intermediate",
-    "2-3 years", "2-4 years", "3-5 years", "2+ years", "3+ years"
+    "2-3 years", "2-4 years", "3-5 years", "2+ years", "3+ years",
+    # En-dash variants, same reasoning as in JUNIOR_SIGNALS.
+    "2–3 years", "2–4 years", "3–5 years",
 ]
 
 EXCLUDE_SIGNALS = [
@@ -1771,22 +1777,46 @@ def _structured_level_text(job_data: Dict) -> str:
 
 
 def classify_job_level(job_data: Dict) -> Optional[str]:
-    """Classify job level with exclusion logic"""
+    """Classify job level with exclusion logic.
+
+    Evidence hierarchy (strongest first):
+    1. An explicit senior marker in the TITLE vetoes everything.
+    2. Explicit level evidence in the TITLE (junior/mid signals, ladder
+       markers) outranks exclude words in the DESCRIPTION prose — measured
+       on live sources, "report to the senior manager" in a body text
+       was vetoing explicit "Junior Data Scientist" / "... Intern" titles.
+    3. Description-level exclusion, then description-level signals.
+    4. Structured metadata is weakest: boards routinely tag every technical
+       role "Senior", so a coarse metadata label must not veto text evidence.
+    """
     title_text = str(job_data.get('title', '')).lower()
     full_text = f"{job_data.get('title', '')} {job_data.get('description', '')}".lower()
     structured_text = _structured_level_text(job_data).lower()
 
-    # Exclude senior+ roles stated in the posting text first.
-    if any(has_text_signal(full_text, word) for word in EXCLUDE_SIGNALS):
+    # 1) Explicit seniority stated in the title is decisive.
+    if any(has_text_signal(title_text, word) for word in EXCLUDE_SIGNALS):
         return None
 
+    # 2) Explicit level evidence in the title beats description prose.
+    if any(has_text_signal(title_text, word) for word in JUNIOR_SIGNALS):
+        return "Junior"
+    if any(has_text_signal(title_text, signal) for signal in MIDDLE_SIGNALS):
+        return "Middle"
+    # Scoped ladder markers are explicit statements, not seniority guesses.
+    if _ENTRY_LEVEL_TITLE_RE.search(title_text):
+        return "Junior"
+    if _MID_LEVEL_TITLE_RE.search(title_text):
+        return "Middle"
+
+    # 3) Description-level evidence: exclusion first.
+    if any(has_text_signal(full_text, word) for word in EXCLUDE_SIGNALS):
+        return None
     if any(has_text_signal(full_text, word) for word in JUNIOR_SIGNALS):
         return "Junior"
     if any(has_text_signal(full_text, signal) for signal in MIDDLE_SIGNALS):
         return "Middle"
-    # Structured metadata is weaker than the posting text: boards routinely tag
-    # every technical role "Senior", so a coarse metadata label must not veto a
-    # title that explicitly asks for a junior or mid candidate.
+
+    # 4) Structured metadata as the last resort.
     if structured_text and any(has_text_signal(structured_text, word) for word in EXCLUDE_SIGNALS):
         return None
     if structured_text:
@@ -1794,11 +1824,6 @@ def classify_job_level(job_data: Dict) -> Optional[str]:
             return "Junior"
         if any(has_text_signal(structured_text, signal) for signal in MIDDLE_SIGNALS):
             return "Middle"
-    # Scoped ladder markers are explicit statements, not seniority guesses.
-    if _ENTRY_LEVEL_TITLE_RE.search(title_text):
-        return "Junior"
-    if _MID_LEVEL_TITLE_RE.search(title_text):
-        return "Middle"
     # A technical title alone is not evidence of Junior/Middle seniority.
     # Keep unknown levels out of the public queue instead of labelling them Junior.
     return None
