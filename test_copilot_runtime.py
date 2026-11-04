@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import copilot_webhook_runtime as copilot_runtime
+from copilot import store as copilot_store
 import durable_product_state as durable
 from message_formatter import build_copilot_url, copilot_enabled
 from test_copilot_credit_operations import FakeGrowthStore
@@ -377,6 +378,26 @@ class CopilotAIRuntimeTests(unittest.TestCase):
                 self.assertNotIn("cv", key.lower())
 
 
+class _ResumeStoreFake:
+    """Minimal CopilotStore stand-in for the saved-resume flow."""
+
+    def __init__(self):
+        self.saved = {}
+
+    def save_resume(self, user_id, text, *, skills="", grade=""):
+        self.saved = {"text": text, "skills": skills, "grade": grade}
+        return True
+
+    def get_resume(self, user_id):
+        return None
+
+    def delete_resume(self, user_id):
+        return False
+
+    def save_profile(self, user_id, *, grade="", skills="", source=""):
+        return True
+
+
 class CopilotForwardRuntimeTests(unittest.TestCase):
     """Forward-to-Analyze never swallows commands, documents or resumes."""
 
@@ -451,14 +472,31 @@ class CopilotForwardRuntimeTests(unittest.TestCase):
             asyncio.run(copilot_runtime._copilot_handle_setup_text(
                 bot, update, SimpleNamespace()
             ))
+        # New contract (saved-resume flow): the resume is routed into the
+        # profile save; without a durable store the flow answers with the
+        # explicit "saving unavailable" message instead of the old refusal.
         self.assertEqual(len(message.replies), 1)
-        self.assertIn("вакансия не выбрана", message.replies[0][0])
-        self.assertEqual(
-            message.replies[0][1]["reply_markup"].inline_keyboard[0][0].callback_data,
-            "growth_quick_fresh",
-        )
-        original.assert_not_awaited()
+        self.assertIn("Сохранение резюме сейчас недоступно", message.replies[0][0])
         self.assertFalse(bot.db.events)
+        original.assert_not_awaited()
+
+    def test_plain_resume_is_saved_into_profile_when_store_available(self):
+        resume_text = (
+            "Резюме: Python разработчик. Опыт работы 3 года, "
+            "образование техническое, мои навыки Python и PostgreSQL. "
+            "Оптимизировал обработку заказов в команде разработки."
+        )
+        message = FakeMessage(text=resume_text)
+        store = _ResumeStoreFake()
+        with patch.object(
+            copilot_store.CopilotStore, "from_database", return_value=store
+        ):
+            db2, message2, original = self._run(message)
+        self.assertEqual(len(message2.replies), 1)
+        self.assertIn("сохранено", message2.replies[0][0].lower())
+        self.assertIn(store.saved["text"], resume_text)
+        self.assertTrue(any(name == "resume_saved" for name, _ in db2.events))
+        original.assert_not_awaited()
 
     def test_resume_match_session_keeps_own_text_handler(self):
         import asyncio

@@ -174,6 +174,55 @@ class CopilotStore:
         }
 
     # ------------------------------------------------------------------
+    # Saved resume (opt-in, one per user; content never leaves the store)
+    # ------------------------------------------------------------------
+    def save_resume(self, user_id: int, resume_text: str, *, skills: str = "", grade: str = "") -> bool:
+        """Upsert the user's own resume text parsed on upload."""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_copilot_resumes (user_id, resume_text, skills, grade, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    resume_text = EXCLUDED.resume_text,
+                    skills = EXCLUDED.skills,
+                    grade = EXCLUDED.grade,
+                    updated_at = NOW()
+                RETURNING user_id
+                """,
+                (int(user_id), str(resume_text or ""), str(skills or ""), str(grade or "")),
+            )
+            return bool(cur.fetchone())
+
+    def get_resume(self, user_id: int) -> Optional[Dict]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT resume_text, skills, grade, updated_at
+                FROM growth_copilot_resumes
+                WHERE user_id = %s
+                """,
+                (int(user_id),),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "resume_text": str(row[0] or ""),
+            "skills": str(row[1] or ""),
+            "grade": str(row[2] or ""),
+            "updated_at": row[3],
+        }
+
+    def delete_resume(self, user_id: int) -> bool:
+        with self._cursor() as cur:
+            cur.execute(
+                "DELETE FROM growth_copilot_resumes WHERE user_id = %s RETURNING user_id",
+                (int(user_id),),
+            )
+            return bool(cur.fetchone())
+
+    # ------------------------------------------------------------------
     # Evaluation
     # ------------------------------------------------------------------
     def save_evaluation(
