@@ -84,7 +84,8 @@ async def cmd_feedback(job_bot, update, context) -> None:
     if not feedback_enabled():
         await update.message.reply_text(DISABLED_TEXT)
         return
-    user_id = update.effective_user.id if update.effective_user else None
+    user = getattr(update, "effective_user", None)
+    user_id = user.id if user else None
     if not user_id:
         return
     _pending(job_bot)[user_id] = {"v": 1}
@@ -94,7 +95,8 @@ async def cmd_feedback(job_bot, update, context) -> None:
 
 async def cmd_cancel(job_bot, update, context) -> None:
     """``/cancel_feedback`` — disarm without sending anything."""
-    user_id = update.effective_user.id if update.effective_user else None
+    user = getattr(update, "effective_user", None)
+    user_id = user.id if user else None
     if not user_id:
         return
     _pending(job_bot).pop(user_id, None)
@@ -111,7 +113,8 @@ async def capture_if_pending(job_bot, update, context) -> bool:
     message = getattr(update, "message", None)
     if message is None:
         return False
-    user_id = update.effective_user.id if update.effective_user else None
+    user = getattr(update, "effective_user", None)
+    user_id = user.id if user else None
     if not user_id:
         return False
     pending = _pending(job_bot)
@@ -126,7 +129,7 @@ async def capture_if_pending(job_bot, update, context) -> bool:
     header = "\n".join(
         [
             "📬 Обратная связь от пользователя бота",
-            _attribution(update.effective_user),
+            _attribution(user),
             "---",
         ]
     )
