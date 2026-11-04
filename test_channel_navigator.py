@@ -48,6 +48,21 @@ class NavigatorPostTests(unittest.TestCase):
         self.assertNotIn("from message_formatter", source)
 
 
+class _FakeChannelStore:
+    def __init__(self):
+        self.state = {}
+
+    def get_channel_state(self, _key):
+        return dict(self.state)
+
+    def save_channel_state(self, _key, state):
+        self.state.update(state)
+        return True
+
+    def close(self):
+        pass
+
+
 class NavigatorAdminTests(unittest.TestCase):
     def _run_apply(self, calls, chat_with_navigator=False, bot_username="test_bot"):
         import api.telegram_navigator_admin as admin
@@ -55,9 +70,14 @@ class NavigatorAdminTests(unittest.TestCase):
         state = {"pinned": None}
         if chat_with_navigator:
             state["pinned"] = {"message_id": 55, "text": NAVIGATOR_TITLE + "\nold"}
+        store = _FakeChannelStore()
 
         def fake_call(token, method, payload=None):
             calls.append((method, payload or {}))
+            if method == "getMe":
+                return {"id": 42}
+            if method == "getChatMember":
+                return {"status": "administrator", "can_pin_message": True}
             if method == "getChat":
                 chat = {}
                 if state["pinned"]:
@@ -69,7 +89,7 @@ class NavigatorAdminTests(unittest.TestCase):
                 state["posted"] = {"message_id": 77, "text": plain}
                 return {"message_id": 77}
             if method == "pinChatMessage":
-                state["pinned"] = state.get("posted")
+                state["pinned"] = state.get("posted") or state["pinned"]
                 return True
             raise AssertionError(method)
 
@@ -78,10 +98,11 @@ class NavigatorAdminTests(unittest.TestCase):
             "TELEGRAM_BOT_TOKEN": "token",
             "CHANNEL_ID": "@chan",
             "BOT_USERNAME": bot_username,
+            "GROWTH_DATABASE_URL": "postgresql://test",
         }
-        with patch.dict(os.environ, env, clear=False), patch.object(
-            admin, "_telegram_call", side_effect=fake_call
-        ):
+        with patch.dict(os.environ, env, clear=False), patch(
+            "growth_store.PostgresGrowthStore", return_value=store
+        ), patch.object(admin, "_telegram_call", side_effect=fake_call):
             return admin._apply_navigator()
 
     def test_first_run_posts_and_pins(self):

@@ -106,6 +106,13 @@ class PostgresGrowthStore:
             "CREATE INDEX IF NOT EXISTS idx_growth_events_name_ts ON growth_events(name, ts)",
             "CREATE INDEX IF NOT EXISTS idx_growth_events_user_ts ON growth_events(user_id, ts)",
             "CREATE INDEX IF NOT EXISTS idx_growth_referrals_referrer ON growth_referrals(referrer_id)",
+            """
+            CREATE TABLE IF NOT EXISTS growth_channel_state (
+                channel_key TEXT PRIMARY KEY,
+                state JSONB NOT NULL DEFAULT '{}'::jsonb,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
         ]
         with self._ensure_conn().cursor() as cur:
             for statement in statements:
@@ -201,6 +208,38 @@ class PostgresGrowthStore:
                 "INSERT INTO growth_events (user_id, name, props) VALUES (%s, %s, %s)",
                 (user_id, str(name), Jsonb(props or {})),
             )
+
+    # ------------------------------------------------------------------
+    # Channel state (singletons per channel: pinned posts, marks, etc.)
+    # ------------------------------------------------------------------
+    def get_channel_state(self, channel_key: str) -> Dict[str, Any]:
+        """Return the JSON state blob stored for ``channel_key`` (``{}`` if none)."""
+        with self._ensure_conn().cursor() as cur:
+            cur.execute(
+                "SELECT state FROM growth_channel_state WHERE channel_key = %s",
+                (str(channel_key),),
+            )
+            row = cur.fetchone()
+        if not row or row[0] is None:
+            return {}
+        return dict(row[0])
+
+    def save_channel_state(self, channel_key: str, state: Dict[str, Any]) -> bool:
+        """Merge ``state`` into the stored blob for ``channel_key``."""
+        current = self.get_channel_state(channel_key)
+        current.update({k: v for k, v in (state or {}).items() if v is not None})
+        with self._ensure_conn().cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO growth_channel_state (channel_key, state, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (channel_key) DO UPDATE SET
+                    state = EXCLUDED.state,
+                    updated_at = NOW()
+                """,
+                (str(channel_key), Jsonb(current)),
+            )
+        return True
 
     def register_referral(self, user_id: int, referrer_id: int) -> bool:
         if not user_id or not referrer_id or int(user_id) == int(referrer_id):

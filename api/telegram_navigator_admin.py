@@ -48,6 +48,37 @@ def _try_call(token: str, method: str, payload: dict | None = None):
         return False, None, str(exc)[:220]
 
 
+def _load_navigator_state(channel_id: str) -> tuple:
+    """Return (store, state, error). ``store`` is ``None`` when Postgres is out."""
+    from growth_store import GrowthStoreUnavailable, PostgresGrowthStore
+
+    dsn = (os.getenv("GROWTH_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
+    if not dsn:
+        return None, {}, "growth_dsn_missing"
+    try:
+        store = PostgresGrowthStore(dsn, all_categories=[])
+    except GrowthStoreUnavailable as exc:
+        return None, {}, f"growth_store_unavailable: {exc}"[:200]
+    key = f"navigator:{channel_id}"
+    try:
+        return store, store.get_channel_state(key), ""
+    except Exception as exc:
+        store.close()
+        return None, {}, f"channel_state_read_failed: {type(exc).__name__}"
+
+
+def _save_navigator_state(store, channel_id: str, state: dict) -> str:
+    try:
+        store.save_channel_state(f"navigator:{channel_id}", state)
+        return ""
+    except Exception as exc:
+        return f"channel_state_write_failed: {type(exc).__name__}"
+
+
+def _is_navigator_pin(pinned: dict, title: str) -> bool:
+    return str((pinned or {}).get("text") or (pinned or {}).get("caption") or "").startswith(title)
+
+
 def _apply_navigator() -> dict:
     from channel_navigator import DEFAULT_CHANNEL, NAVIGATOR_TITLE, build_navigator_post
 
@@ -60,68 +91,129 @@ def _apply_navigator() -> dict:
         raise RuntimeError("telegram_token_missing")
 
     username = _bot_username()
+
+    # 0) Durability gate: without Postgres state we cannot guarantee
+    #    idempotency, and a failed pin would duplicate the post on retry.
+    store, state, state_error = _load_navigator_state(channel_id)
+    if store is None:
+        raise RuntimeError(f"navigator_state_unavailable: {state_error}")
+
+    # 1) Capability gate: pin BEFORE any posting. A bot without the
+    #    "pin messages" right must never publish (otherwise every retry
+    #    appends another copy of the post to the channel).
+    me_ok, me, me_error = _try_call(token, "getMe")
+    bot_id = (me or {}).get("id") if me_ok else None
+    member_ok, member, member_error = _try_call(
+        token, "getChatMember", {"chat_id": channel_id, "user_id": bot_id} if bot_id else {"chat_id": channel_id}
+    )
+    member = member or {}
+    can_pin = bool(member.get("can_pin_message")) or member.get("status") == "creator"
+    if not can_pin:
+        store.close()
+        return {
+            "ok": False,
+            "automated_ok": False,
+            "navigator_post_ok": False,
+            "posted_new": False,
+            "post_message_id": None,
+            "pin_post_status": "skipped",
+            "bot_username_set": bool(username),
+            "can_pin_message": False,
+            "post_error": "",
+            "pin_error": member_error or me_error or "bot lacks pin right in channel",
+            "state_error": state_error,
+        }
+
     text, reply_markup = build_navigator_post(username, channel_id)
 
+    # 2) If a navigator post is already pinned — done.
     chat_ok, chat, chat_error = _try_call(token, "getChat", {"chat_id": channel_id})
     chat = chat or {}
     pinned = chat.get("pinned_message") or {}
-    pinned_text = str(pinned.get("text") or pinned.get("caption") or "")
-    message_id = pinned.get("message_id") if pinned_text.startswith(NAVIGATOR_TITLE) else None
+    stored_id = state.get("post_message_id")
+    stored_id = int(stored_id) if stored_id else None
 
+    posted = False
     post_error = ""
     pin_error = ""
-    posted = False
-    if message_id is None:
-        payload = {
-            "chat_id": channel_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        if reply_markup.get("inline_keyboard"):
-            payload["reply_markup"] = reply_markup
-        post_ok, sent, post_error = _try_call(token, "sendMessage", payload)
-        if post_ok and isinstance(sent, dict):
-            posted = True
-            message_id = sent.get("message_id")
-        else:
-            message_id = None
+    message_id = None
+    status = "existing"
 
-    pinned_ok = False
-    if message_id is not None and not pinned_text.startswith(NAVIGATOR_TITLE):
-        pin_ok, _, pin_error = _try_call(
-            token, "pinChatMessage", {"chat_id": channel_id, "message_id": message_id}
-        )
-        pinned_ok = bool(pin_ok)
+    if _is_navigator_pin(pinned, NAVIGATOR_TITLE):
+        message_id = pinned.get("message_id")
+        status = "existing"
+    else:
+        # 3) Try to re-pin the post we already know about (no new send).
+        if stored_id is not None:
+            pin_ok, _, pin_error = _try_call(
+                token, "pinChatMessage", {"chat_id": channel_id, "message_id": stored_id}
+            )
+            if pin_ok:
+                message_id = stored_id
+                status = "repinned"
+            elif "not found" in (pin_error or "").lower():
+                stored_id = None  # message was deleted; fall through to repost
+                state.pop("post_message_id", None)
+                pin_error = ""
+        # 4) Post a fresh copy only when nothing reusable exists.
+        if message_id is None and stored_id is None:
+            payload = {
+                "chat_id": channel_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            if reply_markup.get("inline_keyboard"):
+                payload["reply_markup"] = reply_markup
+            post_ok, sent, post_error = _try_call(token, "sendMessage", payload)
+            if post_ok and isinstance(sent, dict):
+                posted = True
+                message_id = sent.get("message_id")
+                status = "posted"
+                state["post_message_id"] = message_id
+                save_error = _save_navigator_state(store, channel_id, state)
+                if save_error:
+                    post_error = (post_error + "; " + save_error).strip("; ")
+            else:
+                message_id = None
+
+        # 5) Pin the freshly posted message (reused messages were pinned in step 3).
+        if posted and message_id is not None:
+            pin_ok, _, pin_error = _try_call(
+                token, "pinChatMessage", {"chat_id": channel_id, "message_id": message_id}
+            )
+            status = "pinned" if pin_ok else "pin_failed"
 
     verified_chat_ok, verified_chat, verify_chat_error = _try_call(
         token, "getChat", {"chat_id": channel_id}
     )
     verified_chat = verified_chat or {}
     verified_pinned = verified_chat.get("pinned_message") or {}
+    navigator_ok = bool(
+        verified_chat_ok and _is_navigator_pin(verified_pinned, NAVIGATOR_TITLE)
+    )
 
     result = {
-        "navigator_post_ok": bool(
-            verified_chat_ok
-            and str(verified_pinned.get("text") or "").startswith(NAVIGATOR_TITLE)
-        ),
-        "pinned_message_id": verified_pinned.get("message_id"),
+        "navigator_post_ok": navigator_ok,
+        "pinned_message_id": verified_pinned.get("message_id") if navigator_ok else None,
+        "post_message_id": message_id,
         "posted_new": posted,
-        "pin_post_status": (
-            "existing" if (not posted and pinned_text.startswith(NAVIGATOR_TITLE))
-            else ("pinned" if pinned_ok else "failed")
-        ),
+        "pin_post_status": status,
         "bot_username_set": bool(username),
+        "can_pin_message": True,
         "channel_error": chat_error or verify_chat_error,
         "post_error": post_error,
         "pin_error": pin_error,
+        "state_error": state_error,
     }
     result["automated_ok"] = all([
         result["navigator_post_ok"],
         result["bot_username_set"],
+        result["can_pin_message"],
         not result["post_error"],
         not result["pin_error"],
     ])
+    store.close()
     return result
 
 
@@ -186,7 +278,10 @@ class handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(503, {"ok": False, "error": type(exc).__name__})
             return
-        self._send_json(200 if result.get("automated_ok") else 503, {"ok": bool(result.get("automated_ok")), **result})
+        status = 200 if result.get("automated_ok") else 503
+        if result.get("can_pin_message") is False:
+            status = 409  # permanent: retrying cannot fix missing channel rights
+        self._send_json(status, {"ok": bool(result.get("automated_ok")), **result})
 
     def log_message(self, fmt, *args):
         pass
