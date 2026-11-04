@@ -18,3 +18,5 @@ CREATE TABLE IF NOT EXISTS public.growth_copilot_resumes (
     grade TEXT NOT NULL DEFAULT '',
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE public.growth_copilot_resumes ENABLE ROW LEVEL SECURITY;
