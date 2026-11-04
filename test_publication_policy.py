@@ -290,6 +290,44 @@ class PublicationPolicyTests(unittest.TestCase):
             "Junior",
         )
 
+    def test_explicit_title_level_outranks_exclude_words_in_description(self):
+        """Measured false exclusion: "report to the senior manager" in the body
+        text was vetoing explicit Junior/Intern/Intermediate titles."""
+        cases = [
+            ({"title": "Junior Data Scientist", "description": "You will work with senior staff."}, "Junior"),
+            ({"title": "Software Engineer Intern", "description": "Mentored by a senior engineer."}, "Junior"),
+            ({"title": "Intermediate Backend Engineer", "description": "Pair with the engineering manager."}, "Middle"),
+        ]
+        for job, expected in cases:
+            with self.subTest(title=job["title"]):
+                self.assertEqual(classify_job_level(job), expected)
+
+    def test_title_senior_marker_still_vetoes_everything(self):
+        self.assertIsNone(
+            classify_job_level(
+                {"title": "Senior Product Manager", "description": "Mentor junior analysts."}
+            )
+        )
+        self.assertIsNone(
+            classify_job_level(
+                {"title": "Lead Platform Engineer", "description": "Hands-on role."}
+            )
+        )
+
+    def test_en_dash_year_ranges_match_like_hyphen_ranges(self):
+        self.assertEqual(
+            classify_job_level(
+                {"title": "Python Developer", "description": "1–2 years of Django required."}
+            ),
+            "Junior",
+        )
+        self.assertEqual(
+            classify_job_level(
+                {"title": "DevOps Engineer", "description": "2–4 years of Kubernetes."}
+            ),
+            "Middle",
+        )
+
     def test_default_pre_selection_hook_keeps_every_candidate(self):
         jobs = [_vacancy(1), _vacancy(2)]
         self.assertEqual(asyncio.run(probe_candidates_for_publication(jobs)), jobs)
