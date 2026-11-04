@@ -54,6 +54,7 @@ EXPECTED_TABLES = (
     "growth_copilot_grade_audits",
     "growth_copilot_profiles",
     "growth_copilot_rate_limits",
+    "growth_copilot_resumes",
 )
 
 # The audit below maps the paid operations of the journal to a job hash. The

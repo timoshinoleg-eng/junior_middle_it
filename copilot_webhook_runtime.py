@@ -49,6 +49,7 @@ from copilot.credit_operations import (
 from copilot.credits import CreditManager
 from copilot.store import CopilotStore, CopilotStoreUnavailable
 import onboarding_flow as onboarding
+import resume_profile_flow
 from resume_documents import MAX_FILE_BYTES, ResumeDocumentError, extract_resume_document
 
 logger = logging.getLogger(__name__)
@@ -1437,7 +1438,26 @@ async def _copilot_handle_setup_text(self, update, context):
             {"job_hash": pending["job_hash"], "job": job}, requests=requests,
         )
         return
+    if getattr(update.message, "document", None) is not None:
+        # An unmatched resume document: save it into the user profile
+        # instead of ignoring it; vacancy-specific CV builds are handled
+        # above through the pending request. Never interrupt active setup
+        # or Resume Match sessions (same rule as the text gate below).
+        _uid = update.effective_user.id if update.effective_user else None
+        _busy = bool(
+            _uid
+            and (
+                _uid in (getattr(self, "setup_steps", None) or {})
+                or _uid in (getattr(self, "resume_sessions", None) or {})
+            )
+        )
+        if not _busy and await resume_profile_flow.handle_document(self, update, context):
+            return
     if _unmatched_resume_text(self, update):
+        # Save the user's own resume into their profile (opt-in) and report
+        # the parsed stack; vacancy analyses reuse it automatically.
+        if await resume_profile_flow.save_and_report(self, update, update.message.text or ""):
+            return
         await _reply_choose_vacancy_for_resume(update.message)
         return
     if await _maybe_handle_forward(self, update):
@@ -1470,6 +1490,8 @@ async def _copilot_handle_callback(self, update, context):
     # Onboarding extras (obn: prefix) before the copilot namespace; unknown
     # callback_data returns False and keeps the existing behaviour.
     if await onboarding.handle_callback_extras(self, update, context):
+        return
+    if await resume_profile_flow.handle_callback_extras(self, update, context):
         return
     if not data.startswith(CALLBACK_PREFIX):
         return await _original_handle_callback(self, update, context)
@@ -1513,6 +1535,7 @@ def _copilot_build_runtime():
     application.add_handler(CommandHandler("copilot", job_bot.cmd_copilot))
     application.add_handler(CommandHandler("upskill", job_bot.cmd_upskill))
     onboarding.register_handlers(application, job_bot)
+    resume_profile_flow.register_handlers(application, job_bot)
     return application, db, job_bot
 
 

@@ -136,7 +136,7 @@ class PostgresGrowthStore:
                 """
                 SELECT enabled_categories, hide_senior, min_salary_filter,
                        skills, digest_enabled, onboarding_done, alerts_enabled,
-                       premium_unlocked
+                       premium_unlocked, extra
                 FROM growth_user_settings WHERE user_id = %s
                 """,
                 (int(user_id),),
@@ -145,7 +145,7 @@ class PostgresGrowthStore:
         if not row:
             return self._defaults()
         cats = [c for c in (row[0] or "").split(",") if c]
-        return {
+        settings = {
             "enabled_categories": cats or list(self.all_categories),
             "hide_senior": bool(row[1]),
             "min_salary_filter": int(row[2] or 0),
@@ -155,20 +155,46 @@ class PostgresGrowthStore:
             "alerts_enabled": bool(row[6]),
             "premium_unlocked": bool(row[7]),
         }
+        extra = row[8] if len(row) > 8 else None
+        if isinstance(extra, dict):
+            for key, value in extra.items():
+                settings.setdefault(str(key), value)
+        return settings
+
+    _EXTRA_SETTINGS_KEYS = (
+        "magnet_claimed",
+        "stars_charge_ids",
+    )
 
     def save_user_settings(self, user_id: int, settings: Dict[str, Any]) -> bool:
         current = self.get_user_settings(user_id)
-        current.update({k: v for k, v in (settings or {}).items() if v is not None})
+        incoming = {k: v for k, v in (settings or {}).items() if v is not None}
+        current.update(incoming)
         cats = current.get("enabled_categories") or list(self.all_categories)
         cats_str = cats if isinstance(cats, str) else ",".join(str(c) for c in cats if c)
+        # Product flags that are not first-class columns persist in the
+        # ``extra`` JSONB bag; without this they were silently dropped on the
+        # Postgres backend (magnet re-claimable, Stars double-grantable).
+        known = {
+            "enabled_categories", "hide_senior", "min_salary_filter", "skills",
+            "digest_enabled", "onboarding_done", "alerts_enabled", "premium_unlocked",
+        }
+        base_extra = current.get("extra") if isinstance(current.get("extra"), dict) else {}
+        extra = dict(base_extra)
+        for key, value in incoming.items():
+            if key not in known:
+                extra[str(key)] = value
+        for key in self._EXTRA_SETTINGS_KEYS:
+            if key in current and key not in known:
+                extra.setdefault(str(key), current[key])
         with self._ensure_conn().cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO growth_user_settings (
                     user_id, enabled_categories, hide_senior, min_salary_filter,
                     skills, digest_enabled, onboarding_done, alerts_enabled,
-                    premium_unlocked, updated_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                    premium_unlocked, extra, updated_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                 ON CONFLICT (user_id) DO UPDATE SET
                     enabled_categories=EXCLUDED.enabled_categories,
                     hide_senior=EXCLUDED.hide_senior,
@@ -178,6 +204,7 @@ class PostgresGrowthStore:
                     onboarding_done=EXCLUDED.onboarding_done,
                     alerts_enabled=EXCLUDED.alerts_enabled,
                     premium_unlocked=EXCLUDED.premium_unlocked,
+                    extra=EXCLUDED.extra,
                     updated_at=NOW()
                 """,
                 (
@@ -185,6 +212,7 @@ class PostgresGrowthStore:
                     int(current.get("min_salary_filter") or 0), str(current.get("skills") or ""),
                     bool(current.get("digest_enabled")), bool(current.get("onboarding_done")),
                     bool(current.get("alerts_enabled")), bool(current.get("premium_unlocked")),
+                    Jsonb(extra),
                 ),
             )
         return True
