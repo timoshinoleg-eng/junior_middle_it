@@ -62,7 +62,11 @@ class TelegramNavigatorAdminTests(unittest.TestCase):
         store = _FakeStore()
         script = {
             "getMe": {"id": 42},
-            "getChatMember": {"status": "administrator", "can_pin_message": False},
+            "getChatMember": {
+                "status": "administrator",
+                "can_pin_message": False,
+                "can_edit_messages": False,
+            },
         }
         calls = []
 
@@ -80,6 +84,29 @@ class TelegramNavigatorAdminTests(unittest.TestCase):
         self.assertFalse(result["can_pin_message"])
         self.assertFalse(result["posted_new"])
         self.assertFalse(result["automated_ok"])
+
+    def test_channel_edit_right_counts_as_pin_capability(self):
+        """Channels have no can_pin_messages right; can_edit_messages is the
+        Telegram right that governs pinning there (Bot API pinChatMessage)."""
+        store = _FakeStore()
+        script = {
+            "getMe": {"id": 42},
+            "getChatMember": {"status": "administrator", "can_edit_messages": True},
+            "getChat": [
+                (True, {"pinned_message": {"message_id": 4174, "text": "legacy pin"}}, ""),
+                (True, {"pinned_message": {"message_id": 9001, "text": _pinned_navigator_text()}}, ""),
+            ],
+            "sendMessage": {"message_id": 9001},
+            "pinChatMessage": True,
+        }
+        with patch.dict(os.environ, _ENV, clear=False), _patch_store(store), patch.object(
+            navigator, "_try_call", side_effect=_ok_call(script)
+        ):
+            result = navigator._apply_navigator()
+
+        self.assertTrue(result["can_pin_message"])
+        self.assertTrue(result["posted_new"])
+        self.assertTrue(result["automated_ok"])
 
     def test_fresh_post_saves_state_and_pins(self):
         store = _FakeStore()

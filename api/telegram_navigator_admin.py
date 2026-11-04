@@ -109,15 +109,23 @@ def _apply_navigator() -> dict:
         raise RuntimeError(f"navigator_state_unavailable: {state_error}")
 
     # 1) Capability gate: pin BEFORE any posting. A bot without the
-    #    "pin messages" right must never publish (otherwise every retry
+    #    pin capability must never publish (otherwise every retry
     #    appends another copy of the post to the channel).
+    #    Bot API: pinChatMessage needs "can_pin_messages" in a supergroup
+    #    but "can_edit_messages" in a channel — channels have no separate
+    #    pin right, so checking only can_pin_message blocks full channel
+    #    admins that could pin just fine.
     me_ok, me, me_error = _try_call(token, "getMe")
     bot_id = (me or {}).get("id") if me_ok else None
     member_ok, member, member_error = _try_call(
         token, "getChatMember", {"chat_id": channel_id, "user_id": bot_id} if bot_id else {"chat_id": channel_id}
     )
     member = member or {}
-    can_pin = bool(member.get("can_pin_message")) or member.get("status") == "creator"
+    can_pin = (
+        bool(member.get("can_pin_message"))
+        or bool(member.get("can_edit_messages"))
+        or member.get("status") == "creator"
+    )
     if not can_pin:
         store.close()
         return {
