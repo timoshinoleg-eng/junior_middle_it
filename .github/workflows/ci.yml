@@ -121,6 +121,7 @@ jobs:
              test_copilot_runtime \
             test_onboarding_flow \
             test_resume_profile_flow \
+            test_feedback_flow \
             test_channel_navigator \
              test_resume_image_webhook \
              test_copilot_pdf \

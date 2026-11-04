@@ -50,6 +50,7 @@ from copilot.credits import CreditManager
 from copilot.store import CopilotStore, CopilotStoreUnavailable
 import onboarding_flow as onboarding
 import resume_profile_flow
+import feedback_flow
 from resume_documents import MAX_FILE_BYTES, ResumeDocumentError, extract_resume_document
 
 logger = logging.getLogger(__name__)
@@ -1453,6 +1454,12 @@ async def _copilot_handle_setup_text(self, update, context):
         )
         if not _busy and await resume_profile_flow.handle_document(self, update, context):
             return
+    # Feedback mode: an armed /feedback owns the very next message. It sits
+    # below the vacancy-scoped CV build (which carries a credit charge) but
+    # above the resume heuristics, so an explicit feedback intent is never
+    # misparsed as a resume or a forwarded vacancy.
+    if await feedback_flow.capture_if_pending(self, update, context):
+        return
     if _unmatched_resume_text(self, update):
         # Save the user's own resume into their profile (opt-in) and report
         # the parsed stack; vacancy analyses reuse it automatically.
@@ -1474,6 +1481,10 @@ async def _resume_image_guidance(self, update, context):
     """
     message = update.message
     if message is None:
+        return
+    # An armed feedback session owns the image: the owner gets the original
+    # screenshot instead of the OCR guidance.
+    if await feedback_flow.capture_if_pending(self, update, context):
         return
     await message.reply_text(
         "Получил изображение, но PNG/JPG пока не умею распознавать. "
@@ -1536,12 +1547,23 @@ def _copilot_build_runtime():
     application.add_handler(CommandHandler("upskill", job_bot.cmd_upskill))
     onboarding.register_handlers(application, job_bot)
     resume_profile_flow.register_handlers(application, job_bot)
+    feedback_flow.register_handlers(application, job_bot)
     return application, db, job_bot
 
 
 async def _cmd_stars(self, update, context):
     """``/stars`` — Telegram Stars invoice for the AI-credit pack."""
     await onboarding.cmd_stars(self, update, context)
+
+
+async def _cmd_feedback(self, update, context):
+    """``/feedback`` — arm the one-shot feedback capture."""
+    await feedback_flow.cmd_feedback(self, update, context)
+
+
+async def _cmd_cancel_feedback(self, update, context):
+    """``/cancel_feedback`` — disarm the feedback capture."""
+    await feedback_flow.cmd_cancel(self, update, context)
 
 
 async def _copilot_cmd_stats_growth(self, update, context):
@@ -1577,6 +1599,8 @@ durable.JobBot.cmd_start = _copilot_cmd_start
 durable.JobBot.cmd_copilot = _cmd_copilot
 durable.JobBot.cmd_upskill = _cmd_upskill
 durable.JobBot.cmd_stars = _cmd_stars
+durable.JobBot.cmd_feedback = _cmd_feedback
+durable.JobBot.cmd_cancel_feedback = _cmd_cancel_feedback
 durable.JobBot.cmd_stats_growth = _copilot_cmd_stats_growth
 durable.JobBot.handle_callback = _copilot_handle_callback
 durable.JobBot.handle_setup_text = _copilot_handle_setup_text
