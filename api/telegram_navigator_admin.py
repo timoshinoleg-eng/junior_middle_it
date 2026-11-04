@@ -4,15 +4,13 @@ Manual, secured endpoint: same contract as ``api/telegram_branding_admin.py``
 (``Authorization: Bearer $CRON_SECRET``, production only, safe to re-run —
 an existing navigator pin is detected by its title and left untouched).
 
-Only stdlib is imported at module level: every third-party / repo-level
-dependency is imported lazily inside the handlers, so a bundling problem
-surfaces as a readable JSON payload instead of an opaque
-FUNCTION_INVOCATION_FAILED.
+Only stdlib is imported at module level; repo-level / third-party
+dependencies are imported lazily inside the handlers (the Vercel bundler
+proved unreliable at resolving top-level repo imports for this function).
 """
 import json
 import os
 import sys
-import traceback
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -125,26 +123,6 @@ def _apply_navigator() -> dict:
     return result
 
 
-def _import_probe() -> dict:
-    """Diagnostic: try each lazy dependency and capture tracebacks."""
-    probes: dict = {"sys_path_head": sys.path[:6], "cwd": os.getcwd()}
-    try:
-        here = Path(__file__).resolve()
-        probes["file"] = str(here)
-        probes["dir_listing"] = sorted(p.name for p in here.parent.iterdir())
-        root = here.parents[1]
-        probes["root_listing"] = sorted(p.name for p in root.iterdir())
-    except Exception:
-        probes["dir_error"] = traceback.format_exc()[-600:]
-    for name in ("requests", "serverless_health", "channel_navigator"):
-        try:
-            module = __import__(name)
-            probes[name] = getattr(module, "__file__", "builtin")
-        except Exception:
-            probes[f"{name}_error"] = traceback.format_exc()[-900:]
-    return probes
-
-
 class handler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, payload: dict):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -157,23 +135,11 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        from urllib.parse import parse_qs, urlparse
-
-        if "selftest" in parse_qs(urlparse(self.path).query):
-            self._send_json(200, {"ok": True, "probes": _import_probe()})
-            return
         self._send_json(405, {"ok": False, "error": "method_not_allowed"})
 
     def do_POST(self):
-        try:
-            from serverless_health import cron_authorized
-        except Exception:
-            self._send_json(500, {
-                "ok": False,
-                "error": "serverless_health_import_failed",
-                "detail": traceback.format_exc()[-1200:],
-            })
-            return
+        from serverless_health import cron_authorized
+
         if not cron_authorized(self.headers.get("authorization", "")):
             self._send_json(401, {"ok": False, "error": "unauthorized"})
             return
