@@ -7,6 +7,7 @@ only for the lifetime of the request.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -303,6 +304,19 @@ def _log_error_event(db, name: str, exc: BaseException) -> None:
         pass
 
 
+def _stage_event(db, stage: str) -> None:
+    """Best-effort stage marker so a silent hang shows its last reached step."""
+    try:
+        db.log_event(None, "webhook_stage", {"stage": stage})
+    except Exception:
+        pass
+
+
+async def _process_update_once(application, update) -> None:
+    """Single-update processing step; wrapped in a deadline by the caller."""
+    await application.process_update(update)
+
+
 async def process_update_payload(payload: Dict[str, Any]) -> str:
     """Process one Telegram update and preserve retryability on handler failure."""
     if not isinstance(payload, dict):
@@ -317,6 +331,7 @@ async def process_update_payload(payload: Dict[str, Any]) -> str:
         logger.error("telegram runtime build failed: %s", type(exc).__name__)
         raise
     runtime_at = time.perf_counter()
+    _stage_event(db, "runtime_built")
     try:
         ledger = TelegramUpdateLedger(db)
         claim_state = ledger.claim(update_id)
@@ -324,6 +339,7 @@ async def process_update_payload(payload: Dict[str, Any]) -> str:
         _log_error_event(db, "webhook_runtime_error", exc)
         raise
     claimed_at = time.perf_counter()
+    _stage_event(db, f"claimed:{claim_state}")
     if claim_state == "processed":
         db.close()
         return "duplicate"
@@ -346,8 +362,13 @@ async def process_update_payload(payload: Dict[str, Any]) -> str:
         update = Update.de_json(payload, application.bot)
         if update is None:
             raise ValueError("invalid Telegram update")
+        _stage_event(db, "update_ready")
         async with application:
-            await application.process_update(update)
+            _stage_event(db, "application_entered")
+            # A stalled outbound Bot API call must not burn the whole
+            # maxDuration: cancel it, beacon it, and stay retryable.
+            await asyncio.wait_for(_process_update_once(application, update), timeout=90)
+        _stage_event(db, "update_processed")
         if handler_errors:
             raise RuntimeError("Telegram update handler failed") from handler_errors[0]
         handled_at = time.perf_counter()
