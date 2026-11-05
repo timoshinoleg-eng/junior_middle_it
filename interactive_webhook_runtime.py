@@ -312,6 +312,11 @@ def _stage_event(db, stage: str) -> None:
         pass
 
 
+async def _process_update_once(application, update) -> None:
+    """Single-update processing step; wrapped in a deadline by the caller."""
+    await application.process_update(update)
+
+
 async def process_update_payload(payload: Dict[str, Any]) -> str:
     """Process one Telegram update and preserve retryability on handler failure."""
     if not isinstance(payload, dict):
@@ -362,7 +367,7 @@ async def process_update_payload(payload: Dict[str, Any]) -> str:
             _stage_event(db, "application_entered")
             # A stalled outbound Bot API call must not burn the whole
             # maxDuration: cancel it, beacon it, and stay retryable.
-            await asyncio.wait_for(application.process_update(update), timeout=90)
+            await asyncio.wait_for(_process_update_once(application, update), timeout=90)
         _stage_event(db, "update_processed")
         if handler_errors:
             raise RuntimeError("Telegram update handler failed") from handler_errors[0]
