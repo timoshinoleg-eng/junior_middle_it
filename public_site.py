@@ -210,16 +210,16 @@ def _job_card(job: Dict, bot_username: str) -> str:
     )
     actions = [f'<a class="btn primary" href="{apply_url}" rel="nofollow noopener">Откликнуться</a>']
     if bot_url:
-        actions.append(f'<a class="btn" href="{bot_url}">Открыть в боте</a>')
+        actions.append(f'<a class="btn" href="{bot_url}">В боте</a>')
     if resume_url:
-        actions.append(f'<a class="btn ghost" href="{resume_url}">Проверить резюме</a>')
+        actions.append(f'<a class="btn ghost" href="{resume_url}">Resume Match</a>')
 
     return f"""
     <article class="job-card">
-      <div class="badges"><span>{level}</span><span>{category_label}</span></div>
+      <div class="badges"><span class="brace">{{{level.lower()}}}</span><span class="brace">{{{category_label.lower()}}}</span></div>
       <h2>{title}</h2>
       <p class="company">{company}</p>
-      <div class="facts"><span>🌍 {location}</span><span>💰 {salary}</span></div>
+      <div class="facts"><span>{location}</span><span class="salary">{salary}</span></div>
       <div class="tags">{tag_html}</div>
       <div class="actions">{''.join(actions)}</div>
       <p class="source">Источник: {source or 'публичный job board / ATS'}</p>
@@ -255,33 +255,57 @@ def render_landing(
     )
     canonical_html = f'<link rel="canonical" href="{html.escape(canonical, quote=True)}">' if canonical else ""
     og_url = f'<meta property="og:url" content="{html.escape(canonical, quote=True)}">' if canonical else ""
+
+    category_items = [("", "Все")] + [
+        (key, CATEGORY_LABELS[key])
+        for key in ("development", "qa", "devops", "data", "design", "pm", "security")
+    ]
+    category_links = []
+    for key, label in category_items:
+        href = "/" if not key else f"/?category={key}"
+        active = (category == key) if key else (not category)
+        cls = ' class="on"' if active else ""
+        category_links.append(f'<a{cls} href="{href}">{html.escape(label)}</a>')
+    for key in ("junior", "middle"):
+        cls = ' class="on"' if level == key else ""
+        category_links.append(f'<a{cls} href="/?level={key}">{key}</a>')
+
+    if selected:
+        cards = "".join(_job_card(job, bot_username) for job in selected)
+        jobs_section = f'<div class="jobs"><div class="grid">{cards}</div></div>'
+        count_copy = f"Показано {len(selected)} свежих вакансий"
+    else:
+        jobs_section = (
+            '<div class="jobs"><section class="empty"><h2>Подборка обновляется</h2>'
+            '<p>Открой Telegram-бота: там доступны свежие вакансии, персональный digest, '
+            'realtime alerts и Resume Match.</p></section></div>'
+        )
+        count_copy = "Свежая веб-подборка появится после синхронизации"
+
+    strip = (
+        f'<div class="strip"><a href="{html.escape(tg_channel, quote=True)}">'
+        "Канал с живыми вакансиями — читать в Telegram&nbsp;→</a></div>"
+        if tg_channel else ""
+    )
+    header_cells = ""
+    if tg_channel:
+        header_cells += (
+            f'<a class="cell" href="{html.escape(tg_channel, quote=True)}">Канал</a>'
+        )
+    if main_bot:
+        header_cells += (
+            f'<a class="cell square" href="{html.escape(main_bot, quote=True)}">Подобрать</a>'
+        )
+    crop_marks = '<i class="c1"></i><i class="c2"></i><i class="c3"></i><i class="c4"></i>'
     main_cta = (
-        f'<a class="hero-btn" href="{html.escape(main_bot, quote=True)}">Подобрать вакансии под себя</a>'
+        f'<span class="crop"><a class="hero-btn" href="{html.escape(main_bot, quote=True)}">'
+        f"Подобрать вакансии под себя</a>{crop_marks}</span>"
         if main_bot else ""
     )
     channel_cta = (
         f'<a class="hero-link" href="{html.escape(tg_channel, quote=True)}">Открыть Telegram-канал</a>'
         if tg_channel else ""
     )
-
-    category_links = ['<a href="/">Все</a>']
-    for key in ("development", "qa", "devops", "data", "design", "pm", "security"):
-        category_links.append(
-            f'<a href="/?category={key}">{html.escape(CATEGORY_LABELS[key])}</a>'
-        )
-    level_links = '<a href="/?level=junior">Junior</a><a href="/?level=middle">Middle</a>'
-
-    if selected:
-        cards = "".join(_job_card(job, bot_username) for job in selected)
-        jobs_section = f'<div class="grid">{cards}</div>'
-        count_copy = f"Показано {len(selected)} свежих вакансий"
-    else:
-        jobs_section = (
-            '<section class="empty"><h2>Подборка обновляется</h2>'
-            '<p>Открой Telegram-бота: там доступны свежие вакансии, персональный digest, '
-            'realtime alerts и Resume Match.</p></section>'
-        )
-        count_copy = "Свежая веб-подборка появится после синхронизации"
 
     return f"""<!doctype html>
 <html lang="ru">
@@ -295,36 +319,117 @@ def render_landing(
   <meta property="og:title" content="{html.escape(title, quote=True)}">
   <meta property="og:description" content="{html.escape(description, quote=True)}">
   {canonical_html}{og_url}
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23002bff'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' fill='%23ffffff' text-anchor='middle'%3Ej/m%3C/text%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
   <style>
-    :root{{--bg:#f6f7fb;--card:#fff;--text:#151821;--muted:#626a7a;--line:#e4e7ee;--accent:#265cf0}}
-    *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}
-    a{{color:inherit}} .wrap{{max-width:1120px;margin:auto;padding:24px}} .hero{{padding:48px 0 28px}}
-    .eyebrow{{font-weight:700;color:var(--accent)}} h1{{font-size:clamp(32px,6vw,58px);line-height:1.02;margin:12px 0;max-width:900px}}
-    .lead{{font-size:19px;color:var(--muted);max-width:760px}} .hero-actions,.actions,.filters{{display:flex;gap:10px;flex-wrap:wrap}}
-    .hero-btn,.btn{{text-decoration:none;border:1px solid var(--line);background:#fff;border-radius:12px;padding:11px 15px;font-weight:650}}
-    .hero-btn,.btn.primary{{background:var(--accent);color:#fff;border-color:var(--accent)}} .hero-link{{padding:11px 4px;color:var(--accent);font-weight:650}}
-    .filters{{margin:20px 0}} .filters a{{text-decoration:none;background:#fff;border:1px solid var(--line);border-radius:999px;padding:7px 11px;font-size:14px}}
-    .section-head{{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:34px 0 14px}} .section-head p{{color:var(--muted);margin:0}}
-    .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:16px}} .job-card{{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 3px 14px rgba(25,35,60,.04)}}
-    .job-card h2{{font-size:20px;line-height:1.25;margin:10px 0 4px}} .company{{font-weight:650;margin:0 0 14px}} .badges,.facts,.tags{{display:flex;gap:8px;flex-wrap:wrap}}
-    .badges span,.tag{{background:#eef2ff;border-radius:999px;padding:4px 8px;font-size:12px;font-weight:650}} .facts{{color:var(--muted);font-size:14px;margin-bottom:12px}}
-    .tags{{min-height:26px;margin-bottom:16px}} .tag{{background:#f2f3f6;font-weight:500}} .btn{{font-size:13px;padding:8px 10px}} .btn.ghost{{background:transparent}}
-    .source{{color:var(--muted);font-size:11px;margin:14px 0 0}} .empty{{background:#fff;border:1px solid var(--line);border-radius:18px;padding:28px}}
-    footer{{color:var(--muted);font-size:13px;padding:42px 0 20px}} @media(max-width:600px){{.wrap{{padding:18px}}.hero{{padding-top:30px}}}}
+    :root{{--canvas:#fbfbfc;--paper:#ffffff;--ink:#1c1917;--graphite:#57534e;--pebble:#a8a29e;
+      --hairline:#e7e5e4;--cobalt:#002bff;--cobalt-hover:#0022d6;--cobalt-50:#7f95ff;--cobalt-5:#f2f4ff;
+      --sans:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+      --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}}
+    *{{box-sizing:border-box}}
+    body{{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.5 var(--sans);-webkit-font-smoothing:antialiased}}
+    a{{color:inherit}}
+    a:focus-visible,button:focus-visible{{outline:2px solid var(--cobalt);outline-offset:2px}}
+    .sheet{{max-width:1184px;margin:0 auto;border-left:1px solid var(--hairline);border-right:1px solid var(--hairline);background:var(--canvas)}}
+    .strip{{min-height:33px;background:var(--cobalt);display:flex;align-items:center;padding:0 32px}}
+    .strip a{{color:#fff;text-decoration:none;font-size:14px;line-height:16.8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+    .strip a:hover{{text-decoration:underline}}
+    header.bar{{min-height:64px;display:flex;align-items:center;justify-content:space-between;padding:0 32px;border-bottom:1px solid var(--hairline);gap:16px}}
+    .brand{{font:500 15px/1 var(--mono);letter-spacing:.02em;text-decoration:none;white-space:nowrap}}
+    nav.cells{{display:flex;align-items:stretch;height:39px}}
+    nav.cells a{{display:flex;align-items:center;padding:0 14px;border:1px solid var(--hairline);border-left:0;text-decoration:none;font-size:15px;background:var(--canvas)}}
+    nav.cells a:first-child{{border-left:1px solid var(--hairline)}}
+    nav.cells a:hover{{background:var(--cobalt-5)}}
+    nav.cells a.square{{background:var(--cobalt);border-color:var(--cobalt);color:#fff}}
+    nav.cells a.square:hover{{background:var(--cobalt-hover);border-color:var(--cobalt-hover)}}
+    .hero{{position:relative;padding:72px 32px 64px;border-bottom:1px solid var(--hairline);overflow:hidden}}
+    .hero::before{{content:"";position:absolute;top:-70px;left:-60px;right:-60px;height:360px;z-index:0;
+      background:linear-gradient(90deg,rgba(255,59,0,.16) 0%,rgba(246,0,157,.16) 38%,rgba(151,62,198,.16) 71%,rgba(0,142,255,.16) 100%);
+      filter:blur(64px)}}
+    .hero .dots{{position:absolute;top:0;right:0;width:42%;height:100%;z-index:0;pointer-events:none;
+      background-image:radial-gradient(circle,rgba(0,43,255,.30) 1px,transparent 1.4px);background-size:12px 12px;
+      -webkit-mask-image:linear-gradient(to left,#000 25%,transparent 92%);mask-image:linear-gradient(to left,#000 25%,transparent 92%)}}
+    .hero-inner{{position:relative;z-index:1;max-width:780px}}
+    .eyebrow{{font-size:14px;font-weight:500;line-height:1.5;letter-spacing:1.8px;text-transform:uppercase;color:var(--cobalt)}}
+    h1{{font-size:clamp(32px,5vw,44px);line-height:1.1;font-weight:700;letter-spacing:-.88px;margin:14px 0 18px;max-width:840px}}
+    h1 .accent{{color:var(--cobalt)}}
+    .lead{{font-size:18px;line-height:1.5;color:var(--graphite);max-width:640px;margin:0 0 28px}}
+    .hero-actions,.actions{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
+    .hero-btn,.btn{{text-decoration:none;font-size:15px;line-height:21px;padding:8px 16px;border:1px solid var(--hairline);background:var(--canvas);color:var(--ink)}}
+    .hero-btn:hover,.btn.primary:hover{{background:var(--cobalt-hover);border-color:var(--cobalt-hover)}}
+    .btn:hover{{background:var(--cobalt-5)}}
+    .btn.primary{{background:var(--cobalt);border-color:var(--cobalt);color:#fff}}
+    .btn.ghost{{background:transparent}}
+    .hero-link{{padding:8px 4px;color:var(--ink);text-decoration:underline;text-underline-offset:3px}}
+    .crop{{position:relative;display:inline-block}}
+    .crop i{{position:absolute;width:9px;height:9px;pointer-events:none}}
+    .crop .c1{{top:-8px;left:-8px;border-top:1px solid var(--ink);border-left:1px solid var(--ink)}}
+    .crop .c2{{top:-8px;right:-8px;border-top:1px solid var(--ink);border-right:1px solid var(--ink)}}
+    .crop .c3{{bottom:-8px;left:-8px;border-bottom:1px solid var(--ink);border-left:1px solid var(--ink)}}
+    .crop .c4{{bottom:-8px;right:-8px;border-bottom:1px solid var(--ink);border-right:1px solid var(--ink)}}
+    nav.rail{{display:flex;flex-wrap:wrap;border-bottom:1px solid var(--hairline)}}
+    nav.rail a{{font:400 13px/19.5px var(--mono);padding:10px 14px;color:var(--graphite);text-decoration:none;border-right:1px solid var(--hairline)}}
+    nav.rail a:first-child{{border-left:1px solid var(--hairline)}}
+    nav.rail a:hover{{background:var(--cobalt-5)}}
+    nav.rail a.on{{background:var(--ink);color:var(--canvas)}}
+    .section-head{{display:flex;align-items:end;justify-content:space-between;gap:12px;padding:34px 32px 0}}
+    .section-head .eyebrow{{color:var(--pebble)}}
+    .section-head h2{{font-size:32px;line-height:1.2;font-weight:700;letter-spacing:-.6px;margin:8px 0 4px}}
+    .section-head p{{color:var(--graphite);margin:0;font-size:15px}}
+    .jobs{{padding:22px 32px 0}}
+    .grid{{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--hairline);border-left:1px solid var(--hairline)}}
+    .job-card{{background:var(--paper);border-right:1px solid var(--hairline);border-bottom:1px solid var(--hairline);padding:28px 32px;display:flex;flex-direction:column}}
+    .badges{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}}
+    .brace{{font:400 13px/1.5 var(--mono);color:var(--cobalt)}}
+    .job-card h2{{font-size:20px;line-height:1.4;font-weight:700;margin:0 0 6px}}
+    .company{{color:var(--graphite);margin:0 0 16px;font-size:15px}}
+    .facts{{display:flex;gap:16px;flex-wrap:wrap;font:400 13px/1.6 var(--mono);color:var(--graphite);margin-bottom:12px}}
+    .facts .salary{{color:var(--cobalt)}}
+    .tags{{display:flex;gap:6px;flex-wrap:wrap;min-height:24px;margin-bottom:18px}}
+    .tag{{font:400 12px/1.5 var(--mono);color:var(--graphite);border:1px solid var(--hairline);padding:2px 8px}}
+    .actions{{margin-top:auto}}
+    .actions .btn{{font-size:14px;padding:8px 12px}}
+    .source{{color:var(--pebble);font:400 12px/1.6 var(--mono);margin:16px 0 0}}
+    .empty{{background:var(--paper);border:1px solid var(--hairline);padding:36px 32px}}
+    .empty h2{{font-size:24px;font-weight:700;margin:0 0 10px}}
+    .empty p{{color:var(--graphite);max-width:560px;margin:0}}
+    footer{{margin-top:64px;border-top:1px solid var(--hairline);padding:26px 32px;display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;color:var(--pebble);font:400 13px/1.7 var(--mono)}}
+    footer a{{color:var(--graphite)}}
+    @media(max-width:1024px){{.grid{{grid-template-columns:repeat(2,1fr)}}}}
+    @media(max-width:640px){{
+      .grid{{grid-template-columns:1fr}}
+      .hero{{padding:48px 20px 44px}}
+      header.bar{{padding:0 20px}}
+      nav.cells a{{padding:0 10px;font-size:14px}}
+      .section-head,.jobs,.strip{{padding-left:20px;padding-right:20px}}
+      footer{{padding:22px 20px}}
+    }}
   </style>
 </head>
 <body>
-  <main class="wrap">
-    <section class="hero">
-      <div class="eyebrow">Junior / Middle · Remote IT</div>
-      <h1>Вакансии без шума. Подборка, Resume Match и алерты.</h1>
-      <p class="lead">Публичная витрина проекта junior_middle_it. В подборку попадают вакансии после редакционных фильтров; персональный поиск и мгновенные уведомления доступны в Telegram.</p>
-      <div class="hero-actions">{main_cta}{channel_cta}</div>
-    </section>
-    <nav class="filters" aria-label="Фильтры">{''.join(category_links)}{level_links}</nav>
-    <div class="section-head"><div><h2>Свежие вакансии</h2><p>{html.escape(count_copy)}</p></div></div>
-    {jobs_section}
-    <footer>Никаких платных размещений в ранжировании. Проверяй условия вакансии на странице работодателя перед откликом.</footer>
-  </main>
+  <div class="sheet">
+    {strip}
+    <header class="bar">
+      <a class="brand" href="/">junior_middle_it</a>
+      <nav class="cells" aria-label="Навигация">{header_cells}</nav>
+    </header>
+    <main>
+      <section class="hero">
+        <span class="dots" aria-hidden="true"></span>
+        <div class="hero-inner">
+          <div class="eyebrow">Junior / Middle · Remote IT</div>
+          <h1>Вакансии без <span class="accent">шума</span>: подборка, Resume&nbsp;Match и алерты.</h1>
+          <p class="lead">Публичная витрина проекта junior_middle_it. В подборку попадают вакансии после редакционных фильтров; персональный поиск и мгновенные уведомления доступны в Telegram.</p>
+          <div class="hero-actions">{main_cta}{channel_cta}</div>
+        </div>
+      </section>
+      <nav class="rail" aria-label="Фильтры">{''.join(category_links)}</nav>
+      <div class="section-head"><div><div class="eyebrow">Свежая подборка</div><h2>Вакансии</h2><p>{html.escape(count_copy)}</p></div></div>
+      {jobs_section}
+    </main>
+    <footer><span>Никаких платных размещений в ранжировании. Проверяй условия вакансии на странице работодателя перед откликом.</span>{f'<span><a href="{html.escape(tg_channel, quote=True)}">t.me/junior_middle_it</a></span>' if tg_channel else ''}</footer>
+  </div>
 </body>
 </html>"""
