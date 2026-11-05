@@ -57,9 +57,13 @@ class ProcessUpdateTests(unittest.IsolatedAsyncioTestCase):
     class FakeDB:
         def __init__(self):
             self.closed = False
+            self.events = []
 
         def close(self):
             self.closed = True
+
+        def log_event(self, user_id, name, props=None):
+            self.events.append((user_id, name, dict(props or {})))
 
     class FakeApp:
         def __init__(self, fail=False):
@@ -147,6 +151,35 @@ class ProcessUpdateTests(unittest.IsolatedAsyncioTestCase):
         ), patch("telegram.Update.de_json", return_value=object()):
             with self.assertRaisesRegex(RuntimeError, "handler failed"):
                 await runtime.process_update_payload({"update_id": 126})
+        ledger.complete.assert_not_called()
+        self.assertTrue(db.closed)
+
+    async def test_handler_error_is_beaconed_into_the_events_feed(self):
+        db = self.FakeDB()
+        app = self.FakeApp(fail=True)
+        ledger = MagicMock()
+        ledger.claim.return_value = "claimed"
+        with patch.object(runtime, "build_runtime", return_value=(app, db, object())), patch.object(
+            runtime, "TelegramUpdateLedger", return_value=ledger
+        ), patch("telegram.Update.de_json", return_value=object()):
+            with self.assertRaisesRegex(RuntimeError, "handler failed"):
+                await runtime.process_update_payload({"update_id": 127})
+        errors = [event for event in db.events if event[1] == "webhook_handler_error"]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0][2]["type"], "RuntimeError")
+        self.assertIn("boom", errors[0][2]["msg"])
+
+    async def test_beacon_never_raises_when_the_event_write_fails(self):
+        db = self.FakeDB()
+        db.log_event = MagicMock(side_effect=RuntimeError("db down"))
+        app = self.FakeApp(fail=True)
+        ledger = MagicMock()
+        ledger.claim.return_value = "claimed"
+        with patch.object(runtime, "build_runtime", return_value=(app, db, object())), patch.object(
+            runtime, "TelegramUpdateLedger", return_value=ledger
+        ), patch("telegram.Update.de_json", return_value=object()):
+            with self.assertRaisesRegex(RuntimeError, "handler failed"):
+                await runtime.process_update_payload({"update_id": 128})
         ledger.complete.assert_not_called()
         self.assertTrue(db.closed)
 

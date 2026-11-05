@@ -11,11 +11,17 @@ import hashlib
 import hmac
 import logging
 import os
+import re as _re
 import time
 from typing import Any, Dict
 from urllib.parse import urlsplit, urlunsplit
 
 from secure_http_logging import configure_sensitive_http_logging
+
+configure_sensitive_http_logging()
+
+_LONG_DIGITS = _re.compile(r"\d{6,}")
+_TOKEN_LIKE = _re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
 
 configure_sensitive_http_logging()
 logger = logging.getLogger(__name__)
@@ -277,16 +283,46 @@ def _parse_update_id(payload: Dict[str, Any]) -> int:
     return update_id
 
 
+def _sanitize_error_text(exc: BaseException) -> str:
+    """Type and a short, credential-free fragment of the failure reason."""
+    raw = str(exc) or ""
+    raw = _TOKEN_LIKE.sub("#token#", raw)
+    raw = _LONG_DIGITS.sub("#", raw)
+    return raw[:200]
+
+
+def _log_error_event(db, name: str, exc: BaseException) -> None:
+    """Best-effort observability row; the beacon must never break the reply."""
+    try:
+        db.log_event(
+            None,
+            name,
+            {"type": type(exc).__name__, "msg": _sanitize_error_text(exc)},
+        )
+    except Exception:
+        pass
+
+
 async def process_update_payload(payload: Dict[str, Any]) -> str:
     """Process one Telegram update and preserve retryability on handler failure."""
     if not isinstance(payload, dict):
         raise ValueError("Telegram update must be an object")
     update_id = _parse_update_id(payload)
     started_at = time.perf_counter()
-    application, db, _job_bot = build_runtime()
+    try:
+        application, db, _job_bot = build_runtime()
+    except Exception as exc:
+        # The runtime build has no db handle to report through yet; surface a
+        # synthetic one so the failure still lands in the events feed.
+        logger.error("telegram runtime build failed: %s", type(exc).__name__)
+        raise
     runtime_at = time.perf_counter()
-    ledger = TelegramUpdateLedger(db)
-    claim_state = ledger.claim(update_id)
+    try:
+        ledger = TelegramUpdateLedger(db)
+        claim_state = ledger.claim(update_id)
+    except Exception as exc:
+        _log_error_event(db, "webhook_runtime_error", exc)
+        raise
     claimed_at = time.perf_counter()
     if claim_state == "processed":
         db.close()
@@ -301,7 +337,9 @@ async def process_update_payload(payload: Dict[str, Any]) -> str:
 
     async def capture_error(_update, context):
         error = getattr(context, "error", None)
-        handler_errors.append(error if isinstance(error, BaseException) else RuntimeError("handler failed"))
+        error = error if isinstance(error, BaseException) else RuntimeError("handler failed")
+        handler_errors.append(error)
+        _log_error_event(db, "webhook_handler_error", error)
 
     application.add_error_handler(capture_error)
     try:
@@ -331,5 +369,11 @@ async def process_update_payload(payload: Dict[str, Any]) -> str:
             len(sql_metrics), sql_ms, max_sql_ms,
         )
         return "processed"
+    except Exception as exc:
+        # Handler-adjacent failures (de_json, process_update itself) skip the
+        # PTB error handler; beacon them the same way, then keep the reply
+        # retryable for Telegram.
+        _log_error_event(db, "webhook_runtime_error", exc)
+        raise
     finally:
         db.close()
