@@ -38,6 +38,35 @@ CATEGORY_LABELS = {
 }
 BOT_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{4,64}$")
 
+# Living aurora behind the landing hero (canvas 2D, zero dependencies).
+# Falls back to the static CSS gradient when JS is off, canvas is unavailable
+# or the user prefers reduced motion. Pauses off-screen and on hidden tab.
+AURORA_JS = """(function(){
+var m=window.matchMedia&&window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+var c=document.querySelector(".aurora");
+if(!c||m||!c.getContext)return;
+var x=c.getContext("2d");if(!x)return;
+var hero=c.parentElement;
+var B=[["255,59,0",.42,.10,.30,.17,.11,0],["246,0,157",.46,.42,.62,.15,.12,2.1],["151,62,198",.44,.72,.34,.13,.13,4.2],["0,142,255",.50,.96,.66,.11,.11,1.3]];
+var W=0,H=0,running=false,raf=0,t0=performance.now();
+function size(){var d=Math.min(window.devicePixelRatio||1,1.5);W=c.clientWidth;H=c.clientHeight;c.width=Math.max(1,W*d);c.height=Math.max(1,H*d);x.setTransform(d,0,0,d,0,0);}
+function frame(now){if(!running)return;var t=(now-t0)/1000;x.clearRect(0,0,W,H);x.globalCompositeOperation="lighter";
+for(var i=0;i<B.length;i++){var b=B[i];
+var px=(b[2]+Math.sin(t*0.35+b[6])*b[4])*W;
+var py=(b[3]+Math.cos(t*0.28+b[6])*b[5])*H;
+var r=Math.max(W,H)*b[1]*0.55;
+var g=x.createRadialGradient(px,py,0,px,py,r);
+g.addColorStop(0,"rgba("+b[0]+",0.15)");g.addColorStop(1,"rgba("+b[0]+",0)");
+x.fillStyle=g;x.fillRect(0,0,W,H);}
+raf=requestAnimationFrame(frame);}
+function start(){if(running)return;running=true;raf=requestAnimationFrame(frame);}
+function stop(){running=false;cancelAnimationFrame(raf);}
+size();window.addEventListener("resize",size);
+if("IntersectionObserver" in window){new IntersectionObserver(function(e){e[0].isIntersecting?start():stop();},{threshold:.05}).observe(c);}else{start();}
+document.addEventListener("visibilitychange",function(){document.hidden?stop():start();});
+hero.classList.add("has-aurora");
+})();"""
+
 
 def growth_dsn() -> str:
     return (os.getenv("GROWTH_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
@@ -348,6 +377,8 @@ def render_landing(
     .hero::before{{content:"";position:absolute;top:-70px;left:-60px;right:-60px;height:360px;z-index:0;
       background:linear-gradient(90deg,rgba(255,59,0,.16) 0%,rgba(246,0,157,.16) 38%,rgba(151,62,198,.16) 71%,rgba(0,142,255,.16) 100%);
       filter:blur(64px)}}
+    .hero.has-aurora::before{{display:none}}
+    .hero canvas.aurora{{position:absolute;top:-70px;left:-60px;width:calc(100% + 120px);height:360px;z-index:0;pointer-events:none}}
     .hero .dots{{position:absolute;top:0;right:0;width:42%;height:100%;z-index:0;pointer-events:none;
       background-image:radial-gradient(circle,rgba(0,43,255,.30) 1px,transparent 1.4px);background-size:12px 12px;
       -webkit-mask-image:linear-gradient(to left,#000 25%,transparent 92%);mask-image:linear-gradient(to left,#000 25%,transparent 92%)}}
@@ -417,6 +448,7 @@ def render_landing(
     </header>
     <main>
       <section class="hero">
+        <canvas class="aurora" aria-hidden="true"></canvas>
         <span class="dots" aria-hidden="true"></span>
         <div class="hero-inner">
           <div class="eyebrow">Junior / Middle · Remote IT</div>
@@ -431,5 +463,6 @@ def render_landing(
     </main>
     <footer><span>Никаких платных размещений в ранжировании. Проверяй условия вакансии на странице работодателя перед откликом.</span>{f'<span><a href="{html.escape(tg_channel, quote=True)}">t.me/junior_middle_it</a></span>' if tg_channel else ''}</footer>
   </div>
+  <script>{AURORA_JS}</script>
 </body>
 </html>"""
