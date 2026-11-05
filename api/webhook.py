@@ -4,6 +4,8 @@ import logging
 import sys
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -16,6 +18,41 @@ from secure_http_logging import configure_sensitive_http_logging
 
 configure_sensitive_http_logging()
 logger = logging.getLogger(__name__)
+
+
+def _report_webhook_failure(update_id, kind: str, detail: str) -> None:
+    """Self-report a webhook failure to the admin over the Telegram transport.
+
+    The growth DB may itself be the broken link, so this channel deliberately
+    bypasses it: a fire-and-forget Bot API message with a sanitized, token-free
+    summary. Never raises, never delays the retryable 503 reply.
+    """
+    import os
+    import re
+
+    admin = (os.getenv("ADMIN_USER_ID") or "").strip()
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    if not admin or not token:
+        return
+    safe_detail = re.sub(r"\d{6,}", "#", str(detail or ""))[:180]
+    text = (
+        "🛠 Диагностика вебхука\n"
+        f"update_id={update_id} kind={kind}\n{safe_detail}"
+    )
+    try:
+        request = Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=json.dumps(
+                {"chat_id": admin, "text": text, "disable_web_page_preview": True},
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        with urlopen(request, timeout=5) as response:
+            response.read(4096)
+    except (OSError, URLError, Exception):
+        pass
 
 
 class handler(BaseHTTPRequestHandler):
@@ -77,10 +114,17 @@ class handler(BaseHTTPRequestHandler):
                 )
             else:
                 logger.error("Telegram webhook processing failed: %s", type(exc).__name__)
+            detail = (
+                f"{type(exc).__name__} caused by {type(cause).__name__}: {str(cause)[:160]}"
+                if cause is not None
+                else f"{type(exc).__name__}: {str(exc)[:160]}"
+            )
+            _report_webhook_failure(payload.get("update_id"), "exception", detail)
             self._send_json(503, {"ok": False, "error": "temporarily_unavailable"})
             return
 
         if state == "busy":
+            _report_webhook_failure(payload.get("update_id"), "busy", "concurrent duplicate delivery")
             self._send_json(503, {"ok": False, "error": "update_busy"})
             return
         self._send_json(200, {"ok": True, "status": state})
