@@ -1,0 +1,42 @@
+name: Diagnose Webhook
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  logs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERCEL_ORG_ID: team_szHwcCa6CdtVuEvDGWkvvbZ1
+      VERCEL_PROJECT_ID: prj_269y0sGpFXze7o7MqeDIfLakL5nR
+    steps:
+      - name: Resolve production deployment and tail its logs
+        shell: bash
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -u
+          mkdir -p .vercel
+          printf '{"orgId":"%s","projectId":"%s"}\n' \
+            "$VERCEL_ORG_ID" "$VERCEL_PROJECT_ID" > .vercel/project.json
+
+          echo '### Recent deployments'
+          npx --yes vercel@latest ls junior-middle-it \
+            --scope olegs-projects-bfc4e11a --token "$VERCEL_TOKEN" 2>&1 | head -15
+
+          echo '### Inspect canonical alias'
+          inspect="$(npx --yes vercel@latest inspect junior-middle-it.vercel.app \
+            --scope olegs-projects-bfc4e11a --token "$VERCEL_TOKEN" 2>&1)"
+          echo "$inspect" | head -40
+          deploy_url="$(printf '%s\n' "$inspect" | grep -oE 'https://[a-z0-9-]+-[a-z0-9]+\.vercel\.app' | head -1)"
+          echo "deploy_url=$deploy_url"
+
+          if [ -n "$deploy_url" ]; then
+            echo '### Runtime logs (last 200 lines, 90s cap)'
+            timeout 90 npx --yes vercel@latest logs "$deploy_url" \
+              --scope olegs-projects-bfc4e11a --token "$VERCEL_TOKEN" 2>&1 | tail -200 || true
+          fi
