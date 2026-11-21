@@ -154,40 +154,16 @@ async def save_and_report(job_bot, update, resume_text: str) -> bool:
     resume_text = str(resume_text or "").strip()
     if len(resume_text) < MIN_RESUME_TEXT_LEN:
         return False
-    store = _store(job_bot)
-    if store is None:
-        await message.reply_text(
-            "Сохранение резюме сейчас недоступно (база профилей не подключена). "
-            "Попробуй позже или используй «Проверить резюме» под конкретной вакансией."
-        )
-        return True
-    try:
-        parsed = parse_resume(resume_text)
-        store.save_resume(
-            int(user_id),
-            resume_text,
-            skills=parsed["skills_str"],
-            grade=parsed["grade"],
-        )
-        store.save_profile(
-            int(user_id),
-            grade=parsed["grade"],
-            skills=parsed["skills_str"],
-            source=_RESUME_SOURCE,
-        )
-        # Enrich the durable settings profile so compute_fit-based analyses
-        # (vacancy cards, HR pitch, upskill) reuse the saved stack.
-        job_bot.db.save_user_settings(int(user_id), {"skills": parsed["skills_str"]})
-        job_bot.db.log_event(int(user_id), "resume_saved", {
-            "grade": parsed["grade"],
-            "category": parsed["category"],
-            "skills_count": len(parsed["skills"]),
-        })
-    except Exception as exc:  # pragma: no cover - defensive, store failures logged
-        logger.info("resume save failed: %s", type(exc).__name__)
-        await message.reply_text("Не получилось сохранить резюме — попробуй ещё раз чуть позже.")
-        return True
-    await message.reply_text(format_saved_report(parsed), parse_mode="HTML", reply_markup=_report_keyboard())
+    # Do not retain the input while awaiting consent. The parsed result is
+    # returned for this request only; no profile or settings are modified.
+    parsed = parse_resume(resume_text)
+    skills = ", ".join(parsed["skills"][:8]) or "—"
+    await message.reply_text(
+        f"📊 Уровень: {parsed['grade']}\n🛠 Стек: {skills}\n\n"
+        "Резюме и извлечённые навыки не сохранены. Для разбора вакансии "
+        "открой её и выбери «Проверить резюме». Сохранение профиля "
+        "временно недоступно."
+    )
     return True
 
 
@@ -244,9 +220,8 @@ async def cmd_resume(job_bot, update, context) -> None:
     if not row or not str(row.get("resume_text") or "").strip():
         await message.reply_text(
             "📄 <b>Сохранённого резюме пока нет.</b>\n\n"
-            "Пришли резюме файлом (PDF/DOCX с выделяемым текстом) или вставь "
-            "текст сообщением — я сохраню профиль и буду учитывать твой стек "
-            "в разборах вакансий.",
+            "Пришли резюме файлом или текстом для разового разбора. "
+            "Сохранение профиля временно недоступно.",
             parse_mode="HTML",
         )
         return
@@ -280,16 +255,21 @@ async def handle_callback_extras(job_bot, update, context) -> bool:
     if not user_id:
         return True
     store = _store(job_bot)
-    removed = bool(store is not None and store.delete_resume(int(user_id)))
-    if store is not None:
-        try:
-            store.save_profile(int(user_id), grade="", skills="", source="resume_deleted")
-        except Exception as exc:  # pragma: no cover
-            logger.debug("profile clear after resume delete: %s", type(exc).__name__)
-    if removed:
-        job_bot.db.log_event(int(user_id), "resume_deleted", {})
-    if message is not None and hasattr(message, "reply_text"):
-        await message.reply_text("🗑 Сохранённое резюме удалено. Пришли новое в любой момент.")
+    if store is None:
+        if message is not None:
+            await message.reply_text("Не удалось удалить данные: база недоступна. Попробуй ещё раз.")
+        return True
+    try:
+        store.delete_resume(int(user_id))
+        store.save_profile(int(user_id), grade="", skills="", source="resume_deleted")
+        job_bot.db.save_user_settings(int(user_id), {"skills": ""})
+    except Exception as exc:
+        logger.info("resume deletion failed: %s", type(exc).__name__)
+        if message is not None:
+            await message.reply_text("Не удалось подтвердить удаление всех данных. Попробуй ещё раз.")
+        return True
+    if message is not None:
+        await message.reply_text("🗑 Резюме и навыки профиля удалены. Сохранение нового временно недоступно.")
     return True
 
 
