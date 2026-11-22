@@ -141,6 +141,12 @@ async def post_job_with_durable_payload(bot, job, db=None) -> bool:
         if store is not None:
             # Non-Edge deployments retain their historical direct-Postgres behavior.
             store.save_job_payload(job_hash, job)
+            saved = bool(store.get_job_payload(job_hash))
+            token = core._payload_persisted.set(saved)
+            try:
+                return bool(await _ORIGINAL_POST_JOB_WITH_BOT(bot, job, db=db))
+            finally:
+                core._payload_persisted.reset(token)
         elif edge_writer_configured():
             # Validate routing before consuming a durable claim.
             if not core.get_target_channels(job):
@@ -169,8 +175,12 @@ async def post_job_with_durable_payload(bot, job, db=None) -> bool:
                 _durable_begin_failures.set(_durable_begin_failures.get() + 1)
                 return False
 
+            token = core._payload_persisted.set(True)
             try:
-                posted = await _ORIGINAL_POST_JOB_WITH_BOT(bot, job, db=db)
+                try:
+                    posted = await _ORIGINAL_POST_JOB_WITH_BOT(bot, job, db=db)
+                finally:
+                    core._payload_persisted.reset(token)
             except BaseException:
                 _durable_ambiguous_sends.set(_durable_ambiguous_sends.get() + 1)
                 logger.error(

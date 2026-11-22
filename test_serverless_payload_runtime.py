@@ -72,6 +72,7 @@ class ServerlessPayloadRuntimeTests(unittest.IsolatedAsyncioTestCase):
         fake_store = SimpleNamespace(
             growth_backend="postgres",
             save_job_payload=MagicMock(),
+            get_job_payload=MagicMock(return_value={"hash": "stored"}),
             close=MagicMock(),
         )
         original = AsyncMock(return_value=True)
