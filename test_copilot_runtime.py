@@ -472,15 +472,12 @@ class CopilotForwardRuntimeTests(unittest.TestCase):
             asyncio.run(copilot_runtime._copilot_handle_setup_text(
                 bot, update, SimpleNamespace()
             ))
-        # New contract (saved-resume flow): the resume is routed into the
-        # profile save; without a durable store the flow answers with the
-        # explicit "saving unavailable" message instead of the old refusal.
         self.assertEqual(len(message.replies), 1)
-        self.assertIn("Сохранение резюме сейчас недоступно", message.replies[0][0])
+        self.assertIn("не сохранены", message.replies[0][0])
         self.assertFalse(bot.db.events)
         original.assert_not_awaited()
 
-    def test_plain_resume_is_saved_into_profile_when_store_available(self):
+    def test_plain_resume_is_not_saved_even_when_store_available(self):
         resume_text = (
             "Резюме: Python разработчик. Опыт работы 3 года, "
             "образование техническое, мои навыки Python и PostgreSQL. "
@@ -493,9 +490,9 @@ class CopilotForwardRuntimeTests(unittest.TestCase):
         ):
             db2, message2, original = self._run(message)
         self.assertEqual(len(message2.replies), 1)
-        self.assertIn("сохранено", message2.replies[0][0].lower())
-        self.assertIn(store.saved["text"], resume_text)
-        self.assertTrue(any(name == "resume_saved" for name, _ in db2.events))
+        self.assertIn("не сохранены", message2.replies[0][0].lower())
+        self.assertFalse(store.saved)
+        self.assertFalse(any(name == "resume_saved" for name, _ in db2.events))
         original.assert_not_awaited()
 
     def test_resume_match_session_keeps_own_text_handler(self):

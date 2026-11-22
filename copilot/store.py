@@ -174,7 +174,7 @@ class CopilotStore:
         }
 
     # ------------------------------------------------------------------
-    # Saved resume (opt-in, one per user; content never leaves the store)
+    # Legacy saved resumes (automatic saving is disabled)
     # ------------------------------------------------------------------
     def save_resume(self, user_id: int, resume_text: str, *, skills: str = "", grade: str = "") -> bool:
         """Upsert the user's own resume text parsed on upload."""

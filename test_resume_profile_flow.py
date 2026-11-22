@@ -29,6 +29,7 @@ class FakeDb:
 
     def save_user_settings(self, user_id, values):
         self.settings.update(values or {})
+        return True
 
     def log_event(self, user_id, name, props=None):
         self.events.append((name, dict(props or {})))
@@ -148,19 +149,10 @@ class SaveAndReportTests(unittest.TestCase):
         with patch.object(flow.CopilotStore, "from_database", return_value=store):
             handled = run(flow.save_and_report(bot, make_update(message), RESUME_TEXT))
         self.assertTrue(handled)
-        self.assertIn(USER_ID, store.resumes)
-        self.assertIn("python", store.resumes[USER_ID]["skills"])
-        self.assertEqual(store.resumes[USER_ID]["grade"], "Middle")
-        self.assertTrue(any(p[3] == "resume_saved" for p in store.profiles))
-        self.assertIn("python", bot.db.settings.get("skills", ""))
-        self.assertIn("resume_saved", [name for name, _ in bot.db.events])
-        self.assertTrue(message.replies)
-        reply_text, kwargs = message.replies[0]
-        self.assertIn("сохранено", reply_text.lower())
-        markup = kwargs.get("reply_markup")
-        self.assertIsNotNone(markup)
-        buttons = [b for row in markup.inline_keyboard for b in row]
-        self.assertTrue(any(flow.CB_RESUME_DELETE in (b.callback_data or "") for b in buttons))
+        self.assertEqual(store.resumes, {})
+        self.assertEqual(store.profiles, [])
+        self.assertEqual(bot.db.settings, {})
+        self.assertIn("не сохранены", message.replies[0][0])
 
     def test_short_text_is_not_saved(self):
         store = FakeStore()
@@ -196,7 +188,8 @@ class DocumentTests(unittest.TestCase):
         ):
             handled = run(flow.handle_document(bot, update, context))
         self.assertTrue(handled)
-        self.assertIn(USER_ID, store.resumes)
+        self.assertEqual(store.resumes, {})
+        self.assertIn("не сохранены", message.replies[0][0])
 
     def test_unextractable_document_gets_scan_hint(self):
         store = FakeStore()
@@ -243,7 +236,7 @@ class CallbackAndCommandTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertTrue(query.answered)
         self.assertEqual(store.resumes, {})
-        self.assertIn("resume_deleted", [name for name, _ in bot.db.events])
+        self.assertEqual(bot.db.settings.get("skills"), "")
         self.assertTrue(query.message.replies)
 
     def test_unknown_callback_passes_through(self):

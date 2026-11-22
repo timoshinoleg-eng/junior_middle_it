@@ -1,18 +1,7 @@
-"""Saved-resume profile flow.
+"""One-time resume analysis and deletion of legacy saved profiles.
 
-The user can save their own resume text (opt-in, explicit) so every vacancy
-analysis reuses it without re-uploading the document. Integrated into the
-webhook runtime with the same monkey-patch style as ``onboarding_flow``:
-
-- unmatched resume text / resume documents land in ``save_and_report()``
-  instead of the old "choose a vacancy first" refusal;
-- parsed skills are written into the durable settings profile, so the
-  existing ``compute_fit``-based analyses pick them up automatically;
-- ``/resume`` shows the saved profile and offers deletion.
-
-Privacy contract: the resume is stored only in the user's own row of
-``growth_copilot_resumes``, used solely for fit/match analysis, and is
-removed completely on delete. Nothing is sent to third parties.
+New unmatched text and documents are processed without saving the resume or
+derived skills. Previously saved resumes may still exist and can be deleted.
 """
 from __future__ import annotations
 
@@ -145,7 +134,7 @@ def _store(job_bot) -> Optional[CopilotStore]:
 
 
 async def save_and_report(job_bot, update, resume_text: str) -> bool:
-    """Persist the resume and reply with the parsed profile. False — not saved."""
+    """Analyze the resume for this request without saving it."""
     message = getattr(update, "message", None)
     user = getattr(update, "effective_user", None)
     user_id = getattr(user, "id", None)
@@ -154,45 +143,20 @@ async def save_and_report(job_bot, update, resume_text: str) -> bool:
     resume_text = str(resume_text or "").strip()
     if len(resume_text) < MIN_RESUME_TEXT_LEN:
         return False
-    store = _store(job_bot)
-    if store is None:
-        await message.reply_text(
-            "Сохранение резюме сейчас недоступно (база профилей не подключена). "
-            "Попробуй позже или используй «Проверить резюме» под конкретной вакансией."
-        )
-        return True
-    try:
-        parsed = parse_resume(resume_text)
-        store.save_resume(
-            int(user_id),
-            resume_text,
-            skills=parsed["skills_str"],
-            grade=parsed["grade"],
-        )
-        store.save_profile(
-            int(user_id),
-            grade=parsed["grade"],
-            skills=parsed["skills_str"],
-            source=_RESUME_SOURCE,
-        )
-        # Enrich the durable settings profile so compute_fit-based analyses
-        # (vacancy cards, HR pitch, upskill) reuse the saved stack.
-        job_bot.db.save_user_settings(int(user_id), {"skills": parsed["skills_str"]})
-        job_bot.db.log_event(int(user_id), "resume_saved", {
-            "grade": parsed["grade"],
-            "category": parsed["category"],
-            "skills_count": len(parsed["skills"]),
-        })
-    except Exception as exc:  # pragma: no cover - defensive, store failures logged
-        logger.info("resume save failed: %s", type(exc).__name__)
-        await message.reply_text("Не получилось сохранить резюме — попробуй ещё раз чуть позже.")
-        return True
-    await message.reply_text(format_saved_report(parsed), parse_mode="HTML", reply_markup=_report_keyboard())
+    # The parsed result is returned for this request only.
+    parsed = parse_resume(resume_text)
+    skills = ", ".join(parsed["skills"][:8]) or "—"
+    await message.reply_text(
+        f"📊 Уровень: {parsed['grade']}\n🛠 Стек: {skills}\n\n"
+        "Резюме и извлечённые навыки не сохранены. Для разбора вакансии "
+        "открой её и выбери «Проверить резюме». Сохранение профиля "
+        "временно недоступно."
+    )
     return True
 
 
 async def handle_document(job_bot, update, context) -> bool:
-    """Save an unmatched resume document (no active CV build). True — handled."""
+    """Analyze an unmatched resume document. True means handled."""
     message = getattr(update, "message", None)
     document = getattr(message, "document", None) if message else None
     if document is None or getattr(message, "caption", None):
@@ -244,9 +208,8 @@ async def cmd_resume(job_bot, update, context) -> None:
     if not row or not str(row.get("resume_text") or "").strip():
         await message.reply_text(
             "📄 <b>Сохранённого резюме пока нет.</b>\n\n"
-            "Пришли резюме файлом (PDF/DOCX с выделяемым текстом) или вставь "
-            "текст сообщением — я сохраню профиль и буду учитывать твой стек "
-            "в разборах вакансий.",
+            "Пришли резюме файлом или текстом для разового разбора. "
+            "Сохранение профиля временно недоступно.",
             parse_mode="HTML",
         )
         return
@@ -258,7 +221,7 @@ async def cmd_resume(job_bot, update, context) -> None:
         f"📊 Уровень: <b>{row.get('grade') or '—'}</b>\n"
         f"🛠 Стек: <code>{skills[:400]}</code>\n"
         f"🕐 Обновлено: {stamp}\n\n"
-        "Чтобы обновить — просто пришли новое резюме файлом или текстом.",
+        "Сохранение нового резюме временно недоступно.",
         parse_mode="HTML",
         reply_markup=_report_keyboard(),
     )
@@ -280,16 +243,27 @@ async def handle_callback_extras(job_bot, update, context) -> bool:
     if not user_id:
         return True
     store = _store(job_bot)
-    removed = bool(store is not None and store.delete_resume(int(user_id)))
-    if store is not None:
-        try:
-            store.save_profile(int(user_id), grade="", skills="", source="resume_deleted")
-        except Exception as exc:  # pragma: no cover
-            logger.debug("profile clear after resume delete: %s", type(exc).__name__)
-    if removed:
+    if store is None:
+        if message is not None:
+            await message.reply_text("Не удалось удалить данные: база недоступна. Попробуй ещё раз.")
+        return True
+    try:
+        store.delete_resume(int(user_id))
+        if not store.save_profile(int(user_id), grade="", skills="", source="resume_deleted"):
+            raise RuntimeError("profile cleanup not confirmed")
+        if not job_bot.db.save_user_settings(int(user_id), {"skills": ""}):
+            raise RuntimeError("settings cleanup not confirmed")
+    except Exception as exc:
+        logger.info("resume deletion failed: %s", type(exc).__name__)
+        if message is not None:
+            await message.reply_text("Не удалось подтвердить удаление всех данных. Попробуй ещё раз.")
+        return True
+    try:
         job_bot.db.log_event(int(user_id), "resume_deleted", {})
-    if message is not None and hasattr(message, "reply_text"):
-        await message.reply_text("🗑 Сохранённое резюме удалено. Пришли новое в любой момент.")
+    except Exception as exc:
+        logger.info("resume deletion analytics failed: %s", type(exc).__name__)
+    if message is not None:
+        await message.reply_text("🗑 Резюме и навыки профиля удалены. Сохранение нового временно недоступно.")
     return True
 
 
