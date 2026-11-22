@@ -35,6 +35,16 @@ class FakeDurableDB:
 
 
 class MarketResumeTests(unittest.IsolatedAsyncioTestCase):
+    def test_english_report_does_not_claim_zero_fit_without_evidence(self):
+        from resume_matcher import analyze_resume_match
+        bot = object.__new__(product.JobBot)
+        bot._lang = lambda _uid: "en"
+        job = {"title": "Opportunity"}
+        report = analyze_resume_match("Python developer", job)
+        result = bot._format_resume_report(77, report, job)
+        self.assertIn("Insufficient data", result)
+        self.assertNotIn("0%", result)
+
     async def test_one_callback_and_docx_produce_one_report_and_clear_session(self):
         bot = object.__new__(product.JobBot)
         bot.db = FakeDurableDB()

@@ -439,6 +439,11 @@ class JobBot(p8.JobBot):
         heading = f"{title} · {company}" if company else title
         if lang == "ru":
             return format_resume_match_report(report, job)
+        if not report.required_skills and not report.keyword_overlap_pct and not report.role_overlap:
+            return (f"📄 Resume fit: Insufficient data to assess the match\n{heading}\n\n"
+                    "The vacancy description lacks reliable information for comparison. "
+                    "Try a vacancy with more detailed requirements and responsibilities.\n"
+                    "Your resume text was not stored.")
         lines = [f"📄 Resume fit: {report.score}%", heading, "", "This is a practical text-based estimate, not an official ATS score."]
         if report.matched_skills:
             lines.append("✅ Skills found in your resume: " + ", ".join(report.matched_skills[:8]))
