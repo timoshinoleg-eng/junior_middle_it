@@ -91,9 +91,9 @@ def is_forward_candidate(
         return False
     if len(body) < MIN_FORWARD_CHARS:
         return False
-    if forwarded:
-        return True
-    return bool(URL_RE.search(body))
+    # A URL alone cannot distinguish a vacancy from a private portfolio.
+    # Require the user's explicit Telegram forward action before caching text.
+    return forwarded
 
 
 def build_job(text: str) -> Dict:

@@ -30,9 +30,9 @@ class CandidateTests(unittest.TestCase):
     def test_plain_text_without_a_link_is_not_a_candidate(self):
         self.assertFalse(forward.is_forward_candidate("Просто сообщение без ссылки"))
 
-    def test_link_without_forward_is_a_candidate(self):
+    def test_link_without_forward_is_not_a_candidate(self):
         text = "Вакансия Junior Python, ссылка https://example.com/jobs/2"
-        self.assertTrue(forward.is_forward_candidate(text))
+        self.assertFalse(forward.is_forward_candidate(text))
 
     def test_empty_text_is_not_a_candidate(self):
         self.assertFalse(forward.is_forward_candidate("", forwarded=True))

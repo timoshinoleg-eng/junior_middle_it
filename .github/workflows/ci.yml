@@ -70,6 +70,7 @@ jobs:
             test_editorial_channel_cards \
             test_growth_p1 \
             test_resume_matcher \
+            test_issue78_followup \
             test_resume_detail_latency \
             test_qa_issues_76_78 \
             test_resume_flow \

@@ -1,7 +1,9 @@
 """Issue #82: market fallback provenance must reach Resume Match without leaking CV data."""
 import unittest
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from docx import Document
 
 import localized_product_runtime as product
 import public_acquisition_runtime as acquisition
@@ -33,6 +35,34 @@ class FakeDurableDB:
 
 
 class MarketResumeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_one_callback_and_docx_produce_one_report_and_clear_session(self):
+        bot = object.__new__(product.JobBot)
+        bot.db = FakeDurableDB()
+        bot.resume_sessions = {}
+        bot.setup_steps = {}
+        bot.pending_saved_searches = {}
+        bot._lang = lambda _uid: "ru"
+        bot._resume_prompt_for_user = lambda *_: "SEND YOUR RESUME"
+        prompt = AsyncMock()
+        query = SimpleNamespace(data="resume_market:" + HASH, answer=AsyncMock(),
+                                message=SimpleNamespace(reply_text=prompt))
+        await bot.handle_callback(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=77)), SimpleNamespace())
+        doc = Document()
+        doc.add_paragraph("Python developer with experience building services and tests. " * 5)
+        stream = BytesIO()
+        doc.save(stream)
+        payload = stream.getvalue()
+        document = SimpleNamespace(file_size=len(payload), file_id="synthetic", file_name="test.docx",
+                                   mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        reply = AsyncMock()
+        update = SimpleNamespace(message=SimpleNamespace(document=document, reply_text=reply), effective_user=SimpleNamespace(id=77))
+        file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(payload)))
+        await bot.handle_setup_text(update, SimpleNamespace(bot=SimpleNamespace(get_file=AsyncMock(return_value=file))))
+        self.assertEqual(prompt.await_count, 1)
+        self.assertEqual(reply.await_count, 1)
+        self.assertIn("Недостаточно данных", reply.await_args.args[0])
+        self.assertNotIn(77, bot.resume_sessions)
+
     def test_market_card_keyboard_separates_examples_from_matches(self):
         bot = object.__new__(product.JobBot)
         market = bot._job_keyboard(dict(JOB), "ru", market_example=True)
