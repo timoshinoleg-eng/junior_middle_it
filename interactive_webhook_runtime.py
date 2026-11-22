@@ -142,7 +142,7 @@ def build_runtime():
     if not token or not channel_id:
         raise RuntimeError("interactive Telegram runtime is incomplete")
 
-    application = core.Application.builder().token(token).updater(None).build()
+    application = core.Application.builder().token(token).updater(None).job_queue(None).build()
     db = runtime.DatabaseConnection(":memory:")
     if getattr(db, "growth_backend", "sqlite") != "postgres":
         db.close()
