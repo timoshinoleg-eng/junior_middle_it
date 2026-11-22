@@ -148,3 +148,26 @@ class PrivacyAndEvidenceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class ForwardPrivacyFlowTests(unittest.TestCase):
+    def test_immediate_analysis_uses_original_and_saved_job_uses_safe_skills(self):
+        from copilot.forward import job_payload_from_row
+        from test_copilot_store import FakeGrowthStore
+        raw = 'Hiring Python developer UNIQUE_PRIVATE person@example.com +7-999-123-45-67 Docker https://example.com/private'
+        msg = SimpleNamespace(text=raw, document=None, forward_date=1, reply_text=AsyncMock())
+        update = SimpleNamespace(message=msg, effective_user=SimpleNamespace(id=42))
+        backend = FakeGrowthStore()
+        store = webhook.CopilotStore(backend)
+        bot = SimpleNamespace(setup_steps={}, resume_sessions={}, db=SimpleNamespace(get_user_settings=lambda _: {}, log_event=lambda *args: None))
+        original_analyse = webhook.analyse_job
+        with patch.object(webhook, 'copilot_enabled', return_value=True), patch.object(webhook, 'forward_enabled', return_value=True), patch.object(webhook.CopilotStore, 'from_database', return_value=store), patch.object(webhook, 'analyse_job', wraps=original_analyse) as analyse:
+            self.assertTrue(asyncio.run(webhook._maybe_handle_forward(bot, update)))
+        self.assertEqual(analyse.call_args.args[0]['description'], raw)
+        params = backend.queries[-1][1]
+        row = dict(zip(('job_hash', 'title', 'company', 'url', 'text'), params))
+        job = job_payload_from_row(row)
+        self.assertEqual(job['hash'], params[0])
+        self.assertEqual(job['description'], 'docker, python')
+        report = analyze_resume_match('Python', job)
+        self.assertEqual(set(report.required_skills), {'python', 'docker'})
+        self.assertNotIn('UNIQUE_PRIVATE', repr(params))

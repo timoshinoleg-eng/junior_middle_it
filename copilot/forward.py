@@ -131,6 +131,13 @@ def build_job(text: str) -> Dict:
     }
 
 
+def safe_forwarded_description(text: str) -> str:
+    """Return only fixed skill aliases, never a substring of the input."""
+    from resume_matcher import SKILL_ALIASES, extract_skills
+
+    return ", ".join(sorted(SKILL_ALIASES[skill][0] for skill in extract_skills(text)))
+
+
 def job_payload_from_row(row: Optional[Dict]) -> Optional[Dict]:
     """Rebuild a job payload from a stored forwarded job row."""
     if not row:

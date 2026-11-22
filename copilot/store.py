@@ -613,9 +613,11 @@ class CopilotStore:
     ) -> bool:
         """Remember a vacancy the user forwarded into the private chat.
 
-        The text is a public vacancy posting, never a resume: the forward
-        handler refuses resume-like texts before they reach this method.
+        Store only a generic title and allowlisted skills, even if a caller
+        accidentally supplies personal data in any of the other fields.
         """
+        from copilot.forward import safe_forwarded_description
+
         with self._cursor() as cur:
             cur.execute(
                 """
@@ -632,10 +634,10 @@ class CopilotStore:
                 """,
                 (
                     str(job_hash),
-                    str(title or ""),
-                    str(company or ""),
-                    str(url or ""),
-                    str(text or ""),
+                    "\u041f\u0435\u0440\u0435\u0441\u043b\u0430\u043d\u043d\u0430\u044f \u0432\u0430\u043a\u0430\u043d\u0441\u0438\u044f",
+                    "",
+                    "",
+                    safe_forwarded_description(text),
                 ),
             )
             return bool(cur.fetchone())

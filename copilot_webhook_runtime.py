@@ -1338,10 +1338,7 @@ async def _maybe_handle_forward(job_bot, update) -> bool:
         try:
             store.save_forwarded_job(
                 job_hash,
-                title=job["title"],
-                company=job["company"],
-                url=job["url"],
-                text=job["description"],
+                text=copilot_forward.safe_forwarded_description(job["description"]),
             )
         except Exception as exc:
             logger.info("Copilot forwarded job cache failed: %s", type(exc).__name__)
