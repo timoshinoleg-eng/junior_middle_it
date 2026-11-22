@@ -170,4 +170,4 @@ def register_handlers(application, job_bot) -> None:
     from telegram.ext import CommandHandler
 
     application.add_handler(CommandHandler("feedback", job_bot.cmd_feedback))
-    application.add_handler(CommandHandler("cancel_feedback", job_bot.cmd_cancel))
+    application.add_handler(CommandHandler("cancel_feedback", job_bot.cmd_cancel_feedback))
