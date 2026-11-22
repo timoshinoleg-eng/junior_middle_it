@@ -10,6 +10,49 @@ from resume_matcher import analyze_resume_match, format_resume_match_report
 
 
 class PrivacyAndEvidenceTests(unittest.TestCase):
+    def test_forwarded_employer_headings_route_to_analysis(self):
+        samples = [
+            'Требования:\nОпыт работы: от 3 лет.\nОбразование: высшее.\nИщем Python разработчика для REST API и Docker.',
+            'Hiring Software Engineer\nWork experience: 3 years\nEducation: degree\nRequirements: Python, Docker and REST APIs.',
+        ]
+        for text in samples:
+            with self.subTest(text=text):
+                msg = SimpleNamespace(text=text, document=None, forward_date=1, reply_text=AsyncMock())
+                update = SimpleNamespace(message=msg, effective_user=SimpleNamespace(id=42))
+                db = SimpleNamespace(get_user_settings=lambda _: {}, log_event=lambda *args: None)
+                bot = SimpleNamespace(setup_steps={}, resume_sessions={}, db=db)
+                store = SimpleNamespace(save_forwarded_job=unittest.mock.Mock())
+                self.assertFalse(looks_like_resume(text))
+                self.assertFalse(webhook._unmatched_resume_text(bot, update))
+                with patch.object(webhook, 'copilot_enabled', return_value=True), \
+                     patch.object(webhook, 'forward_enabled', return_value=True), \
+                     patch.object(webhook.CopilotStore, 'from_database', return_value=store), \
+                     patch.object(webhook, '_pdf_requests', return_value={}), \
+                     patch.object(webhook.feedback_flow, 'capture_if_pending', new=AsyncMock(return_value=False)), \
+                     patch.object(webhook.resume_profile_flow, 'save_and_report', new=AsyncMock(side_effect=AssertionError('CV route'))):
+                    asyncio.run(webhook._copilot_handle_setup_text(bot, update, None))
+                store.save_forwarded_job.assert_called_once()
+                self.assertTrue(msg.reply_text.await_args.kwargs.get('disable_web_page_preview'))
+
+    def test_candidate_profiles_never_saved_as_forwarded_jobs(self):
+        samples = [
+            'Опыт работы: разрабатывал Python сервисы.\nОбразование: высшее.\nПортфолио https://example.com/me',
+            'Work experience: I built Python services.\nEducation: degree.\nPortfolio https://example.com/me',
+            'Work experience: built services. Education: degree. Requirements: Python. Hiring engineers was part of my job. https://example.com/me',
+            'Ищу работу. Вакансия: разработчик. Опыт работы: 3 года. Образование: высшее. https://example.com/me',
+        ]
+        for text in samples:
+            with self.subTest(text=text):
+                msg = SimpleNamespace(text=text, document=None, forward_date=1, reply_text=AsyncMock())
+                update = SimpleNamespace(message=msg, effective_user=SimpleNamespace(id=42))
+                bot = SimpleNamespace(setup_steps={}, resume_sessions={}, db=object())
+                self.assertTrue(looks_like_resume(text))
+                self.assertTrue(webhook._unmatched_resume_text(bot, update))
+                with patch.object(webhook, 'copilot_enabled', return_value=True), \
+                     patch.object(webhook, 'forward_enabled', return_value=True), \
+                     patch.object(webhook.CopilotStore, 'from_database', side_effect=AssertionError('unexpected storage')):
+                    self.assertTrue(asyncio.run(webhook._maybe_handle_forward(bot, update)))
+
     def test_short_resume_gets_guidance_without_storage(self):
         msg = SimpleNamespace(text='Python developer', document=None, forward_date=None, reply_text=AsyncMock())
         update = SimpleNamespace(message=msg, effective_user=SimpleNamespace(id=42))
@@ -62,6 +105,13 @@ class PrivacyAndEvidenceTests(unittest.TestCase):
             for _ in range(2):
                 with self.subTest(text=text):
                     self.assertFalse(is_forward_candidate(text))
+                    msg = SimpleNamespace(text=text, document=None, forward_date=None, reply_text=AsyncMock())
+                    update = SimpleNamespace(message=msg, effective_user=SimpleNamespace(id=42))
+                    bot = SimpleNamespace(setup_steps={}, resume_sessions={}, db=object())
+                    with patch.object(webhook, 'copilot_enabled', return_value=True), \
+                         patch.object(webhook, 'forward_enabled', return_value=True), \
+                         patch.object(webhook.CopilotStore, 'from_database', side_effect=AssertionError('unexpected storage')):
+                        self.assertFalse(asyncio.run(webhook._maybe_handle_forward(bot, update)))
 
     def test_forwarded_vacancy_is_still_supported(self):
         self.assertTrue(is_forward_candidate('Hiring Python developer. Apply at https://example.com/jobs', forwarded=True))

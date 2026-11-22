@@ -1406,13 +1406,7 @@ def _unmatched_resume_text(self, update) -> bool:
         has_document=False,
     ):
         return True
-    sample = text.casefold()
-    signals = (
-        "опыт работы", "мои навыки", "образование", "контактная информация",
-        "профессиональный опыт", "work experience", "my skills",
-        "education", "employment history",
-    )
-    return sum(signal in sample for signal in signals) >= 2
+    return False
 
 
 async def _reply_choose_vacancy_for_resume(message):
