@@ -441,6 +441,20 @@ class CopilotForwardRuntimeTests(unittest.TestCase):
         self.assertTrue(any(name == "copilot_forward_analyzed" for name, _ in db.events))
         original.assert_not_awaited()
 
+    def test_unbound_resumes_with_portfolio_never_reach_forward_store_on_retry(self):
+        samples = (
+            "Software engineer with three years building Python services. Portfolio https://example.com/me",
+            "Разработчик три года создавал сервисы на Python. Портфолио https://example.com/me",
+        )
+        for sample in samples:
+            store = _ResumeStoreFake()
+            with patch.object(copilot_store.CopilotStore, "from_database", return_value=store):
+                for _ in range(2):
+                    db, message, original = self._run(FakeMessage(text=sample))
+                    self.assertFalse(any(name == "copilot_forward_analyzed" for name, _ in db.events))
+                    self.assertTrue(message.replies)
+            self.assertFalse(store.saved)
+
     def test_command_is_not_consumed(self):
         message = FakeMessage(text="/setup python fastapi")
         db, message, original = self._run(message)

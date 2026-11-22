@@ -86,6 +86,12 @@ class ResumeDocumentTests(unittest.TestCase):
                 mime_type="application/pdf",
             )
 
+    def test_rejects_empty_and_corrupt_documents(self):
+        for filename, data in (("empty.pdf", b""), ("bad.pdf", b"%PDF-broken"),
+                               ("empty.docx", b""), ("bad.docx", b"PKbroken")):
+            with self.subTest(filename=filename), self.assertRaises(ResumeDocumentError):
+                extract_resume_document(data, filename=filename, mime_type="")
+
     def test_rejects_scanned_or_empty_pdf(self):
         # A valid blank PDF is intentionally treated as a scan/no-text case.
         blank = build_pdf("short")

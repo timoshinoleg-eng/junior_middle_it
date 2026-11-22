@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -1309,8 +1310,8 @@ async def _maybe_handle_forward(job_bot, update) -> bool:
         return False
     user_id = update.effective_user.id if update.effective_user else None
     setup_steps = getattr(job_bot, "setup_steps", None) or {}
-    if user_id and user_id in setup_steps:
-        # The setup wizard owns the text input while it is running.
+    if user_id and (user_id in setup_steps or user_id in (getattr(job_bot, "resume_sessions", None) or {})):
+        # Active workflows own the input, including resumes with portfolio links.
         return False
     document = getattr(message, "document", None)
     text = str(getattr(message, "text", "") or "")
@@ -1337,10 +1338,7 @@ async def _maybe_handle_forward(job_bot, update) -> bool:
         try:
             store.save_forwarded_job(
                 job_hash,
-                title=job["title"],
-                company=job["company"],
-                url=job["url"],
-                text=job["description"],
+                text=copilot_forward.safe_forwarded_description(job["description"]),
             )
         except Exception as exc:
             logger.info("Copilot forwarded job cache failed: %s", type(exc).__name__)
@@ -1377,7 +1375,7 @@ def _unmatched_resume_text(self, update) -> bool:
     if not message or getattr(message, "document", None) is not None:
         return False
     text = str(getattr(message, "text", "") or "").strip()
-    if len(text) < 80 or text.startswith("/"):
+    if not text or text.startswith("/"):
         return False
     user_id = update.effective_user.id if update.effective_user else None
     if not user_id:
@@ -1386,6 +1384,13 @@ def _unmatched_resume_text(self, update) -> bool:
         return False
     if user_id in (getattr(self, "resume_sessions", None) or {}):
         return False
+    if len(text) < 80:
+        if getattr(message, "forward_date", None):
+            return False
+        from resume_matcher import extract_skills
+
+        roles = r"(?<!\w)(?:developer|engineer|programmer|tester|devops|qa|разработчик\w*|программист\w*|тестировщик\w*|инженер\w*)(?!\w)"
+        return bool(copilot_forward.looks_like_resume(text) or extract_skills(text) or re.search(roles, text, re.IGNORECASE))
     if copilot_forward.looks_like_resume(text):
         return True
     # A pasted resume without literal #resume, CV or section markers
@@ -1398,13 +1403,7 @@ def _unmatched_resume_text(self, update) -> bool:
         has_document=False,
     ):
         return True
-    sample = text.casefold()
-    signals = (
-        "опыт работы", "мои навыки", "образование", "контактная информация",
-        "профессиональный опыт", "work experience", "my skills",
-        "education", "employment history",
-    )
-    return sum(signal in sample for signal in signals) >= 2
+    return False
 
 
 async def _reply_choose_vacancy_for_resume(message):

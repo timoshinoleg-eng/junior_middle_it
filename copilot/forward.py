@@ -70,7 +70,25 @@ def extract_url(text: str) -> str:
 def looks_like_resume(text: str) -> bool:
     """Whether the text describes a candidate instead of a vacancy."""
     value = str(text or "").lower()
-    return any(signal in value for signal in RESUME_SIGNALS)
+    if any(signal in value for signal in RESUME_SIGNALS):
+        return True
+    # Candidate evidence wins even when a CV quotes an old job advertisement.
+    if re.search(r'(?<!\w)(?:я|мой|мои|my|i)\b', value) or re.search(
+        r'\b(?:portfolio|портфолио)\b', value
+    ):
+        return True
+    sections = ("опыт работы", "образование", "мои навыки", "контактная информация",
+                "профессиональный опыт", "work experience", "employment history", "education", "my skills")
+    # Only override ambiguous section headings for an employer-framed opening
+    # with a requirements block. Isolated hiring words may occur in a CV.
+    opening = value.lstrip()
+    employer_opening = re.match(
+        r'(?:требования\s*:|вакансия\s*:|ищем\b|hiring\b|we are looking for\b)', opening
+    )
+    requirements = re.search(r'(?:требования\s*:|requirements\s*:)', value)
+    if employer_opening and requirements:
+        return False
+    return sum(signal in value for signal in sections) >= 2
 
 
 def is_forward_candidate(
@@ -91,9 +109,9 @@ def is_forward_candidate(
         return False
     if len(body) < MIN_FORWARD_CHARS:
         return False
-    if forwarded:
-        return True
-    return bool(URL_RE.search(body))
+    # A URL alone cannot distinguish a vacancy from a private portfolio.
+    # Require the user's explicit Telegram forward action before caching text.
+    return forwarded
 
 
 def build_job(text: str) -> Dict:
@@ -111,6 +129,13 @@ def build_job(text: str) -> Dict:
         "url": extract_url(body),
         "source": "forwarded",
     }
+
+
+def safe_forwarded_description(text: str) -> str:
+    """Return only fixed skill aliases, never a substring of the input."""
+    from resume_matcher import SKILL_ALIASES, extract_skills
+
+    return ", ".join(sorted(SKILL_ALIASES[skill][0] for skill in extract_skills(text)))
 
 
 def job_payload_from_row(row: Optional[Dict]) -> Optional[Dict]:

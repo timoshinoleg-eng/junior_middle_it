@@ -173,6 +173,19 @@ class SaveAndReportTests(unittest.TestCase):
 
 
 class DocumentTests(unittest.TestCase):
+    def test_large_document_receives_reply(self):
+        message = FakeMessage(document=self._doc())
+        message.document.file_size = flow.MAX_RESUME_BYTES + 1
+        self.assertTrue(run(flow.handle_document(FakeJobBot(None), make_update(message), SimpleNamespace(bot=FakeBotApi()))))
+        self.assertTrue(message.replies)
+
+    def test_download_failure_receives_reply(self):
+        message = FakeMessage(document=self._doc())
+        async def fail(_file_id):
+            raise RuntimeError("download failed")
+        self.assertTrue(run(flow.handle_document(FakeJobBot(None), make_update(message), SimpleNamespace(bot=SimpleNamespace(get_file=fail)))))
+        self.assertTrue(message.replies)
+
     def _doc(self):
         return SimpleNamespace(file_id="file_1", file_name="cv.pdf", mime_type="application/pdf", file_size=1024)
 

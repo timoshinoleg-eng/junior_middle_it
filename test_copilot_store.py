@@ -215,3 +215,17 @@ class CopilotStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ForwardStoragePrivacyTests(unittest.TestCase):
+    def test_store_only_persists_allowlisted_skills(self):
+        backend = FakeGrowthStore()
+        store = CopilotStore(backend)
+        private = 'UNIQUE_PRIVATE person@example.com +7-999-123-45-67 Python Docker'
+        store.save_forwarded_job('a' * 40, title=private, company=private, url='https://example.com/' + private, text=private)
+        params = backend.queries[-1][1]
+        self.assertEqual(params, ('a' * 40, '\u041f\u0435\u0440\u0435\u0441\u043b\u0430\u043d\u043d\u0430\u044f \u0432\u0430\u043a\u0430\u043d\u0441\u0438\u044f', '', '', 'docker, python'))
+
+    def test_store_without_skills_has_empty_description(self):
+        backend = FakeGrowthStore()
+        CopilotStore(backend).save_forwarded_job('b' * 40, text='UNIQUE_PRIVATE person@example.com')
+        self.assertEqual(backend.queries[-1][1][-1], '')

@@ -129,11 +129,20 @@ def job_text(job: Dict) -> str:
     tags = job.get("tags") or []
     if not isinstance(tags, Sequence) or isinstance(tags, (str, bytes)):
         tags = [str(tags)]
+    def explicit_field(value):
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (list, tuple)):
+            return " ".join(item for item in value if isinstance(item, str))
+        return ""
+
     return " ".join(
         [
             str(job.get("title") or ""),
             str(job.get("description") or ""),
             " ".join(str(tag) for tag in tags),
+            explicit_field(job.get("requirements")),
+            explicit_field(job.get("skills")),
         ]
     )
 
@@ -257,6 +266,16 @@ def format_resume_match_report(report: ResumeMatchReport, job: Dict) -> str:
     title = str(job.get("title") or "вакансия").strip()[:110]
     company = str(job.get("company") or "").strip()[:70]
     heading = f"{title} · {company}" if company else title
+    if not report.required_skills:
+        return "\n".join([
+            "📄 Resume Match: Недостаточно данных для оценки соответствия",
+            heading,
+            "",
+            "⚠️ Низкая уверенность: оценка недоступна.",
+            "Не удалось выделить конкретные технические требования из доступных данных вакансии; "
+            "процент соответствия по стеку не рассчитывается. Это НЕ означает, что резюме не подходит.",
+            "Текст резюме не сохранялся.",
+        ])
     found_count = len(report.matched_skills)
     required_count = len(report.required_skills)
     confidence_low = required_count < 3 or report.keyword_overlap_pct < 10
