@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -1387,9 +1388,12 @@ def _unmatched_resume_text(self, update) -> bool:
     if user_id in (getattr(self, "resume_sessions", None) or {}):
         return False
     if len(text) < 80:
-        return not copilot_forward.is_forward_candidate(
-            text, forwarded=bool(getattr(message, "forward_date", None)), has_document=False
-        ) and not getattr(message, "forward_date", None)
+        if getattr(message, "forward_date", None):
+            return False
+        from resume_matcher import extract_skills
+
+        roles = r"(?<!\w)(?:developer|engineer|programmer|tester|devops|qa|разработчик\w*|программист\w*|тестировщик\w*|инженер\w*)(?!\w)"
+        return bool(copilot_forward.looks_like_resume(text) or extract_skills(text) or re.search(roles, text, re.IGNORECASE))
     if copilot_forward.looks_like_resume(text):
         return True
     # A pasted resume without literal #resume, CV or section markers

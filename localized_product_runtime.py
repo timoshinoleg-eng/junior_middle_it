@@ -441,8 +441,8 @@ class JobBot(p8.JobBot):
             return format_resume_match_report(report, job)
         if not report.required_skills:
             return (f"📄 Resume fit: Insufficient data to assess the match\n{heading}\n\n"
-                    "The vacancy description lacks reliable information for comparison. "
-                    "Try a vacancy with more detailed requirements and responsibilities.\n"
+                    "We could not identify specific technical requirements from the available vacancy data; "
+                    "a skills match percentage is not calculated. This does NOT mean your resume is unsuitable.\n"
                     "Your resume text was not stored.")
         lines = [f"📄 Resume fit: {report.score}%", heading, "", "This is a practical text-based estimate, not an official ATS score."]
         if len(report.required_skills) < 3:
