@@ -168,13 +168,15 @@ async def handle_document(job_bot, update, context) -> bool:
         return False
     file_size = int(getattr(document, "file_size", 0) or 0)
     if file_size > MAX_RESUME_BYTES:
-        return False
+        await message.reply_text("Файл слишком большой: максимум 5 МБ. Пришли файл меньшего размера или текст резюме.")
+        return True
     try:
         tg_file = await context.bot.get_file(file_id)
         payload = bytes(await tg_file.download_as_bytearray())
     except Exception as exc:
         logger.info("resume document download failed: %s", type(exc).__name__)
-        return False
+        await message.reply_text("Не удалось скачать файл. Попробуй отправить его снова или вставь текст резюме.")
+        return True
     try:
         from resume_documents import extract_resume_document
 
@@ -186,7 +188,8 @@ async def handle_document(job_bot, update, context) -> bool:
         resume_text = str(getattr(parsed, "text", "") or "").strip()
     except Exception as exc:
         logger.info("extract_resume_document failed: %s", type(exc).__name__)
-        resume_text = ""
+        await message.reply_text("Не удалось прочитать документ. Пришли корректный PDF/DOCX с выделяемым текстом или вставь текст резюме.")
+        return True
     if len(resume_text) < MIN_RESUME_TEXT_LEN:
         await message.reply_text(
             "⚠️ Не удалось извлечь текст из документа (похоже на скан-картинку). "

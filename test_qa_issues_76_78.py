@@ -54,6 +54,16 @@ class PollingOwnershipTests(unittest.TestCase):
 
 
 class ResumeTextAndScoreTests(unittest.TestCase):
+    def test_short_unbound_text_receives_guidance(self):
+        bot = SimpleNamespace(setup_steps={}, resume_sessions={})
+        self.assertTrue(webhook._unmatched_resume_text(bot, self._update("Python developer")))
+
+    def test_active_resume_with_link_is_not_forwarded_as_vacancy(self):
+        bot = SimpleNamespace(setup_steps={}, resume_sessions={42: {"job_hash": "x"}}, db=SimpleNamespace())
+        update = self._update("Software engineer with Python projects at https://example.com/portfolio")
+        with patch.object(webhook, "copilot_enabled", return_value=True), patch.object(webhook, "forward_enabled", return_value=True), patch.object(webhook.CopilotStore, "from_database", side_effect=AssertionError("resume reached vacancy storage")):
+            self.assertFalse(asyncio.run(webhook._maybe_handle_forward(bot, update)))
+
     def _update(self, text, *, forwarded=False):
         message = SimpleNamespace(
             text=text, document=None,

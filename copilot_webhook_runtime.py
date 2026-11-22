@@ -1309,8 +1309,8 @@ async def _maybe_handle_forward(job_bot, update) -> bool:
         return False
     user_id = update.effective_user.id if update.effective_user else None
     setup_steps = getattr(job_bot, "setup_steps", None) or {}
-    if user_id and user_id in setup_steps:
-        # The setup wizard owns the text input while it is running.
+    if user_id and (user_id in setup_steps or user_id in (getattr(job_bot, "resume_sessions", None) or {})):
+        # Active workflows own the input, including resumes with portfolio links.
         return False
     document = getattr(message, "document", None)
     text = str(getattr(message, "text", "") or "")
@@ -1377,7 +1377,7 @@ def _unmatched_resume_text(self, update) -> bool:
     if not message or getattr(message, "document", None) is not None:
         return False
     text = str(getattr(message, "text", "") or "").strip()
-    if len(text) < 80 or text.startswith("/"):
+    if not text or text.startswith("/"):
         return False
     user_id = update.effective_user.id if update.effective_user else None
     if not user_id:
@@ -1386,6 +1386,10 @@ def _unmatched_resume_text(self, update) -> bool:
         return False
     if user_id in (getattr(self, "resume_sessions", None) or {}):
         return False
+    if len(text) < 80:
+        return not copilot_forward.is_forward_candidate(
+            text, forwarded=bool(getattr(message, "forward_date", None)), has_document=False
+        ) and not getattr(message, "forward_date", None)
     if copilot_forward.looks_like_resume(text):
         return True
     # A pasted resume without literal #resume, CV or section markers
