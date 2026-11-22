@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Set
 import signal
 import asyncio
+from contextvars import ContextVar
 import re
 import requests
 import xml.etree.ElementTree as ET
@@ -3037,13 +3038,48 @@ def get_target_channels(job: Dict) -> List[str]:
     return [Config.CHANNEL_ID] if Config.CHANNEL_ID else []
 
 
-async def _send_job_to_chat(bot: Bot, job: Dict, chat_id: str) -> bool:
+# Set by the serverless durable writer only while a saved payload is being sent.
+_payload_persisted = ContextVar("channel_payload_persisted", default=False)
+_username_cache_bot = None
+_username_cache_value = ""
+_username_cache_until = 0.0
+
+
+def _valid_channel_identity(job, username):
+    job_hash = job.get("hash") or job.get("content_hash") or ""
+    return (isinstance(job_hash, str) and bool(re.fullmatch(r"[A-Za-z0-9_-]{1,40}", job_hash))
+            and isinstance(username, str) and bool(re.fullmatch(r"[A-Za-z0-9_]{5,32}", username)))
+
+
+async def _channel_bot_username(bot):
+    global _username_cache_bot, _username_cache_value, _username_cache_until
+    configured = Config.BOT_USERNAME.strip().lstrip("@")
+    if configured:
+        return configured
+    if _username_cache_bot is bot and time.monotonic() < _username_cache_until:
+        return _username_cache_value
+    try:
+        username = getattr(await asyncio.wait_for(bot.get_me(), timeout=3), "username", "") or ""
+    except Exception:
+        username = ""
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        logger.warning("Channel resume CTA unavailable: bot username lookup failed")
+        username = ""
+    _username_cache_bot, _username_cache_value = bot, username
+    _username_cache_until = time.monotonic() + (3600 if username else 60)
+    return username
+
+
+async def _send_job_to_chat(bot: Bot, job: Dict, chat_id: str, *, payload_persisted: bool = True) -> bool:
     """Low-level send one job message to one chat."""
     try:
+        username = await _channel_bot_username(bot) if payload_persisted and (job.get("hash") or job.get("content_hash")) else ""
+        valid = payload_persisted and _valid_channel_identity(job, username)
         if Config.ENABLE_MARKDOWN_V2 and FORMATTER_AVAILABLE:
             formatter = JobMessageFormatter()
+            keyboard_job = job if valid else {**job, "hash": "", "content_hash": ""}
             formatted = formatter.format_job(
-                job, view_mode='compact', bot_username=Config.BOT_USERNAME
+                keyboard_job, view_mode='compact', bot_username=username if valid else ""
             )
             await bot.send_message(
                 chat_id=chat_id,
@@ -3057,13 +3093,16 @@ async def _send_job_to_chat(bot: Bot, job: Dict, chat_id: str) -> bool:
                 chat_id=chat_id,
                 text=format_job_message_legacy(job),
                 parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "📄 Проверить резюме", url=f"https://t.me/{username}?start=resume_{job.get('hash') or job.get('content_hash')}"
+                )]]) if valid else None,
                 disable_web_page_preview=True
             )
         return True
     except RetryAfter as e:
         logger.warning(f"⏳ Flood control {chat_id}: retry after {e.retry_after}s")
         await asyncio.sleep(e.retry_after)
-        return await _send_job_to_chat(bot, job, chat_id)
+        return await _send_job_to_chat(bot, job, chat_id, payload_persisted=payload_persisted)
     except Exception as e:
         logger.error(f"❌ Send fail → {chat_id}: {e}")
         return False
@@ -3073,8 +3112,10 @@ async def post_job_with_bot(bot: Bot, job: Dict, db: Optional[DatabaseConnection
     """Post a job using a bare Bot instance, suitable for cron/serverless (multi-track aware)."""
     job_hash = job.get('hash') or generate_job_hash(job)
     job['hash'] = job_hash
+    persisted = _payload_persisted.get()
     if db:
         db.save_job_payload(job_hash, job)
+        persisted = bool(db.get_job_payload(job_hash))
 
     targets = get_target_channels(job)
     if not targets:
@@ -3085,7 +3126,7 @@ async def post_job_with_bot(bot: Bot, job: Dict, db: Optional[DatabaseConnection
     for i, chat_id in enumerate(targets):
         if i > 0:
             await asyncio.sleep(Config.MULTI_TRACK_POST_DELAY)
-        ok = await _send_job_to_chat(bot, job, chat_id)
+        ok = await _send_job_to_chat(bot, job, chat_id, payload_persisted=persisted)
         if ok:
             any_ok = True
             logger.info(
@@ -4175,67 +4216,12 @@ class JobBot:
             return False
 
         any_ok = False
+        persisted = bool(self.db.get_job_payload(job_hash))
         for i, chat_id in enumerate(targets):
             if i > 0:
                 await asyncio.sleep(Config.MULTI_TRACK_POST_DELAY)
-            try:
-                if Config.ENABLE_MARKDOWN_V2 and self.formatter:
-                    formatted = self.formatter.format_job(
-                        job, view_mode='compact', bot_username=Config.BOT_USERNAME
-                    )
-                    await self.application.bot.send_message(
-                        chat_id=chat_id,
-                        text=formatted.text,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        reply_markup=InlineKeyboardMarkup(
-                            formatted.reply_markup['inline_keyboard']
-                        ),
-                        disable_web_page_preview=formatted.disable_web_page_preview
-                    )
-                else:
-                    await self.application.bot.send_message(
-                        chat_id=chat_id,
-                        text=format_job_message_legacy(job),
-                        parse_mode='HTML',
-                        disable_web_page_preview=True
-                    )
+            if await _send_job_to_chat(self.application.bot, job, chat_id, payload_persisted=persisted):
                 any_ok = True
-                logger.info(
-                    f"✅ Posted → {chat_id}: {job.get('title', 'N/A')} "
-                    f"[{job.get('category', 'other')}]"
-                )
-            except RetryAfter as e:
-                logger.warning(f"⏳ Flood control {chat_id}: {e.retry_after}s")
-                await asyncio.sleep(e.retry_after)
-                try:
-                    # one retry after flood wait
-                    if Config.ENABLE_MARKDOWN_V2 and self.formatter:
-                        formatted = self.formatter.format_job(
-                            job, view_mode='compact', bot_username=Config.BOT_USERNAME
-                        )
-                        await self.application.bot.send_message(
-                            chat_id=chat_id,
-                            text=formatted.text,
-                            parse_mode=ParseMode.MARKDOWN_V2,
-                            reply_markup=InlineKeyboardMarkup(
-                                formatted.reply_markup['inline_keyboard']
-                            ),
-                            disable_web_page_preview=True,
-                        )
-                    else:
-                        await self.application.bot.send_message(
-                            chat_id=chat_id,
-                            text=format_job_message_legacy(job),
-                            parse_mode='HTML',
-                            disable_web_page_preview=True,
-                        )
-                    any_ok = True
-                except Exception as e2:
-                    logger.error(f"❌ Retry fail → {chat_id}: {e2}")
-            except TimedOut:
-                logger.error(f"❌ Timeout → {chat_id}")
-            except Exception as e:
-                logger.error(f"❌ Failed → {chat_id}: {e}")
         return any_ok
 
 # ==================== MAIN LOOP ====================
