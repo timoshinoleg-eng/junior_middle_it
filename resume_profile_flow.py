@@ -1,18 +1,7 @@
-"""Saved-resume profile flow.
+"""One-time resume analysis and deletion of legacy saved profiles.
 
-The user can save their own resume text (opt-in, explicit) so every vacancy
-analysis reuses it without re-uploading the document. Integrated into the
-webhook runtime with the same monkey-patch style as ``onboarding_flow``:
-
-- unmatched resume text / resume documents land in ``save_and_report()``
-  instead of the old "choose a vacancy first" refusal;
-- parsed skills are written into the durable settings profile, so the
-  existing ``compute_fit``-based analyses pick them up automatically;
-- ``/resume`` shows the saved profile and offers deletion.
-
-Privacy contract: the resume is stored only in the user's own row of
-``growth_copilot_resumes``, used solely for fit/match analysis, and is
-removed completely on delete. Nothing is sent to third parties.
+New unmatched text and documents are processed without saving the resume or
+derived skills. Previously saved resumes may still exist and can be deleted.
 """
 from __future__ import annotations
 
@@ -145,7 +134,7 @@ def _store(job_bot) -> Optional[CopilotStore]:
 
 
 async def save_and_report(job_bot, update, resume_text: str) -> bool:
-    """Persist the resume and reply with the parsed profile. False — not saved."""
+    """Analyze the resume for this request without saving it."""
     message = getattr(update, "message", None)
     user = getattr(update, "effective_user", None)
     user_id = getattr(user, "id", None)
@@ -154,8 +143,7 @@ async def save_and_report(job_bot, update, resume_text: str) -> bool:
     resume_text = str(resume_text or "").strip()
     if len(resume_text) < MIN_RESUME_TEXT_LEN:
         return False
-    # Do not retain the input while awaiting consent. The parsed result is
-    # returned for this request only; no profile or settings are modified.
+    # The parsed result is returned for this request only.
     parsed = parse_resume(resume_text)
     skills = ", ".join(parsed["skills"][:8]) or "—"
     await message.reply_text(
@@ -168,7 +156,7 @@ async def save_and_report(job_bot, update, resume_text: str) -> bool:
 
 
 async def handle_document(job_bot, update, context) -> bool:
-    """Save an unmatched resume document (no active CV build). True — handled."""
+    """Analyze an unmatched resume document. True means handled."""
     message = getattr(update, "message", None)
     document = getattr(message, "document", None) if message else None
     if document is None or getattr(message, "caption", None):
@@ -233,7 +221,7 @@ async def cmd_resume(job_bot, update, context) -> None:
         f"📊 Уровень: <b>{row.get('grade') or '—'}</b>\n"
         f"🛠 Стек: <code>{skills[:400]}</code>\n"
         f"🕐 Обновлено: {stamp}\n\n"
-        "Чтобы обновить — просто пришли новое резюме файлом или текстом.",
+        "Сохранение нового резюме временно недоступно.",
         parse_mode="HTML",
         reply_markup=_report_keyboard(),
     )
@@ -261,13 +249,19 @@ async def handle_callback_extras(job_bot, update, context) -> bool:
         return True
     try:
         store.delete_resume(int(user_id))
-        store.save_profile(int(user_id), grade="", skills="", source="resume_deleted")
-        job_bot.db.save_user_settings(int(user_id), {"skills": ""})
+        if not store.save_profile(int(user_id), grade="", skills="", source="resume_deleted"):
+            raise RuntimeError("profile cleanup not confirmed")
+        if not job_bot.db.save_user_settings(int(user_id), {"skills": ""}):
+            raise RuntimeError("settings cleanup not confirmed")
     except Exception as exc:
         logger.info("resume deletion failed: %s", type(exc).__name__)
         if message is not None:
             await message.reply_text("Не удалось подтвердить удаление всех данных. Попробуй ещё раз.")
         return True
+    try:
+        job_bot.db.log_event(int(user_id), "resume_deleted", {})
+    except Exception as exc:
+        logger.info("resume deletion analytics failed: %s", type(exc).__name__)
     if message is not None:
         await message.reply_text("🗑 Резюме и навыки профиля удалены. Сохранение нового временно недоступно.")
     return True

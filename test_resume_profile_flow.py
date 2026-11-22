@@ -29,6 +29,7 @@ class FakeDb:
 
     def save_user_settings(self, user_id, values):
         self.settings.update(values or {})
+        return True
 
     def log_event(self, user_id, name, props=None):
         self.events.append((name, dict(props or {})))
