@@ -266,7 +266,7 @@ def format_resume_match_report(report: ResumeMatchReport, job: Dict) -> str:
     title = str(job.get("title") or "вакансия").strip()[:110]
     company = str(job.get("company") or "").strip()[:70]
     heading = f"{title} · {company}" if company else title
-    if not report.required_skills and not report.keyword_overlap_pct and not report.role_overlap:
+    if not report.required_skills:
         return "\n".join([
             "📄 Resume Match: Недостаточно данных для оценки соответствия",
             heading,

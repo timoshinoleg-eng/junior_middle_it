@@ -45,6 +45,15 @@ class MarketResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Insufficient data", result)
         self.assertNotIn("0%", result)
 
+    def test_english_no_skills_with_role_overlap_has_no_percentage(self):
+        from resume_matcher import analyze_resume_match
+        bot = object.__new__(product.JobBot)
+        bot._lang = lambda _uid: "en"
+        job = {"title": "Software Engineer II - Full Stack", "company": "Smartsheet"}
+        report = analyze_resume_match("Software engineer full stack building applications", job)
+        self.assertTrue(report.role_overlap)
+        self.assertNotIn("%", bot._format_resume_report(77, report, job))
+
     async def test_one_callback_and_docx_produce_one_report_and_clear_session(self):
         bot = object.__new__(product.JobBot)
         bot.db = FakeDurableDB()

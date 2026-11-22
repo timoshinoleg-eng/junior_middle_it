@@ -70,7 +70,11 @@ def extract_url(text: str) -> str:
 def looks_like_resume(text: str) -> bool:
     """Whether the text describes a candidate instead of a vacancy."""
     value = str(text or "").lower()
-    return any(signal in value for signal in RESUME_SIGNALS)
+    if any(signal in value for signal in RESUME_SIGNALS):
+        return True
+    sections = ("опыт работы:", "образование:", "мои навыки:",
+                "work experience:", "employment history:", "education:", "my skills:")
+    return sum(signal in value for signal in sections) >= 2
 
 
 def is_forward_candidate(
