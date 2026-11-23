@@ -512,3 +512,28 @@ class GrowthUtilsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThroughputEvidenceTests(unittest.TestCase):
+    def test_mentors_are_not_candidate_requirements(self):
+        from growth_utils import apply_editorial_quality_gate
+        job = {"title": "Junior Backend Developer", "description": "Work closely with Senior Engineers and Team Lead", "location": "Remote"}
+        apply_editorial_quality_gate(job)
+        self.assertEqual(job["quality_gate_status"], "passed")
+        self.assertEqual(job["level_source"], "explicit_title")
+
+    def test_hard_requirements_and_titles(self):
+        from growth_utils import assess_level_evidence
+        for title, description in [("Senior Developer", ""), ("Junior Developer", "Requires 5+ years of experience"), ("Junior Developer", "Требования: опыт от 5 лет")]:
+            with self.subTest(title=title, description=description):
+                self.assertEqual(assess_level_evidence({"title": title, "description": description})["level_source"], "conflict")
+
+    def test_historical_experience_is_not_a_requirement(self):
+        from growth_utils import assess_level_evidence
+        job = {"title": "Junior Developer", "description": "Our founder has 5+ years of experience. Work with a senior team."}
+        self.assertEqual(assess_level_evidence(job)["level_source"], "explicit_title")
+
+    def test_russian_remote_and_hybrid(self):
+        from growth_utils import assess_remote_eligibility
+        for text, expected in [("удаленная работа", "passed"), ("удалённая работа", "passed"), ("удаленная работа, гибрид", "rejected")]:
+            self.assertEqual(assess_remote_eligibility({"location": text})["remote_status"], expected)

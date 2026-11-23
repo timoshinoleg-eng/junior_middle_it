@@ -22,7 +22,7 @@ from growth_utils import SOURCE_DATE_FIELDS
 _ORIGINAL_IS_SUITABLE_JOB = core.is_suitable_job
 _ORIGINAL_EMERGENCY_MAX_POSTS = core.Config.EMERGENCY_MAX_POSTS_PER_CYCLE
 _DEFAULT_MAX_AGE_DAYS = 7
-_DEFAULT_MAX_POSTS_PER_CYCLE = 7
+_DEFAULT_MAX_POSTS_PER_CYCLE = 10
 _SCHEDULED_CYCLES_PER_DAY = 4  # .github/workflows/vercel-cron.yml
 _MAX_REASONABLE_FUTURE_SKEW = timedelta(hours=6)
 
@@ -71,13 +71,13 @@ def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
 
 
 def _cycle_max_posts() -> int:
-    # Four GitHub Actions scheduled windows x seven jobs = at most 28 scheduled
-    # posts/day. This is NOT a cross-invocation quota for manual triggers.
+    # Four scheduled windows x ten jobs = up to 40 by default (48 at maximum)
+    # posts/day, subject to supply. This is not a cross-invocation quota.
     return _env_int(
         "SERVERLESS_MAX_POSTS_PER_CYCLE",
         _DEFAULT_MAX_POSTS_PER_CYCLE,
         minimum=1,
-        maximum=7,
+        maximum=12,
     )
 
 
