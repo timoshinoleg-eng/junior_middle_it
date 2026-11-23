@@ -31,14 +31,18 @@ FX_TO_USD = {
 SOURCE_DATE_FIELDS = (
     "source_published_at",
     "published",
-    "created",
+    "publishedAt",
     "publication_date",
     "date_published",
     "posted_at",
     "posted_date",
     "pub_date",
     "published_at",
+    "created",
+    "createdAt",
     "date",
+    # Update time is only a fallback, not necessarily the publication date.
+    "updatedAt",
 )
 
 
@@ -122,7 +126,7 @@ THEMATIC_TRACK_LABELS = {
 
 _REMOTE_SIGNALS = (
     "remote", "remoto", "work from home", "wfh", "distributed", "fully distributed",
-    "удалённо", "удаленно", "дистанционно",
+    "удалённо", "удаленно", "удалённая работа", "удаленная работа", "дистанционно",
 )
 _HYBRID_OR_ONSITE_SIGNALS = (
     "hybrid", "on-site", "onsite", "in office", "office-based",
@@ -153,12 +157,6 @@ _GEO_DISPLAY_LABELS = (
     ("united kingdom", "United Kingdom"), ("uk", "United Kingdom"),
     ("london", "United Kingdom"),
 )
-_SENIORITY_CONFLICT_SIGNALS = (
-    "senior", "staff", "principal", "lead", "head of", "director",
-    "architect", "5+ years", "6+ years", "7+ years", "8+ years",
-    "experienced ", "deep experience", "considerable experience",
-    "proven experience", "extensive experience",
-)
 _EXPLICIT_JUNIOR_SIGNALS = (
     "junior", "jr.", "entry level", "entry-level", "graduate", "trainee", "intern",
     "стажёр", "стажер", "джун",
@@ -186,21 +184,24 @@ def _contains_any(text: str, signals: Tuple[str, ...]) -> bool:
     return any(signal in text for signal in signals)
 
 
-def _contains_seniority_conflict(text: str) -> bool:
-    """Detect a seniority conflict without firing on ordinary word extensions.
-
-    Single word signals are matched on word boundaries: a plain substring test
-    lets "architect" fire on "architecture" and "lead" fire on "leadership",
-    which quarantined explicitly junior and middle postings whose description
-    merely mentioned software architecture or team leadership. Multi word
-    signals stay substring matches because they are phrase level evidence
-    ("5+ years", "deep experience", "head of").
-    """
-    for signal in _SENIORITY_CONFLICT_SIGNALS:
-        if " " in signal:
-            if signal in text:
+def _contains_seniority_conflict(title: str, description: str) -> bool:
+    """Match senior roles and candidate requirements, not colleagues' experience."""
+    role = r"(?<!\w)(?:senior|staff|principal|lead|director|head\s+of|architect|руководитель|тимлид)(?!\w)"
+    if re.search(role, title):
+        return True
+    # Examine individual sentences/bullets so company history does not become a
+    # candidate requirement merely because another sentence uses "required".
+    for sentence in re.split(r"[\n;.!?]", description):
+        years = re.search(r"(?<!\d)(?:[5-9]|[1-9]\d)\s*\+\s*years?\b|(?:опыт\s*)?(?:от|более)\s*(?:[5-9]|[1-9]\d)\s*лет", sentence)
+        if years:
+            historical = re.search(r"\b(?:founder|founded|company|our team|established)\b|основател|компани", sentence)
+            required = re.search(r"\b(?:require[ds]?|requirements?|must|minimum|at least|you|your|candidate)\b|требован|необходим|кандидат|опыт\s+от", sentence)
+            if required or not historical:
                 return True
-        elif re.search(r"(?<!\w)" + re.escape(signal) + r"(?!\w)", text):
+        if re.search(r"\b(?:deep|extensive|considerable|proven) experience\b", sentence) and re.search(r"\b(?:requir\w*|must|you|your|candidate)\b", sentence):
+            return True
+        # Directly specifying the applicant's seniority differs from mentioning a mentor.
+        if re.search(r"\b(?:seeking|hiring|looking for|require[ds]?)\s+(?:an?\s+)?(?:senior|staff|principal|lead)\b", sentence):
             return True
     return False
 
@@ -377,7 +378,7 @@ def assess_level_evidence(job: Dict) -> Dict[str, Any]:
     text = _job_text(job)
     level = str(job.get("level") or "").strip()
 
-    if _contains_seniority_conflict(text):
+    if _contains_seniority_conflict(title, str(job.get("description") or "").lower()):
         return {
             "level_source": "conflict",
             "level_confidence": 0,
