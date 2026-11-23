@@ -11,6 +11,7 @@ Sources (all free, no API key):
 from __future__ import annotations
 
 import logging
+import os
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -609,11 +610,16 @@ def run_fetcher(name: str, fn: Callable[[], List[Dict]]) -> List[Dict]:
 
 
 def get_extra_fetchers() -> List[Tuple[Callable[[], List[Dict]], str]]:
-    """Fetchers to append to the main list (wired in channel_bot.get_api_fetch_functions)."""
-    return [
+    """Fetchers to append to channel_bot; Habr remains off until rollout."""
+    fetchers = [
         (fetch_4dayweek, "4dayweek"),
         (fetch_themuse, "The Muse"),
         (fetch_remoteok_dev, "RemoteOK Dev"),
         (fetch_working_nomads, "Working Nomads"),
         (fetch_rss_jobs, "RSS boards"),
     ]
+    if os.getenv("ENABLE_HABR_RSS", "false").strip().lower() == "true":
+        from job_sources_habr import fetch_habr_career
+
+        fetchers.append((fetch_habr_career, "Habr Career RSS"))
+    return fetchers
