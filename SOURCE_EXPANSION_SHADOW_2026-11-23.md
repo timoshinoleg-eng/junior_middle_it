@@ -54,3 +54,37 @@ deduplicated jobs, and not a forecast for channel throughput.
 
 Unmeasured criteria must not be reported as PASS. No new source is enabled by
 merging this branch alone. HH and ATS expansion remain separate follow-ups.
+
+
+## Independent live shadow dry-run — 2026-11-24 (no posting)
+
+Ran from connected HP (VEOL) using in-memory copies of the isolated
+Habr adapter from the PR branch and production filtering functions from
+main 249d460. Requests were only GET to public Habr feeds. No publishing,
+cron trigger, database writes, repository change, or persistent local files.
+
+| Grade | Raw RSS items | After Habr adapter | After existing suitability, level, editorial and channel-track filters |
+|---|---:|---:|---:|
+| Intern (qid=1) | 10 | 9 | 7 |
+| Junior (qid=3) | 17 | 17 | 14 |
+| Middle (qid=4) | 50 | 44 | 31 |
+| **Total** | **77** | **70** | **52** |
+
+52 unique canonical URLs remained after within-batch exact-URL dedup.
+Of these 52, 23 are at most 48 hours old; 50 are at most 7 days old;
+2 are older than 14 days. Source publication date was read from pubDate;
+this is not independently verified job open/closed status.
+
+Compared 52 candidates against **457 production published rows from the
+previous 28 days** via one read-only Supabase query: **0 exact URL matches**
+and **0 exact normalized title+company matches**. This is NOT full
+rapidfuzz cross-source duplicate verification and does not establish
+52 safe-to-publish jobs.
+
+Full eligibility remains **NOT VERIFIED**: canonical URL preflight,
+fuzzy duplicate threshold, work-from-Russia geo eligibility, live Vercel
+egress access, source terms/attribution and Telegram preview.
+
+The gate currently filtered out the non-IT titles from the sampled feeds;
+the adapter separately rejects obvious senior and sales/marketing headings.
+The source remains disabled by default.
