@@ -176,6 +176,65 @@ class HabrCareerAdapterTests(unittest.TestCase):
         self.assertEqual(apply_editorial_quality_gate(job)["quality_gate_status"], "passed")
         self.assertNotEqual(job["remote_scope"], "worldwide")
 
+    def test_currency_ranges_eur_usd_rub_and_single_sided(self):
+        from job_sources_habr import parse_habr_rss
+
+        for raw, expected in (
+            ("От 2 100 $ до 8 000 $", "От 2 100 $ до 8 000 $"),
+            ("От 3 000 € до 5 000 €", "От 3 000 € до 5 000 €"),
+            ("От 80 000 ₽ до 140 000 ₽", "От 80 000 ₽ до 140 000 ₽"),
+            ("До 4 500 $", "До 4 500 $"),
+        ):
+            with self.subTest(raw=raw):
+                job = parse_habr_rss(self._rss(salary=raw), "junior")[0]
+                self.assertEqual(job["salary"], expected)
+
+    def test_russian_senior_titles_veto_middle_tag(self):
+        from job_sources_habr import parse_habr_rss
+
+        for title in (
+            "Старший разработчик серверной части (C#)",
+            "Ведущий системный аналитик",
+            "Главный инженер по тестированию",
+            "старший Python-разработчик",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(
+                    parse_habr_rss(self._rss(tag="middle", title=title), "middle"),
+                    [],
+                )
+        accepted = parse_habr_rss(
+            self._rss(tag="middle", title="Middle C# разработчик"),
+            "middle",
+        )
+        self.assertEqual(len(accepted), 1)
+
+    def test_middle_non_it_titles_do_not_enter_public_channel(self):
+        from job_sources_habr import parse_habr_rss
+        from growth_utils import passes_channel_tracks
+        from job_classifier import JobClassifier
+
+        allowed = ["development", "qa", "devops", "data", "design", "pm", "security"]
+        for title, category in (
+            ("Менеджер по продажам B2B (банковские продукты)", "sales"),
+            ("SMM-специалист", "marketing"),
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(
+                    parse_habr_rss(self._rss(tag="middle", title=title), "middle"),
+                    [],
+                )
+                # Independently check the existing channel-track fallback.
+                job = {
+                    "title": title,
+                    "description": "Можно удалённо. #middle",
+                    "location": "Remote",
+                }
+                self.assertEqual(JobClassifier().classify(job), category)
+                self.assertFalse(passes_channel_tracks(
+                    {**job, "category": category}, allowed
+                ))
+
     def test_requires_explicit_grade_and_per_item_remote_evidence(self):
         from job_sources_habr import parse_habr_rss
 
