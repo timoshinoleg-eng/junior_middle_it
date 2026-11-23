@@ -30,8 +30,18 @@ _REMOTE_RE = re.compile(
 _TITLE_RE = re.compile(r"^Требуется\s+«(.+)»(?:\s*\(.*\))?$", re.IGNORECASE)
 _COMPANY_RE = re.compile(r"Компания\s+«(.+)»\s+ищет", re.IGNORECASE)
 _SALARY_RE = re.compile(
-    r"(?<!\w)(?:от|до)\s+\d[\d \u00a0]*\s*₽"
-    r"(?:\s+до\s+\d[\d \u00a0]*\s*₽)?",
+    r"(?<!\w)(?:от|до)\s+\d[\d \u00a0\u202f]*\s*(?P<currency>₽|\$|€)"
+    r"(?:\s+до\s+\d[\d \u00a0\u202f]*\s*(?P=currency))?",
+    re.IGNORECASE,
+)
+# qid/#middle are employer labels, not proof that the position isn't senior.
+# Match the actual title, not the body (where "старший коллега" is harmless).
+_SENIOR_TITLE_RE = re.compile(r"(?<!\w)(?:старш\w*|ведущ\w*|главн\w*)(?!\w)", re.IGNORECASE)
+# Extra source-level guard: do not publish sales/marketing jobs from broad
+# qid=4 feeds even when a misleading tech keyword confuses classification.
+_NON_IT_TITLE_RE = re.compile(
+    r"(?<!\w)(?:smm|sales|marketing|маркетолог\w*|маркетинг\w*|"
+    r"продаж\w*|копирайтер\w*|таргетолог\w*)(?!\w)",
     re.IGNORECASE,
 )
 _TAG_RE = re.compile(r"(?<!\w)#([^\s,;:!?<>]+)")
@@ -95,6 +105,8 @@ def parse_habr_rss(content: bytes | str, expected_grade: str, max_items: int = 2
             continue
         match = _TITLE_RE.fullmatch(raw_title)
         title = (match.group(1) if match else raw_title).strip()
+        if _SENIOR_TITLE_RE.search(title) or _NON_IT_TITLE_RE.search(title):
+            continue
         author = _plain(
             _child_text(item, "creator")
             or _child_text(item, "companyName")
