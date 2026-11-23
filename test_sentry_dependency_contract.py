@@ -7,3 +7,6 @@ class SentryDependencyContractTests(unittest.TestCase):
         requirements = (Path(__file__).parent / "requirements.txt").read_text(encoding="utf-8").splitlines()
         sentry = [line.strip() for line in requirements if line.strip().startswith("sentry-sdk")]
         self.assertEqual(sentry, ["sentry-sdk>=2.0,<3"])
+        import tomllib
+        project = tomllib.loads((Path(__file__).parent / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertIn("sentry-sdk>=2.0,<3", project["project"]["dependencies"])
