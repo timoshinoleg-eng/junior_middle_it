@@ -133,5 +133,108 @@ class LiveSourceTests(unittest.TestCase):
         self.assertGreater(len(jobs), 0)
 
 
+
+
+class HabrCareerAdapterTests(unittest.TestCase):
+    """Offline contract tests: never touch the live RSS endpoint in CI."""
+
+    @staticmethod
+    def _rss(*, tag="junior", remote=True, url="https://career.habr.com/vacancies/1000170621",
+             salary="От 75 000 ₽ до 115 000 ₽", company="ТЛ Групп", title="Backend-разработчик (Python/Django)"):
+        remote_text = "Можно удалённо." if remote else "Работа в офисе."
+        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+          <channel><item>
+            <title>Требуется «{title}» (Москва)</title>
+            <description><![CDATA[Компания «{company}» ищет хорошего специалиста.
+               Москва (Россия). {salary}. Полный рабочий день.
+               {remote_text} Требуемые навыки: #{tag}, #Python, #Django, #C#.]]></description>
+            <dc:creator>{company}</dc:creator>
+            <pubDate>Mon, 23 Nov 2026 16:25:06 +0300</pubDate>
+            <link>{url}</link>
+          </item></channel>
+        </rss>"""
+        return xml.encode("utf-8")
+
+    def test_parses_title_company_salary_skills_and_date(self):
+        from job_sources_habr import parse_habr_rss
+
+        jobs = parse_habr_rss(self._rss(), "junior")
+        self.assertEqual(len(jobs), 1)
+        job = jobs[0]
+        self.assertEqual(job["title"], "Backend-разработчик (Python/Django)")
+        self.assertEqual(job["company"], "ТЛ Групп")
+        self.assertEqual(job["salary"], "От 75 000 ₽ до 115 000 ₽")
+        self.assertEqual(job["source"], "RSS:Habr Career")
+        self.assertEqual(job["published"], "Mon, 23 Nov 2026 16:25:06 +0300")
+        self.assertIn("Python", job["tags"])
+        self.assertIn("C#", job["tags"])
+        self.assertNotIn("worldwide", job["location"].lower())
+
+        from growth_utils import apply_editorial_quality_gate
+
+        self.assertEqual(apply_editorial_quality_gate(job)["quality_gate_status"], "passed")
+        self.assertNotEqual(job["remote_scope"], "worldwide")
+
+    def test_requires_explicit_grade_and_per_item_remote_evidence(self):
+        from job_sources_habr import parse_habr_rss
+
+        self.assertEqual(parse_habr_rss(self._rss(tag="middle"), "junior"), [])
+        self.assertEqual(parse_habr_rss(self._rss(remote=False), "junior"), [])
+        self.assertEqual(parse_habr_rss(self._rss(tag="senior"), "junior"), [])
+        self.assertEqual(len(parse_habr_rss(self._rss(tag="intern"), "intern")), 1)
+        with self.assertRaises(ValueError):
+            parse_habr_rss(self._rss(), "senior")
+
+    def test_rejects_non_habr_or_non_https_vacancy_links(self):
+        from job_sources_habr import parse_habr_rss
+
+        for link in (
+            "https://elsewhere.example/vacancies/1000170621",
+            "http://career.habr.com/vacancies/1000170621",
+            "https://career.habr.com/companies/acme",
+        ):
+            with self.subTest(link=link):
+                self.assertEqual(parse_habr_rss(self._rss(url=link), "junior"), [])
+
+    def test_no_salary_is_marked_unknown(self):
+        from job_sources_habr import parse_habr_rss
+
+        job = parse_habr_rss(self._rss(salary=""), "junior")[0]
+        self.assertEqual(job["salary"], "Не указана")
+
+    def test_disabled_by_default_and_enabled_with_flag(self):
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"ENABLE_HABR_RSS": "false"}):
+            names = [name for _, name in get_extra_fetchers()]
+            self.assertNotIn("Habr Career RSS", names)
+        with patch.dict(os.environ, {"ENABLE_HABR_RSS": "true"}):
+            names = [name for _, name in get_extra_fetchers()]
+            self.assertIn("Habr Career RSS", names)
+
+    def test_independent_per_grade_failure_and_no_duplicate_urls(self):
+        from unittest.mock import Mock, patch
+        import requests
+        from job_sources_habr import fetch_habr_career
+
+        response = Mock()
+        response.content = self._rss()
+        response.raise_for_status.return_value = None
+
+        def fake_get(url, *, params, headers, timeout):
+            self.assertEqual(timeout, 15)
+            self.assertEqual(params["remote"], "true")
+            if params["qid"] == 1:
+                raise requests.Timeout("simulated timeout")
+            return response
+
+        with patch("job_sources_habr.requests.get", side_effect=fake_get) as get:
+            jobs = fetch_habr_career()
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["company"], "ТЛ Групп")
+
+
 if __name__ == "__main__":
     unittest.main()
